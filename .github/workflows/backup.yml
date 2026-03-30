@@ -7,7 +7,7 @@ on:
     branches: [main]
   workflow_dispatch:
   schedule:
-    - cron: "0 0 * * *" # Runs every day at midnight
+    - cron: "0 0 * * *" # Runs every day at midnight UTC
 
 jobs:
   run_db_backup:
@@ -37,15 +37,20 @@ jobs:
         with:
           version: latest
 
+      - name: Install PostgreSQL client
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
       - name: Force IPv4 for Supabase host
         shell: bash
         run: |
           set -euo pipefail
-          # Safely extract hostname
+
           HOST=$(python3 -c "import os, urllib.parse; print(urllib.parse.urlparse(os.environ.get('SUPABASE_DB_URL', '')).hostname or '')")
           echo "Host: $HOST"
 
-          # Resolve IPv4 to bypass GitHub Runner IPv6 "Network unreachable" errors
           IPV4=$(getent ahostsv4 "$HOST" | awk '/RAW/ {print $1; exit}')
           if [ -z "$IPV4" ]; then
             echo "Error: Could not resolve IPv4 for $HOST" >&2
@@ -53,26 +58,58 @@ jobs:
           fi
           echo "IPv4: $IPV4"
 
-          # Build the connection string with hostaddr override
-          [[ "$SUPABASE_DB_URL" == *\?* ]] && SEP="&" || SEP="?"
+          if [[ "$SUPABASE_DB_URL" == *\?* ]]; then
+            SEP="&"
+          else
+            SEP="?"
+          fi
+
           echo "SUPABASE_DB_URL_IPV4=${SUPABASE_DB_URL}${SEP}sslmode=require&hostaddr=${IPV4}" >> "$GITHUB_ENV"
 
-      - name: Run Dumps and Compress
+      - name: Run Supabase dumps
+        shell: bash
         run: |
-          # 1. Dump roles and schema (Small files)
+          set -euo pipefail
+
+          mkdir -p exports
+
+          # Roles only
           supabase db dump --db-url "$SUPABASE_DB_URL_IPV4" -f roles.sql --role-only
+
+          # Schema only
           supabase db dump --db-url "$SUPABASE_DB_URL_IPV4" -f schema.sql
 
-          # 2. Dump data and compress immediately to bypass GitHub's 100MB limit
+          # Full data dump compressed
           supabase db dump --db-url "$SUPABASE_DB_URL_IPV4" --data-only --use-copy | gzip > data.sql.gz
 
-          # 3. Explicitly remove any uncompressed data.sql to prevent accidental commits
+          # Remove accidental uncompressed file if created
           rm -f data.sql
 
-      - name: Commit and Push
+      - name: Export config tables to one SQL file
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p exports
+
+          pg_dump "$SUPABASE_DB_URL_IPV4" \
+            --data-only \
+            --inserts \
+            --table=public.base_duration \
+            --table=public.booking_settings \
+            --table=public.discounts \
+            --table=public.extra_tasks \
+            --table=public.roles \
+            --table=public.service_categories \
+            --table=public.service_types \
+            --table=public.timezones \
+            > exports/config_data.sql
+
+      - name: Commit and push backup files
+        if: github.event_name != 'pull_request'
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "chore: automated supabase backup [skip ci]"
-          file_pattern: "roles.sql schema.sql data.sql.gz"
+          file_pattern: "roles.sql schema.sql data.sql.gz exports/config_data.sql"
           commit_user_name: github-actions[bot]
           commit_user_email: github-actions[bot]@users.noreply.github.com
