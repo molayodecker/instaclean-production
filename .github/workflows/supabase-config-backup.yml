@@ -5,7 +5,7 @@ on:
     branches: [main]
   workflow_dispatch:
   schedule:
-    - cron: "0 1 * * *" # Runs daily at 1 AM UTC (separate from main backup)
+    - cron: "0 1 * * *" # Runs daily at 1 AM UTC
 
 jobs:
   export_config_tables:
@@ -20,6 +20,7 @@ jobs:
       - name: Check if backups are enabled
         shell: bash
         run: |
+          set -euo pipefail
           if [ "$BACKUP_ENABLED" != "true" ]; then
             echo "Backups are not enabled. Skipping."
             exit 0
@@ -30,27 +31,26 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Install PostgreSQL client
+      - name: Install PostgreSQL 17 client
         shell: bash
         run: |
-          sudo apt-get update
-
-          # Add official PostgreSQL repo
-          sudo apt-get install -y wget gnupg
-          echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
-          wget -qO - https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo apt-key add -
+          set -euo pipefail
 
           sudo apt-get update
+          sudo apt-get install -y wget gnupg lsb-release ca-certificates
 
-          # Install correct version
+          echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+
+          wget -qO - https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | gpg --dearmor \
+            | sudo tee /etc/apt/trusted.gpg.d/postgresql.gpg > /dev/null
+
+          sudo apt-get update
           sudo apt-get install -y postgresql-client-17
 
-          # Verify version
-          pg_dump --version
-        # shell: bash
-        # run: |
-        #   sudo apt-get update
-        #   sudo apt-get install -y postgresql-client
+          /usr/lib/postgresql/17/bin/pg_dump --version
+          /usr/lib/postgresql/17/bin/psql --version
 
       - name: Force IPv4 for Supabase host
         shell: bash
@@ -66,6 +66,8 @@ jobs:
             exit 1
           fi
 
+          echo "IPv4: $IPV4"
+
           if [[ "$SUPABASE_DB_URL" == *\?* ]]; then
             SEP="&"
           else
@@ -74,14 +76,22 @@ jobs:
 
           echo "SUPABASE_DB_URL_IPV4=${SUPABASE_DB_URL}${SEP}sslmode=require&hostaddr=${IPV4}" >> "$GITHUB_ENV"
 
-      - name: Export config tables (SQL)
+      - name: Debug PostgreSQL binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          which pg_dump || true
+          pg_dump --version || true
+          /usr/lib/postgresql/17/bin/pg_dump --version
+
+      - name: Export config tables to one SQL file
         shell: bash
         run: |
           set -euo pipefail
 
           mkdir -p exports
 
-          pg_dump "$SUPABASE_DB_URL_IPV4" \
+          /usr/lib/postgresql/17/bin/pg_dump "$SUPABASE_DB_URL_IPV4" \
             --data-only \
             --inserts \
             --table=public.base_duration \
