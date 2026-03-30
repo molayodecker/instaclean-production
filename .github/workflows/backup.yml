@@ -50,19 +50,36 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "schedule" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+
+          EVENT="${{ github.event_name }}"
+          SAME_REPO_PR="false"
+
+          if [ "$EVENT" = "pull_request" ] && [ "${{ github.event.pull_request.head.repo.full_name }}" = "${{ github.repository }}" ]; then
+            SAME_REPO_PR="true"
+          fi
+
+          if [ "$EVENT" = "schedule" ] || [ "$EVENT" = "workflow_dispatch" ] || [ "$SAME_REPO_PR" = "true" ]; then
             echo "mode=full" >> "$GITHUB_OUTPUT"
+            echo "upload_to_r2=true" >> "$GITHUB_OUTPUT"
             echo "Running FULL backup"
           else
             echo "mode=schema" >> "$GITHUB_OUTPUT"
+            echo "upload_to_r2=false" >> "$GITHUB_OUTPUT"
             echo "Running SCHEMA-ONLY backup"
           fi
 
       - name: Checkout checkpoint branch
+        if: github.event_name != 'pull_request'
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: checkpoint
+
+      - name: Checkout repository for PR validation
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Supabase CLI
         uses: supabase/setup-cli@v1
@@ -173,7 +190,7 @@ jobs:
           commit_user_email: github-actions[bot]@users.noreply.github.com
 
       - name: Upload full backups to Cloudflare R2
-        if: steps.mode.outputs.mode == 'full'
+        if: steps.mode.outputs.upload_to_r2 == 'true'
         shell: bash
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
