@@ -1,0 +1,88 @@
+name: Supa-config-backup
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "0 1 * * *" # Runs daily at 1 AM UTC (separate from main backup)
+
+jobs:
+  export_config_tables:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+      BACKUP_ENABLED: ${{ secrets.BACKUP_ENABLED }}
+
+    steps:
+      - name: Check if backups are enabled
+        shell: bash
+        run: |
+          if [ "$BACKUP_ENABLED" != "true" ]; then
+            echo "Backups are not enabled. Skipping."
+            exit 0
+          fi
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install PostgreSQL client
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Force IPv4 for Supabase host
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          HOST=$(python3 -c "import os, urllib.parse; print(urllib.parse.urlparse(os.environ.get('SUPABASE_DB_URL', '')).hostname or '')")
+          echo "Host: $HOST"
+
+          IPV4=$(getent ahostsv4 "$HOST" | awk '/RAW/ {print $1; exit}')
+          if [ -z "$IPV4" ]; then
+            echo "Error: Could not resolve IPv4 for $HOST" >&2
+            exit 1
+          fi
+
+          if [[ "$SUPABASE_DB_URL" == *\?* ]]; then
+            SEP="&"
+          else
+            SEP="?"
+          fi
+
+          echo "SUPABASE_DB_URL_IPV4=${SUPABASE_DB_URL}${SEP}sslmode=require&hostaddr=${IPV4}" >> "$GITHUB_ENV"
+
+      - name: Export config tables (SQL)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p exports
+
+          pg_dump "$SUPABASE_DB_URL_IPV4" \
+            --data-only \
+            --inserts \
+            --table=public.base_duration \
+            --table=public.booking_settings \
+            --table=public.discounts \
+            --table=public.extra_tasks \
+            --table=public.roles \
+            --table=public.service_categories \
+            --table=public.service_types \
+            --table=public.timezones \
+            > exports/config_data.sql
+
+      - name: Commit and push config backup
+        if: github.event_name != 'pull_request'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: config tables backup [skip ci]"
+          file_pattern: "exports/config_data.sql"
+          commit_user_name: github-actions[bot]
+          commit_user_email: github-actions[bot]@users.noreply.github.com
