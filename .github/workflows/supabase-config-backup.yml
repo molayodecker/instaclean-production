@@ -1,14 +1,14 @@
-name: Supa-config-backup
+name: Supa-backup
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
   schedule:
-    - cron: "0 1 * * *" # Runs daily at 1 AM UTC
+    - cron: "0 0 * * *"
 
 jobs:
-  export_config_tables:
+  run_db_backup:
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -30,85 +30,40 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.head_ref || github.ref_name }}
 
-      - name: Install PostgreSQL 17 client
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          sudo apt-get update
-          sudo apt-get install -y wget gnupg lsb-release ca-certificates
-
-          echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
-            | sudo tee /etc/apt/sources.list.d/pgdg.list
-
-          wget -qO - https://www.postgresql.org/media/keys/ACCC4CF8.asc \
-            | gpg --dearmor \
-            | sudo tee /etc/apt/trusted.gpg.d/postgresql.gpg > /dev/null
-
-          sudo apt-get update
-          sudo apt-get install -y postgresql-client-17
-
-          /usr/lib/postgresql/17/bin/pg_dump --version
-          /usr/lib/postgresql/17/bin/psql --version
+      - name: Setup Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
 
       - name: Force IPv4 for Supabase host
         shell: bash
         run: |
           set -euo pipefail
-
           HOST=$(python3 -c "import os, urllib.parse; print(urllib.parse.urlparse(os.environ.get('SUPABASE_DB_URL', '')).hostname or '')")
-          echo "Host: $HOST"
-
           IPV4=$(getent ahostsv4 "$HOST" | awk '/RAW/ {print $1; exit}')
           if [ -z "$IPV4" ]; then
             echo "Error: Could not resolve IPv4 for $HOST" >&2
             exit 1
           fi
-
-          echo "IPv4: $IPV4"
-
-          if [[ "$SUPABASE_DB_URL" == *\?* ]]; then
-            SEP="&"
-          else
-            SEP="?"
-          fi
-
+          [[ "$SUPABASE_DB_URL" == *\?* ]] && SEP="&" || SEP="?"
           echo "SUPABASE_DB_URL_IPV4=${SUPABASE_DB_URL}${SEP}sslmode=require&hostaddr=${IPV4}" >> "$GITHUB_ENV"
 
-      - name: Debug PostgreSQL binaries
+      - name: Run Dumps and Compress
         shell: bash
         run: |
           set -euo pipefail
-          which pg_dump || true
-          pg_dump --version || true
-          /usr/lib/postgresql/17/bin/pg_dump --version
+          supabase db dump --db-url "$SUPABASE_DB_URL_IPV4" -f roles.sql --role-only
+          supabase db dump --db-url "$SUPABASE_DB_URL_IPV4" -f schema.sql
+          supabase db dump --db-url "$SUPABASE_DB_URL_IPV4" --data-only --use-copy | gzip > data.sql.gz
+          rm -f data.sql
 
-      - name: Export config tables to one SQL file
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          mkdir -p exports
-
-          /usr/lib/postgresql/17/bin/pg_dump "$SUPABASE_DB_URL_IPV4" \
-            --data-only \
-            --inserts \
-            --table=public.base_duration \
-            --table=public.booking_settings \
-            --table=public.discounts \
-            --table=public.extra_tasks \
-            --table=public.roles \
-            --table=public.service_categories \
-            --table=public.service_types \
-            --table=public.timezones \
-            > exports/config_data.sql
-
-      - name: Commit and push config backup
+      - name: Commit and Push
         if: github.event_name != 'pull_request'
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "chore: config tables backup [skip ci]"
-          file_pattern: "exports/config_data.sql"
+          commit_message: "chore: automated supabase backup [skip ci]"
+          file_pattern: "roles.sql schema.sql data.sql.gz"
           commit_user_name: github-actions[bot]
           commit_user_email: github-actions[bot]@users.noreply.github.com
