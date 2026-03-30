@@ -1,13 +1,13 @@
 name: Supa-backup
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
   schedule:
-    - cron: "0 0 * * *" # Runs every day at midnight
+    - cron: "0 0 * * *" # Runs daily at midnight UTC
+
+concurrency:
+  group: supabase-backups
+  cancel-in-progress: false
 
 jobs:
   run_db_backup:
@@ -22,57 +22,111 @@ jobs:
       - name: Check if backups are enabled
         shell: bash
         run: |
+          set -euo pipefail
           if [ "$BACKUP_ENABLED" != "true" ]; then
             echo "Backups are not enabled. Skipping."
             exit 0
           fi
 
-      - name: Checkout repository
+      - name: Checkout checkpoint branch
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: checkpoint
 
       - name: Setup Supabase CLI
         uses: supabase/setup-cli@v1
         with:
           version: latest
 
+      - name: Install PostgreSQL 17 client
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y wget gnupg lsb-release ca-certificates
+
+          echo "deb http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+
+          wget -qO - https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | gpg --dearmor \
+            | sudo tee /etc/apt/trusted.gpg.d/postgresql.gpg > /dev/null
+
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+
+          /usr/lib/postgresql/17/bin/pg_dump --version
+          /usr/lib/postgresql/17/bin/psql --version
+
       - name: Force IPv4 for Supabase host
         shell: bash
         run: |
           set -euo pipefail
-          # Safely extract hostname
+
           HOST=$(python3 -c "import os, urllib.parse; print(urllib.parse.urlparse(os.environ.get('SUPABASE_DB_URL', '')).hostname or '')")
           echo "Host: $HOST"
 
-          # Resolve IPv4 to bypass GitHub Runner IPv6 "Network unreachable" errors
           IPV4=$(getent ahostsv4 "$HOST" | awk '/RAW/ {print $1; exit}')
           if [ -z "$IPV4" ]; then
             echo "Error: Could not resolve IPv4 for $HOST" >&2
             exit 1
           fi
+
           echo "IPv4: $IPV4"
 
-          # Build the connection string with hostaddr override
-          [[ "$SUPABASE_DB_URL" == *\?* ]] && SEP="&" || SEP="?"
+          if [[ "$SUPABASE_DB_URL" == *\?* ]]; then
+            SEP="&"
+          else
+            SEP="?"
+          fi
+
           echo "SUPABASE_DB_URL_IPV4=${SUPABASE_DB_URL}${SEP}sslmode=require&hostaddr=${IPV4}" >> "$GITHUB_ENV"
 
-      - name: Run Dumps and Compress
+      - name: Run Supabase dumps
+        shell: bash
         run: |
-          # 1. Dump roles and schema (Small files)
+          set -euo pipefail
+
+          mkdir -p exports
+
+          # Roles only
           supabase db dump --db-url "$SUPABASE_DB_URL_IPV4" -f roles.sql --role-only
+
+          # Schema only
           supabase db dump --db-url "$SUPABASE_DB_URL_IPV4" -f schema.sql
 
-          # 2. Dump data and compress immediately to bypass GitHub's 100MB limit
+          # Full data dump compressed
           supabase db dump --db-url "$SUPABASE_DB_URL_IPV4" --data-only --use-copy | gzip > data.sql.gz
 
-          # 3. Explicitly remove any uncompressed data.sql to prevent accidental commits
+          # Remove accidental uncompressed dump if created
           rm -f data.sql
 
-      - name: Commit and Push
+      - name: Export config tables to one SQL file
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p exports
+
+          /usr/lib/postgresql/17/bin/pg_dump "$SUPABASE_DB_URL_IPV4" \
+            --data-only \
+            --inserts \
+            --table=public.base_duration \
+            --table=public.booking_settings \
+            --table=public.discounts \
+            --table=public.extra_tasks \
+            --table=public.roles \
+            --table=public.service_categories \
+            --table=public.service_types \
+            --table=public.timezones \
+            > exports/config_data.sql
+
+      - name: Commit and push backup files
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "chore: automated supabase backup [skip ci]"
-          file_pattern: "roles.sql schema.sql data.sql.gz"
+          file_pattern: "roles.sql schema.sql data.sql.gz exports/config_data.sql"
           commit_user_name: github-actions[bot]
           commit_user_email: github-actions[bot]@users.noreply.github.com
