@@ -58,11 +58,8 @@ jobs:
           fi
           echo "IPv4: $IPV4"
 
-          if [[ "$SUPABASE_DB_URL" == *\?* ]]; then
-            SEP="&"
-          else
-            SEP="?"
-          fi
+          # Build the connection string with hostaddr override
+          [[ "$SUPABASE_DB_URL" == *\?* ]] && SEP="&" || SEP="?"
 
           echo "SUPABASE_DB_URL_IPV4=${SUPABASE_DB_URL}${SEP}sslmode=require&hostaddr=${IPV4}" >> "$GITHUB_ENV"
 
