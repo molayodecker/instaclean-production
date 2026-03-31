@@ -163,7 +163,7 @@ jobs:
           /usr/lib/postgresql/17/bin/pg_dump "$SUPABASE_DB_URL_IPV4" \
             --data-only \
             --inserts \
-            --table=public.base_duration \
+            --table=public.base_durations \
             --table=public.booking_settings \
             --table=public.discounts \
             --table=public.extra_tasks \
