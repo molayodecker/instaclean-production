@@ -1,3 +1,3 @@
 # crispy-happiness
 
-Database checkpoint for Instaclean Prod
+Database checkpoint for Instaclean Staging
