@@ -15,24 +15,20 @@ SELECT pg_get_functiondef(p.oid) || E'\n'
 FROM pg_proc p
 JOIN pg_namespace n
   ON n.oid = p.pronamespace
-LEFT JOIN pg_aggregate a
-  ON a.aggfnoid = p.oid
 WHERE n.nspname IN ('public', 'auth')
   AND p.prokind IN ('f', 'p', 'w')
-  AND a.aggfnoid IS NULL
 ORDER BY n.nspname, p.proname, pg_get_function_identity_arguments(p.oid);
 
 SELECT '';
 
 -- === AGGREGATES ===
-SELECT '-- === AGGREGATES ===';
-SELECT pg_get_aggregatedef(p.oid) || E';\n'
+SELECT '-- === AGGREGATES (signatures; DDL in schema.sql) ===';
+SELECT format('-- %s', p.oid::regprocedure::text) || E'\n'
 FROM pg_proc p
 JOIN pg_namespace n
   ON n.oid = p.pronamespace
-JOIN pg_aggregate a
-  ON a.aggfnoid = p.oid
 WHERE n.nspname IN ('public', 'auth')
+  AND p.prokind = 'a'
 ORDER BY n.nspname, p.proname, pg_get_function_identity_arguments(p.oid);
 
 SELECT '';
