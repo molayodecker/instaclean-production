@@ -26,7 +26,7 @@ SELECT '';
 
 -- === AGGREGATES ===
 SELECT '-- === AGGREGATES ===';
-SELECT pg_get_aggregatedef(a.oid) || E';\n'
+SELECT pg_get_aggregatedef(p.oid) || E';\n'
 FROM pg_proc p
 JOIN pg_namespace n
   ON n.oid = p.pronamespace
