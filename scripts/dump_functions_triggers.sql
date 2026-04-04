@@ -48,9 +48,15 @@ ORDER BY n.nspname, c.relname, t.tgname;
 SELECT '';
 
 -- === EVENT TRIGGERS ===
-SELECT '-- === EVENT TRIGGERS ===';
-SELECT pg_get_event_triggerdef(e.oid) || E';\n'
+SELECT '-- === EVENT TRIGGERS (summary; DDL in schema.sql) ===';
+SELECT format(
+         '-- %I ON %s EXECUTE FUNCTION %s',
+         e.evtname,
+         e.evtevent::text,
+         e.evtfoid::regprocedure::text
+       ) || E'\n'
 FROM pg_event_trigger e
 ORDER BY e.evtname;
 
 \o
+
