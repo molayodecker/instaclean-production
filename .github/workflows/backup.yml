@@ -71,12 +71,12 @@ jobs:
           # Schema + functions/triggers to R2 on every run when R2 secrets are set (not only full data dumps).
           echo "upload_ddl_to_r2=true" >> "$GITHUB_OUTPUT"
 
-      - name: Checkout checkpoint branch
+      - name: Checkout main branch
         if: github.event_name != 'pull_request'
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-          ref: checkpoint
+          ref: main
 
       - name: Checkout repository for PR validation
         if: github.event_name == 'pull_request'
