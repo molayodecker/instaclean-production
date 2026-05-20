@@ -36,17 +36,26 @@ jobs:
       R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
 
     steps:
-      - name: Check if backups are enabled
+      - name: Check backup prerequisites
+        id: gate
         shell: bash
         run: |
           set -euo pipefail
           if [ "${BACKUP_ENABLED:-false}" != "true" ]; then
-            echo "Backups are not enabled. Skipping."
+            echo "Backups disabled. Set BACKUP_ENABLED=true in repository secrets to run."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          if [ -z "${SUPABASE_DB_URL:-}" ]; then
+            echo "::error::SUPABASE_DB_URL secret is missing or empty. Add your postgresql:// connection URI under Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+          python3 -c "import os, urllib.parse; u=os.environ['SUPABASE_DB_URL']; p=urllib.parse.urlparse(u); assert p.scheme in ('postgresql', 'postgres') and p.hostname, 'SUPABASE_DB_URL must be a postgresql:// URI with a host'"
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
 
       - name: Determine backup mode
         id: mode
+        if: steps.gate.outputs.enabled == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -72,24 +81,26 @@ jobs:
           echo "upload_ddl_to_r2=true" >> "$GITHUB_OUTPUT"
 
       - name: Checkout main branch
-        if: github.event_name != 'pull_request'
+        if: steps.gate.outputs.enabled == 'true' && github.event_name != 'pull_request'
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: main
 
       - name: Checkout repository for PR validation
-        if: github.event_name == 'pull_request'
+        if: steps.gate.outputs.enabled == 'true' && github.event_name == 'pull_request'
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Setup Supabase CLI
+        if: steps.gate.outputs.enabled == 'true'
         uses: supabase/setup-cli@v1
         with:
           version: latest
 
       - name: Install PostgreSQL 17 client and AWS CLI
+        if: steps.gate.outputs.enabled == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -115,12 +126,17 @@ jobs:
           "$HOME/.local/bin/aws" --version
 
       - name: Force IPv4 for Supabase host
+        if: steps.gate.outputs.enabled == 'true'
         shell: bash
         run: |
           set -euo pipefail
 
-          HOST=$(python3 -c "import os, urllib.parse; print(urllib.parse.urlparse(os.environ.get('SUPABASE_DB_URL', '')).hostname or '')")
+          HOST=$(python3 -c "import os, urllib.parse; print(urllib.parse.urlparse(os.environ['SUPABASE_DB_URL']).hostname or '')")
           echo "Host: $HOST"
+          if [ -z "$HOST" ]; then
+            echo "::error::Could not parse hostname from SUPABASE_DB_URL" >&2
+            exit 1
+          fi
 
           IPV4=$(getent ahostsv4 "$HOST" | awk '/RAW/ {print $1; exit}')
           if [ -z "$IPV4" ]; then
@@ -139,6 +155,7 @@ jobs:
           echo "SUPABASE_DB_URL_IPV4=${SUPABASE_DB_URL}${SEP}sslmode=require&hostaddr=${IPV4}" >> "$GITHUB_ENV"
 
       - name: Dump roles and schema
+        if: steps.gate.outputs.enabled == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -149,6 +166,7 @@ jobs:
           supabase db dump --db-url "$SUPABASE_DB_URL_IPV4" -f schema.sql
 
       - name: Dump functions and triggers
+        if: steps.gate.outputs.enabled == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -159,7 +177,7 @@ jobs:
             -f scripts/dump_functions_triggers.sql
 
       - name: Dump full data
-        if: steps.mode.outputs.mode == 'full'
+        if: steps.gate.outputs.enabled == 'true' && steps.mode.outputs.mode == 'full'
         shell: bash
         run: |
           set -euo pipefail
@@ -168,7 +186,7 @@ jobs:
           rm -f data.sql
 
       - name: Export config tables to compressed SQL file
-        if: steps.mode.outputs.mode == 'full'
+        if: steps.gate.outputs.enabled == 'true' && steps.mode.outputs.mode == 'full'
         shell: bash
         run: |
           set -euo pipefail
@@ -187,6 +205,7 @@ jobs:
             | gzip > exports/config_data.sql.gz
 
       - name: Show generated files
+        if: steps.gate.outputs.enabled == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -194,7 +213,7 @@ jobs:
           ls -lh data.sql.gz exports/config_data.sql.gz || true
 
       - name: Commit schema, roles, and functions/triggers to GitHub
-        if: github.event_name != 'pull_request'
+        if: steps.gate.outputs.enabled == 'true' && github.event_name != 'pull_request'
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "chore: schema backup [skip ci]"
@@ -204,6 +223,7 @@ jobs:
 
       - name: Upload schema and functions/triggers to Cloudflare R2
         if: >
+          steps.gate.outputs.enabled == 'true' &&
           steps.mode.outputs.upload_ddl_to_r2 == 'true' &&
           env.R2_BUCKET_NAME != '' &&
           env.R2_ACCOUNT_ID != ''
@@ -232,7 +252,7 @@ jobs:
             --endpoint-url "$ENDPOINT"
 
       - name: Upload full data backups to Cloudflare R2
-        if: steps.mode.outputs.upload_to_r2 == 'true'
+        if: steps.gate.outputs.enabled == 'true' && steps.mode.outputs.upload_to_r2 == 'true'
         shell: bash
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
