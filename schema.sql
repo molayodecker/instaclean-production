@@ -2878,52 +2878,89 @@ ALTER FUNCTION "public"."handle_new_google_user"() OWNER TO "postgres";
 
 CREATE OR REPLACE FUNCTION "public"."handle_new_user_multi_role"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
-    AS $$BEGIN
-    INSERT INTO public.users (id, email, phone)
-    VALUES (NEW.id, NEW.email, NEW.phone)
-    ON CONFLICT (id) DO UPDATE
-    SET
-      email = EXCLUDED.email,
-      phone = COALESCE(EXCLUDED.phone, public.users.phone);
-
-    INSERT INTO public.profiles (id, user_id, firstname, lastname)
-    VALUES (
-        NEW.id,
-        NEW.id,
-        COALESCE(
-            NULLIF(NEW.raw_user_meta_data->>'first_name', ''),
-            NULLIF(split_part(trim(NEW.raw_user_meta_data->>'name'), ' ', 1), '')
-        ),
-        COALESCE(
-            NULLIF(NEW.raw_user_meta_data->>'last_name', ''),
-            NULLIF(
-                trim(
-                    substr(
-                        trim(NEW.raw_user_meta_data->>'name'),
-                        length(split_part(trim(NEW.raw_user_meta_data->>'name'), ' ', 1)) + 2
-                    )
-                ),
-                ''
-            )
-        )
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_phone text;
+BEGIN
+  v_phone := public.normalize_phone_for_users(
+    COALESCE(
+      NEW.phone,
+      NEW.raw_user_meta_data->>'phone',
+      NEW.raw_user_meta_data->>'phone_number'
     )
-    ON CONFLICT (id) DO UPDATE
-    SET
-      firstname = COALESCE(EXCLUDED.firstname, public.profiles.firstname),
-      lastname  = COALESCE(EXCLUDED.lastname, public.profiles.lastname);
+  );
 
-    INSERT INTO public.user_roles (user_id, role_id)
-    VALUES (NEW.id, COALESCE(NEW.raw_app_meta_data->>'role', 'customer'))
-    ON CONFLICT (user_id, role_id) DO NOTHING;
+  INSERT INTO public.users (id, email, phone)
+  VALUES (
+    NEW.id,
+    lower(NULLIF(btrim(NEW.email), '')),
+    CASE
+      WHEN v_phone IS NOT NULL
+       AND NOT EXISTS (
+         SELECT 1
+         FROM public.users u
+         WHERE u.phone = v_phone
+           AND u.id <> NEW.id
+       )
+      THEN v_phone
+      ELSE NULL
+    END
+  )
+  ON CONFLICT (id) DO UPDATE
+  SET
+    email = COALESCE(EXCLUDED.email, public.users.email),
+    phone = CASE
+      WHEN v_phone IS NOT NULL
+       AND NOT EXISTS (
+         SELECT 1
+         FROM public.users u
+         WHERE u.phone = v_phone
+           AND u.id <> public.users.id
+       )
+      THEN v_phone
+      ELSE public.users.phone
+    END;
 
-    IF COALESCE(NEW.raw_app_meta_data->>'role', '') = 'cleaner' THEN
-        INSERT INTO public.cleaner_data (user_id)
-        VALUES (NEW.id)
-        ON CONFLICT (user_id) DO NOTHING;
-    END IF;
+  INSERT INTO public.profiles (id, user_id, firstname, lastname)
+  VALUES (
+    NEW.id,
+    NEW.id,
+    COALESCE(
+      NULLIF(NEW.raw_user_meta_data->>'first_name', ''),
+      NULLIF(split_part(trim(NEW.raw_user_meta_data->>'name'), ' ', 1), '')
+    ),
+    COALESCE(
+      NULLIF(NEW.raw_user_meta_data->>'last_name', ''),
+      NULLIF(
+        trim(
+          substr(
+            trim(NEW.raw_user_meta_data->>'name'),
+            length(split_part(trim(NEW.raw_user_meta_data->>'name'), ' ', 1)) + 2
+          )
+        ),
+        ''
+      )
+    )
+  )
+  ON CONFLICT (id) DO UPDATE
+  SET
+    firstname = COALESCE(EXCLUDED.firstname, public.profiles.firstname),
+    lastname  = COALESCE(EXCLUDED.lastname, public.profiles.lastname);
 
-    RETURN NEW;
-END;$$;
+  INSERT INTO public.user_roles (user_id, role_id)
+  VALUES (NEW.id, COALESCE(NEW.raw_app_meta_data->>'role', 'customer'))
+  ON CONFLICT (user_id, role_id) DO NOTHING;
+
+  IF COALESCE(NEW.raw_app_meta_data->>'role', '') = 'cleaner' THEN
+    INSERT INTO public.cleaner_data (user_id)
+    VALUES (NEW.id)
+    ON CONFLICT (user_id) DO NOTHING;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
 
 
 ALTER FUNCTION "public"."handle_new_user_multi_role"() OWNER TO "postgres";
@@ -3559,6 +3596,49 @@ $_$;
 
 
 ALTER FUNCTION "public"."normalize_ghana_phone_to_e164"("p_input" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."normalize_phone_for_users"("raw_phone" "text") RETURNS "text"
+    LANGUAGE "plpgsql" IMMUTABLE
+    AS $_$
+DECLARE
+  digits text;
+  cleaned text;
+BEGIN
+  IF raw_phone IS NULL OR btrim(raw_phone) = '' THEN
+    RETURN NULL;
+  END IF;
+
+  cleaned := regexp_replace(btrim(raw_phone), '[\s\-\(\)]', '', 'g');
+  digits := regexp_replace(cleaned, '\D', '', 'g');
+
+  -- Accept already-normalized international E.164 numbers.
+  IF cleaned ~ '^\+[1-9][0-9]{6,14}$' THEN
+    RETURN cleaned;
+  END IF;
+
+  -- Ghana convenience fallback: 0241234567 -> +233241234567.
+  IF digits ~ '^0[2-5][0-9]{8}$' THEN
+    RETURN '+233' || substring(digits from 2);
+  END IF;
+
+  -- Ghana common mistake: 2330241234567 -> +233241234567.
+  IF digits ~ '^2330[2-5][0-9]{8}$' THEN
+    RETURN '+233' || substring(digits from 5);
+  END IF;
+
+  -- Ghana without plus: 233241234567 -> +233241234567.
+  IF digits ~ '^233[2-5][0-9]{8}$' THEN
+    RETURN '+' || digits;
+  END IF;
+
+  -- Do not guess bare international numbers like 13019791778.
+  RETURN NULL;
+END;
+$_$;
+
+
+ALTER FUNCTION "public"."normalize_phone_for_users"("raw_phone" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."psk_transaction"("p_booking_id" "uuid", "p_user_id" "uuid", "p_reference" "text", "p_paystack_id" bigint, "p_amount" numeric, "p_fee_amount" numeric, "p_total_captured" numeric, "p_currency" "text", "p_metadata" "jsonb") RETURNS "public"."psk_transaction"
@@ -11933,6 +12013,12 @@ GRANT ALL ON FUNCTION "public"."normalize_ghana_mobile_e164_ts"("p_input" "text"
 GRANT ALL ON FUNCTION "public"."normalize_ghana_phone_to_e164"("p_input" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."normalize_ghana_phone_to_e164"("p_input" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."normalize_ghana_phone_to_e164"("p_input" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."normalize_phone_for_users"("raw_phone" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."normalize_phone_for_users"("raw_phone" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."normalize_phone_for_users"("raw_phone" "text") TO "service_role";
 
 
 
