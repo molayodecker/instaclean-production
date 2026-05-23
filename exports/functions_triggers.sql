@@ -6647,22 +6647,29 @@ CREATE OR REPLACE FUNCTION public.normalize_phone_for_users(raw_phone text)
  IMMUTABLE
 AS $function$
 DECLARE
-  digits text;
   cleaned text;
+  digits text;
 BEGIN
   IF raw_phone IS NULL OR btrim(raw_phone) = '' THEN
     RETURN NULL;
   END IF;
 
-  cleaned := regexp_replace(btrim(raw_phone), '[\s\-\(\)]', '', 'g');
-  digits := regexp_replace(cleaned, '\D', '', 'g');
+  -- Remove spaces, dashes, parentheses, dots.
+  cleaned := regexp_replace(btrim(raw_phone), '[\s\-\(\)\.]', '', 'g');
 
-  -- Accept already-normalized international E.164 numbers.
-  IF cleaned ~ '^\+[1-9][0-9]{6,14}$' THEN
-    RETURN cleaned;
+  -- Convert international 00-prefix to + (e.g. 00233...).
+  IF cleaned ~ '^00[1-9][0-9]{6,14}$' THEN
+    cleaned := '+' || substring(cleaned from 3);
   END IF;
 
-  -- Ghana convenience fallback: 0241234567 -> +233241234567.
+  -- Canonical E.164 with plus.
+  IF cleaned ~ '^\+[1-9][0-9]{6,14}$' THEN
+    RETURN '+' || regexp_replace(cleaned, '\D', '', 'g');
+  END IF;
+
+  digits := regexp_replace(cleaned, '\D', '', 'g');
+
+  -- Ghana local: 0241234567 -> +233241234567.
   IF digits ~ '^0[2-5][0-9]{8}$' THEN
     RETURN '+233' || substring(digits from 2);
   END IF;
@@ -6674,10 +6681,9 @@ BEGIN
 
   -- Ghana without plus: 233241234567 -> +233241234567.
   IF digits ~ '^233[2-5][0-9]{8}$' THEN
-    RETURN '+' || digits;
+    RETURN '+233' || substring(digits from 4);
   END IF;
 
-  -- Do not guess bare international numbers like 13019791778.
   RETURN NULL;
 END;
 $function$
@@ -7879,6 +7885,37 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.queue_avatar_storage_deletion(p_object_path text, p_delete_after timestamp with time zone DEFAULT (now() + '24:00:00'::interval))
+ RETURNS void
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_user_id uuid := auth.uid();
+BEGIN
+  IF v_user_id IS NULL THEN
+    RAISE EXCEPTION 'Not authenticated' USING ERRCODE = '42501';
+  END IF;
+
+  IF p_object_path IS NULL OR btrim(p_object_path) = '' THEN
+    RAISE EXCEPTION 'object_path is required' USING ERRCODE = '22004';
+  END IF;
+
+  IF btrim(p_object_path) NOT LIKE v_user_id::text || '/%' THEN
+    RAISE EXCEPTION 'Invalid avatar object path' USING ERRCODE = '42501';
+  END IF;
+
+  INSERT INTO public.avatar_storage_deletions (user_id, bucket, object_path, delete_after)
+  VALUES (v_user_id, 'avatars', btrim(p_object_path), p_delete_after)
+  ON CONFLICT ON CONSTRAINT avatar_storage_deletions_bucket_object_path_key
+  DO UPDATE SET
+    delete_after = EXCLUDED.delete_after,
+    user_id = EXCLUDED.user_id;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.record_lookup_attempt(p_scope text, p_key text, p_max_attempts integer, p_window_seconds integer)
  RETURNS boolean
  LANGUAGE plpgsql
@@ -8184,6 +8221,41 @@ BEGIN
   END IF;
 
   RETURN NEW;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.set_default_payout_method(p_method_id uuid)
+ RETURNS boolean
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+BEGIN
+  IF v_uid IS NULL THEN
+    RAISE EXCEPTION 'not_authenticated';
+  END IF;
+
+  IF p_method_id IS NULL THEN
+    RAISE EXCEPTION 'invalid_method_id';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM public.payout_methods
+    WHERE id = p_method_id
+      AND user_id = v_uid
+  ) THEN
+    RETURN false;
+  END IF;
+
+  UPDATE public.payout_methods
+  SET is_default = (id = p_method_id)
+  WHERE user_id = v_uid;
+
+  RETURN true;
 END;
 $function$
 

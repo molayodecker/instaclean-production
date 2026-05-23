@@ -3602,22 +3602,29 @@ CREATE OR REPLACE FUNCTION "public"."normalize_phone_for_users"("raw_phone" "tex
     LANGUAGE "plpgsql" IMMUTABLE
     AS $_$
 DECLARE
-  digits text;
   cleaned text;
+  digits text;
 BEGIN
   IF raw_phone IS NULL OR btrim(raw_phone) = '' THEN
     RETURN NULL;
   END IF;
 
-  cleaned := regexp_replace(btrim(raw_phone), '[\s\-\(\)]', '', 'g');
-  digits := regexp_replace(cleaned, '\D', '', 'g');
+  -- Remove spaces, dashes, parentheses, dots.
+  cleaned := regexp_replace(btrim(raw_phone), '[\s\-\(\)\.]', '', 'g');
 
-  -- Accept already-normalized international E.164 numbers.
-  IF cleaned ~ '^\+[1-9][0-9]{6,14}$' THEN
-    RETURN cleaned;
+  -- Convert international 00-prefix to + (e.g. 00233...).
+  IF cleaned ~ '^00[1-9][0-9]{6,14}$' THEN
+    cleaned := '+' || substring(cleaned from 3);
   END IF;
 
-  -- Ghana convenience fallback: 0241234567 -> +233241234567.
+  -- Canonical E.164 with plus.
+  IF cleaned ~ '^\+[1-9][0-9]{6,14}$' THEN
+    RETURN '+' || regexp_replace(cleaned, '\D', '', 'g');
+  END IF;
+
+  digits := regexp_replace(cleaned, '\D', '', 'g');
+
+  -- Ghana local: 0241234567 -> +233241234567.
   IF digits ~ '^0[2-5][0-9]{8}$' THEN
     RETURN '+233' || substring(digits from 2);
   END IF;
@@ -3629,10 +3636,9 @@ BEGIN
 
   -- Ghana without plus: 233241234567 -> +233241234567.
   IF digits ~ '^233[2-5][0-9]{8}$' THEN
-    RETURN '+' || digits;
+    RETURN '+233' || substring(digits from 4);
   END IF;
 
-  -- Do not guess bare international numbers like 13019791778.
   RETURN NULL;
 END;
 $_$;
@@ -3677,6 +3683,38 @@ $$;
 
 
 ALTER FUNCTION "public"."psk_transaction"("p_booking_id" "uuid", "p_user_id" "uuid", "p_reference" "text", "p_paystack_id" bigint, "p_amount" numeric, "p_fee_amount" numeric, "p_total_captured" numeric, "p_currency" "text", "p_metadata" "jsonb") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."queue_avatar_storage_deletion"("p_object_path" "text", "p_delete_after" timestamp with time zone DEFAULT ("now"() + '24:00:00'::interval)) RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_user_id uuid := auth.uid();
+BEGIN
+  IF v_user_id IS NULL THEN
+    RAISE EXCEPTION 'Not authenticated' USING ERRCODE = '42501';
+  END IF;
+
+  IF p_object_path IS NULL OR btrim(p_object_path) = '' THEN
+    RAISE EXCEPTION 'object_path is required' USING ERRCODE = '22004';
+  END IF;
+
+  IF btrim(p_object_path) NOT LIKE v_user_id::text || '/%' THEN
+    RAISE EXCEPTION 'Invalid avatar object path' USING ERRCODE = '42501';
+  END IF;
+
+  INSERT INTO public.avatar_storage_deletions (user_id, bucket, object_path, delete_after)
+  VALUES (v_user_id, 'avatars', btrim(p_object_path), p_delete_after)
+  ON CONFLICT ON CONSTRAINT avatar_storage_deletions_bucket_object_path_key
+  DO UPDATE SET
+    delete_after = EXCLUDED.delete_after,
+    user_id = EXCLUDED.user_id;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."queue_avatar_storage_deletion"("p_object_path" "text", "p_delete_after" timestamp with time zone) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."record_lookup_attempt"("p_scope" "text", "p_key" "text", "p_max_attempts" integer, "p_window_seconds" integer) RETURNS boolean
@@ -3995,6 +4033,46 @@ $$;
 
 
 ALTER FUNCTION "public"."set_booking_timezone"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."set_default_payout_method"("p_method_id" "uuid") RETURNS boolean
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_uid uuid := auth.uid();
+BEGIN
+  IF v_uid IS NULL THEN
+    RAISE EXCEPTION 'not_authenticated';
+  END IF;
+
+  IF p_method_id IS NULL THEN
+    RAISE EXCEPTION 'invalid_method_id';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM public.payout_methods
+    WHERE id = p_method_id
+      AND user_id = v_uid
+  ) THEN
+    RETURN false;
+  END IF;
+
+  UPDATE public.payout_methods
+  SET is_default = (id = p_method_id)
+  WHERE user_id = v_uid;
+
+  RETURN true;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."set_default_payout_method"("p_method_id" "uuid") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."set_default_payout_method"("p_method_id" "uuid") IS 'Sets exactly one default payout method for auth.uid() in a single UPDATE.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."set_updated_at"() RETURNS "trigger"
@@ -4587,6 +4665,23 @@ CREATE TABLE IF NOT EXISTS "public"."availability" (
 
 
 ALTER TABLE "public"."availability" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."avatar_storage_deletions" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "bucket" "text" DEFAULT 'avatars'::"text" NOT NULL,
+    "object_path" "text" NOT NULL,
+    "delete_after" timestamp with time zone NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."avatar_storage_deletions" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."avatar_storage_deletions" IS 'Storage objects to delete after the grace period when a user replaces their profile avatar.';
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."base_durations" (
@@ -5682,6 +5777,26 @@ COMMENT ON COLUMN "public"."payout_methods"."updated_at" IS 'Maintained by BEFOR
 
 
 
+CREATE TABLE IF NOT EXISTS "public"."payout_recipient_audit" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "recipient_code" "text",
+    "recipient_type" "text" NOT NULL,
+    "currency" "text" NOT NULL,
+    "masked_account" "text" NOT NULL,
+    "bank_code" "text",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "payout_recipient_audit_recipient_type_check" CHECK (("recipient_type" = ANY (ARRAY['nuban'::"text", 'mobile_money'::"text"])))
+);
+
+
+ALTER TABLE "public"."payout_recipient_audit" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."payout_recipient_audit" IS 'Append-only audit log when Paystack transfer recipients are created or reused.';
+
+
+
 CREATE TABLE IF NOT EXISTS "public"."platform_fees" (
     "id" "uuid" DEFAULT "extensions"."uuid_generate_v4"() NOT NULL,
     "fee_type" "text" NOT NULL,
@@ -6041,7 +6156,8 @@ CREATE TABLE IF NOT EXISTS "public"."users" (
     "created_at" timestamp with time zone DEFAULT "now"(),
     "updated_at" timestamp with time zone DEFAULT "now"(),
     "last_updated" timestamp with time zone DEFAULT "now"(),
-    "password_hash" "text"
+    "password_hash" "text",
+    CONSTRAINT "users_phone_e164_chk" CHECK ((("phone" IS NULL) OR ("phone" ~ '^\+?[1-9][0-9]{7,14}$'::"text")))
 );
 
 
@@ -6168,6 +6284,16 @@ ALTER TABLE ONLY "public"."auth_lookup_rate_limit"
 
 ALTER TABLE ONLY "public"."availability"
     ADD CONSTRAINT "availability_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."avatar_storage_deletions"
+    ADD CONSTRAINT "avatar_storage_deletions_bucket_object_path_key" UNIQUE ("bucket", "object_path");
+
+
+
+ALTER TABLE ONLY "public"."avatar_storage_deletions"
+    ADD CONSTRAINT "avatar_storage_deletions_pkey" PRIMARY KEY ("id");
 
 
 
@@ -6426,6 +6552,11 @@ ALTER TABLE ONLY "public"."payout_methods"
 
 
 
+ALTER TABLE ONLY "public"."payout_recipient_audit"
+    ADD CONSTRAINT "payout_recipient_audit_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."platform_fees"
     ADD CONSTRAINT "platform_fees_pkey" PRIMARY KEY ("id");
 
@@ -6557,6 +6688,11 @@ ALTER TABLE ONLY "public"."users"
 
 
 ALTER TABLE ONLY "public"."users"
+    ADD CONSTRAINT "users_phone_unique" UNIQUE ("phone");
+
+
+
+ALTER TABLE ONLY "public"."users"
     ADD CONSTRAINT "users_pkey" PRIMARY KEY ("id");
 
 
@@ -6630,6 +6766,10 @@ CREATE INDEX "auth_identity_lookup_providers_idx" ON "public"."auth_identity_loo
 
 
 CREATE INDEX "auth_lookup_rate_limit_window_idx" ON "public"."auth_lookup_rate_limit" USING "btree" ("window_start");
+
+
+
+CREATE INDEX "avatar_storage_deletions_delete_after_idx" ON "public"."avatar_storage_deletions" USING "btree" ("delete_after");
 
 
 
@@ -7221,6 +7361,18 @@ COMMENT ON INDEX "public"."one_default_payout_method_per_user" IS 'At most one p
 
 
 
+CREATE UNIQUE INDEX "payout_methods_one_default_per_user" ON "public"."payout_methods" USING "btree" ("user_id") WHERE ("is_default" IS TRUE);
+
+
+
+CREATE INDEX "payout_recipient_audit_recipient_code_idx" ON "public"."payout_recipient_audit" USING "btree" ("recipient_code") WHERE ("recipient_code" IS NOT NULL);
+
+
+
+CREATE INDEX "payout_recipient_audit_user_id_created_at_idx" ON "public"."payout_recipient_audit" USING "btree" ("user_id", "created_at" DESC);
+
+
+
 CREATE UNIQUE INDEX "profiles_user_id_key" ON "public"."profiles" USING "btree" ("user_id");
 
 
@@ -7241,7 +7393,7 @@ CREATE INDEX "user_login_sessions_user_id_idx" ON "public"."user_login_sessions"
 
 
 
-CREATE UNIQUE INDEX "users_phone_unique" ON "public"."users" USING "btree" ("phone") WHERE ("phone" IS NOT NULL);
+CREATE UNIQUE INDEX "users_phone_unique_idx" ON "public"."users" USING "btree" ("phone") WHERE ("phone" IS NOT NULL);
 
 
 
@@ -7308,6 +7460,11 @@ ALTER TABLE ONLY "public"."auth_identity_lookup"
 
 ALTER TABLE ONLY "public"."availability"
     ADD CONSTRAINT "availability_cleaner_id_fkey" FOREIGN KEY ("cleaner_id") REFERENCES "public"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."avatar_storage_deletions"
+    ADD CONSTRAINT "avatar_storage_deletions_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
 
@@ -7513,6 +7670,11 @@ ALTER TABLE ONLY "public"."notifications"
 
 ALTER TABLE ONLY "public"."payout_methods"
     ADD CONSTRAINT "payout_methods_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."payout_recipient_audit"
+    ADD CONSTRAINT "payout_recipient_audit_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
 
@@ -7831,6 +7993,14 @@ CREATE POLICY "Send_Messages_In_Joined_Convos" ON "public"."messages" FOR INSERT
 
 
 
+CREATE POLICY "Service role full access on avatar_storage_deletions" ON "public"."avatar_storage_deletions" TO "service_role" USING (true) WITH CHECK (true);
+
+
+
+CREATE POLICY "Service role full access on payout_recipient_audit" ON "public"."payout_recipient_audit" TO "service_role" USING (true) WITH CHECK (true);
+
+
+
 CREATE POLICY "System can view all availability exceptions" ON "public"."cleaner_availability_exceptions" FOR SELECT USING (true);
 
 
@@ -7870,6 +8040,18 @@ CREATE POLICY "Users can view related user data via helper" ON "public"."users" 
 
 
 CREATE POLICY "Users can view their own roles" ON "public"."user_roles" FOR SELECT USING (("auth"."uid"() = "user_id"));
+
+
+
+CREATE POLICY "Users queue own avatar deletions" ON "public"."avatar_storage_deletions" FOR INSERT TO "authenticated" WITH CHECK ((("user_id" = ( SELECT "auth"."uid"() AS "uid")) AND ("bucket" = 'avatars'::"text") AND ("object_path" ~~ ((( SELECT "auth"."uid"() AS "uid"))::"text" || '/%'::"text"))));
+
+
+
+CREATE POLICY "Users read own avatar deletions" ON "public"."avatar_storage_deletions" FOR SELECT TO "authenticated" USING ((("user_id" = ( SELECT "auth"."uid"() AS "uid")) AND ("bucket" = 'avatars'::"text") AND ("object_path" ~~ ((( SELECT "auth"."uid"() AS "uid"))::"text" || '/%'::"text"))));
+
+
+
+CREATE POLICY "Users update own avatar deletions" ON "public"."avatar_storage_deletions" FOR UPDATE TO "authenticated" USING ((("user_id" = ( SELECT "auth"."uid"() AS "uid")) AND ("bucket" = 'avatars'::"text") AND ("object_path" ~~ ((( SELECT "auth"."uid"() AS "uid"))::"text" || '/%'::"text")))) WITH CHECK ((("user_id" = ( SELECT "auth"."uid"() AS "uid")) AND ("bucket" = 'avatars'::"text") AND ("object_path" ~~ ((( SELECT "auth"."uid"() AS "uid"))::"text" || '/%'::"text"))));
 
 
 
@@ -8085,6 +8267,9 @@ CREATE POLICY "authenticated_read_invite_codes" ON "public"."invite_codes" FOR S
 
 
 ALTER TABLE "public"."availability" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."avatar_storage_deletions" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."base_durations" ENABLE ROW LEVEL SECURITY;
@@ -8362,6 +8547,9 @@ CREATE POLICY "payout_methods_owner_select" ON "public"."payout_methods" FOR SEL
 
 CREATE POLICY "payout_methods_owner_update" ON "public"."payout_methods" FOR UPDATE TO "authenticated" USING (("user_id" = "auth"."uid"())) WITH CHECK (("user_id" = "auth"."uid"()));
 
+
+
+ALTER TABLE "public"."payout_recipient_audit" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."platform_fees" ENABLE ROW LEVEL SECURITY;
@@ -12553,6 +12741,13 @@ GRANT ALL ON FUNCTION "public"."psk_transaction"("p_booking_id" "uuid", "p_user_
 
 
 
+REVOKE ALL ON FUNCTION "public"."queue_avatar_storage_deletion"("p_object_path" "text", "p_delete_after" timestamp with time zone) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."queue_avatar_storage_deletion"("p_object_path" "text", "p_delete_after" timestamp with time zone) TO "anon";
+GRANT ALL ON FUNCTION "public"."queue_avatar_storage_deletion"("p_object_path" "text", "p_delete_after" timestamp with time zone) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."queue_avatar_storage_deletion"("p_object_path" "text", "p_delete_after" timestamp with time zone) TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."record_lookup_attempt"("p_scope" "text", "p_key" "text", "p_max_attempts" integer, "p_window_seconds" integer) FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."record_lookup_attempt"("p_scope" "text", "p_key" "text", "p_max_attempts" integer, "p_window_seconds" integer) TO "anon";
 GRANT ALL ON FUNCTION "public"."record_lookup_attempt"("p_scope" "text", "p_key" "text", "p_max_attempts" integer, "p_window_seconds" integer) TO "authenticated";
@@ -12601,6 +12796,12 @@ GRANT ALL ON FUNCTION "public"."search_available_cleaners"("p_lat" double precis
 GRANT ALL ON FUNCTION "public"."set_booking_timezone"() TO "anon";
 GRANT ALL ON FUNCTION "public"."set_booking_timezone"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."set_booking_timezone"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."set_default_payout_method"("p_method_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."set_default_payout_method"("p_method_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."set_default_payout_method"("p_method_id" "uuid") TO "service_role";
 
 
 
@@ -15844,6 +16045,8 @@ GRANT ALL ON TABLE "public"."account_merges" TO "service_role";
 
 
 GRANT ALL ON TABLE "public"."auth_identity_lookup" TO "service_role";
+GRANT SELECT ON TABLE "public"."auth_identity_lookup" TO "anon";
+GRANT SELECT ON TABLE "public"."auth_identity_lookup" TO "authenticated";
 
 
 
@@ -15854,6 +16057,12 @@ GRANT ALL ON TABLE "public"."auth_lookup_rate_limit" TO "service_role";
 GRANT ALL ON TABLE "public"."availability" TO "anon";
 GRANT ALL ON TABLE "public"."availability" TO "authenticated";
 GRANT ALL ON TABLE "public"."availability" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."avatar_storage_deletions" TO "anon";
+GRANT ALL ON TABLE "public"."avatar_storage_deletions" TO "authenticated";
+GRANT ALL ON TABLE "public"."avatar_storage_deletions" TO "service_role";
 
 
 
@@ -16151,6 +16360,12 @@ GRANT ALL ON TABLE "public"."payment_split_config" TO "service_role";
 GRANT ALL ON TABLE "public"."payout_methods" TO "anon";
 GRANT ALL ON TABLE "public"."payout_methods" TO "authenticated";
 GRANT ALL ON TABLE "public"."payout_methods" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."payout_recipient_audit" TO "anon";
+GRANT ALL ON TABLE "public"."payout_recipient_audit" TO "authenticated";
+GRANT ALL ON TABLE "public"."payout_recipient_audit" TO "service_role";
 
 
 
