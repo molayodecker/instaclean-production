@@ -4041,6 +4041,7 @@ CREATE OR REPLACE FUNCTION "public"."set_default_payout_method"("p_method_id" "u
     AS $$
 DECLARE
   v_uid uuid := auth.uid();
+  v_purpose text;
 BEGIN
   IF v_uid IS NULL THEN
     RAISE EXCEPTION 'not_authenticated';
@@ -4050,18 +4051,20 @@ BEGIN
     RAISE EXCEPTION 'invalid_method_id';
   END IF;
 
-  IF NOT EXISTS (
-    SELECT 1
-    FROM public.payout_methods
-    WHERE id = p_method_id
-      AND user_id = v_uid
-  ) THEN
+  SELECT pm.purpose
+  INTO v_purpose
+  FROM public.payout_methods pm
+  WHERE pm.id = p_method_id
+    AND pm.user_id = v_uid;
+
+  IF v_purpose IS NULL THEN
     RETURN false;
   END IF;
 
   UPDATE public.payout_methods
   SET is_default = (id = p_method_id)
-  WHERE user_id = v_uid;
+  WHERE user_id = v_uid
+    AND purpose = v_purpose;
 
   RETURN true;
 END;
@@ -4071,7 +4074,7 @@ $$;
 ALTER FUNCTION "public"."set_default_payout_method"("p_method_id" "uuid") OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."set_default_payout_method"("p_method_id" "uuid") IS 'Sets exactly one default payout method for auth.uid() in a single UPDATE.';
+COMMENT ON FUNCTION "public"."set_default_payout_method"("p_method_id" "uuid") IS 'Sets exactly one default payout/refund method per auth.uid() and purpose in a single UPDATE.';
 
 
 
@@ -5762,7 +5765,9 @@ CREATE TABLE IF NOT EXISTS "public"."payout_methods" (
     "is_primary" boolean DEFAULT false,
     "is_default" boolean DEFAULT false,
     "created_at" timestamp with time zone DEFAULT "now"(),
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "purpose" "text" DEFAULT 'payout'::"text" NOT NULL,
+    CONSTRAINT "payout_methods_purpose_check" CHECK (("purpose" = ANY (ARRAY['payout'::"text", 'refund'::"text"])))
 );
 
 
@@ -5774,6 +5779,10 @@ COMMENT ON TABLE "public"."payout_methods" IS 'Cleaner payout destinations; clie
 
 
 COMMENT ON COLUMN "public"."payout_methods"."updated_at" IS 'Maintained by BEFORE UPDATE trigger and default on INSERT.';
+
+
+
+COMMENT ON COLUMN "public"."payout_methods"."purpose" IS 'payout = cleaner earnings destination; refund = customer refund destination. Same Paystack recipient_code may appear on both.';
 
 
 
@@ -6544,11 +6553,6 @@ ALTER TABLE ONLY "public"."payment_split_config"
 
 ALTER TABLE ONLY "public"."payout_methods"
     ADD CONSTRAINT "payout_methods_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."payout_methods"
-    ADD CONSTRAINT "payout_methods_recipient_code_key" UNIQUE ("recipient_code");
 
 
 
@@ -7361,7 +7365,11 @@ COMMENT ON INDEX "public"."one_default_payout_method_per_user" IS 'At most one p
 
 
 
-CREATE UNIQUE INDEX "payout_methods_one_default_per_user" ON "public"."payout_methods" USING "btree" ("user_id") WHERE ("is_default" IS TRUE);
+CREATE UNIQUE INDEX "payout_methods_one_default_per_user_purpose" ON "public"."payout_methods" USING "btree" ("user_id", "purpose") WHERE ("is_default" IS TRUE);
+
+
+
+CREATE UNIQUE INDEX "payout_methods_user_purpose_account_unique" ON "public"."payout_methods" USING "btree" ("user_id", "purpose", "type", "account_number", COALESCE("bank_code", ''::"text"));
 
 
 

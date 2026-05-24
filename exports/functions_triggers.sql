@@ -8233,6 +8233,7 @@ CREATE OR REPLACE FUNCTION public.set_default_payout_method(p_method_id uuid)
 AS $function$
 DECLARE
   v_uid uuid := auth.uid();
+  v_purpose text;
 BEGIN
   IF v_uid IS NULL THEN
     RAISE EXCEPTION 'not_authenticated';
@@ -8242,18 +8243,20 @@ BEGIN
     RAISE EXCEPTION 'invalid_method_id';
   END IF;
 
-  IF NOT EXISTS (
-    SELECT 1
-    FROM public.payout_methods
-    WHERE id = p_method_id
-      AND user_id = v_uid
-  ) THEN
+  SELECT pm.purpose
+  INTO v_purpose
+  FROM public.payout_methods pm
+  WHERE pm.id = p_method_id
+    AND pm.user_id = v_uid;
+
+  IF v_purpose IS NULL THEN
     RETURN false;
   END IF;
 
   UPDATE public.payout_methods
   SET is_default = (id = p_method_id)
-  WHERE user_id = v_uid;
+  WHERE user_id = v_uid
+    AND purpose = v_purpose;
 
   RETURN true;
 END;
