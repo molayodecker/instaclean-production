@@ -7,15 +7,20 @@ on:
       - "roles.sql"
       - "schema.sql"
       - "data.sql.gz"
+      - "schema.sql.gz"
       - "exports/**"
+
   pull_request:
     branches: [main]
     paths-ignore:
       - "roles.sql"
       - "schema.sql"
       - "data.sql.gz"
+      - "schema.sql.gz"
       - "exports/**"
+
   workflow_dispatch:
+
   schedule:
     - cron: "0 0 * * *" # daily at midnight UTC
 
@@ -26,6 +31,7 @@ concurrency:
 jobs:
   run_db_backup:
     runs-on: ubuntu-latest
+
     permissions:
       contents: write
 
@@ -41,16 +47,21 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           if [ "${BACKUP_ENABLED:-false}" != "true" ]; then
             echo "Backups disabled. Set BACKUP_ENABLED=true in repository secrets to run."
             echo "enabled=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+
           if [ -z "${SUPABASE_DB_URL:-}" ]; then
-            echo "::error::SUPABASE_DB_URL secret is missing or empty. Add your postgresql:// connection URI under Settings → Secrets and variables → Actions."
+            echo "::error::SUPABASE_DB_URL secret is missing or empty."
+            echo "::error::Add your postgresql:// connection URI under Settings → Secrets and variables → Actions."
             exit 1
           fi
+
           python3 -c "import os, urllib.parse; u=os.environ['SUPABASE_DB_URL']; p=urllib.parse.urlparse(u); assert p.scheme in ('postgresql', 'postgres') and p.hostname, 'SUPABASE_DB_URL must be a postgresql:// URI with a host'"
+
           echo "enabled=true" >> "$GITHUB_OUTPUT"
 
       - name: Determine backup mode
@@ -74,10 +85,9 @@ jobs:
           else
             echo "mode=schema" >> "$GITHUB_OUTPUT"
             echo "upload_to_r2=false" >> "$GITHUB_OUTPUT"
-            echo "Running SCHEMA-ONLY backup"
+            echo "Running SCHEMA + SAFE CONFIG backup"
           fi
 
-          # Schema + functions/triggers to R2 on every run when R2 secrets are set (not only full data dumps).
           echo "upload_ddl_to_r2=true" >> "$GITHUB_OUTPUT"
 
       - name: Checkout main branch
@@ -132,15 +142,18 @@ jobs:
           set -euo pipefail
 
           HOST=$(python3 -c "import os, urllib.parse; print(urllib.parse.urlparse(os.environ['SUPABASE_DB_URL']).hostname or '')")
+
           echo "Host: $HOST"
+
           if [ -z "$HOST" ]; then
-            echo "::error::Could not parse hostname from SUPABASE_DB_URL" >&2
+            echo "::error::Could not parse hostname from SUPABASE_DB_URL"
             exit 1
           fi
 
           IPV4=$(getent ahostsv4 "$HOST" | awk '/RAW/ {print $1; exit}')
+
           if [ -z "$IPV4" ]; then
-            echo "Error: Could not resolve IPv4 for $HOST" >&2
+            echo "::error::Could not resolve IPv4 for $HOST"
             exit 1
           fi
 
@@ -162,8 +175,14 @@ jobs:
 
           mkdir -p exports
 
-          supabase db dump --db-url "$SUPABASE_DB_URL_IPV4" -f roles.sql --role-only
-          supabase db dump --db-url "$SUPABASE_DB_URL_IPV4" -f schema.sql
+          supabase db dump \
+            --db-url "$SUPABASE_DB_URL_IPV4" \
+            -f roles.sql \
+            --role-only
+
+          supabase db dump \
+            --db-url "$SUPABASE_DB_URL_IPV4" \
+            -f schema.sql
 
       - name: Dump functions and triggers
         if: steps.gate.outputs.enabled == 'true'
@@ -171,25 +190,20 @@ jobs:
         run: |
           set -euo pipefail
 
+          mkdir -p exports
+
           /usr/lib/postgresql/17/bin/psql "$SUPABASE_DB_URL_IPV4" \
             -v ON_ERROR_STOP=1 \
             -q \
             -f scripts/dump_functions_triggers.sql
 
-      - name: Dump full data
-        if: steps.gate.outputs.enabled == 'true' && steps.mode.outputs.mode == 'full'
+      - name: Export safe config tables to compressed SQL file
+        if: steps.gate.outputs.enabled == 'true'
         shell: bash
         run: |
           set -euo pipefail
 
-          supabase db dump --db-url "$SUPABASE_DB_URL_IPV4" --data-only --use-copy | gzip > data.sql.gz
-          rm -f data.sql
-
-      - name: Export config tables to compressed SQL file
-        if: steps.gate.outputs.enabled == 'true' && steps.mode.outputs.mode == 'full'
-        shell: bash
-        run: |
-          set -euo pipefail
+          mkdir -p exports
 
           /usr/lib/postgresql/17/bin/pg_dump "$SUPABASE_DB_URL_IPV4" \
             --data-only \
@@ -204,24 +218,40 @@ jobs:
             --table=public.timezones \
             | gzip > exports/config_data.sql.gz
 
+      - name: Dump full data
+        if: steps.gate.outputs.enabled == 'true' && steps.mode.outputs.mode == 'full'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          supabase db dump \
+            --db-url "$SUPABASE_DB_URL_IPV4" \
+            --data-only \
+            --use-copy \
+            | gzip > data.sql.gz
+
+          rm -f data.sql
+
       - name: Show generated files
         if: steps.gate.outputs.enabled == 'true'
         shell: bash
         run: |
           set -euo pipefail
-          ls -lh roles.sql schema.sql exports/functions_triggers.sql || true
-          ls -lh data.sql.gz exports/config_data.sql.gz || true
 
-      - name: Commit schema, roles, and functions/triggers to GitHub
+          echo "Generated backup files:"
+          ls -lh roles.sql schema.sql exports/functions_triggers.sql exports/config_data.sql.gz || true
+          ls -lh data.sql.gz || true
+
+      - name: Commit schema, roles, functions/triggers, and safe config data to GitHub
         if: steps.gate.outputs.enabled == 'true' && github.event_name != 'pull_request'
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "chore: schema backup [skip ci]"
-          file_pattern: "roles.sql schema.sql exports/functions_triggers.sql"
+          commit_message: "chore: database backup [skip ci]"
+          file_pattern: "roles.sql schema.sql exports/functions_triggers.sql exports/config_data.sql.gz"
           commit_user_name: github-actions[bot]
           commit_user_email: github-actions[bot]@users.noreply.github.com
 
-      - name: Upload schema and functions/triggers to Cloudflare R2
+      - name: Upload schema, functions/triggers, and safe config data to Cloudflare R2
         if: >
           steps.gate.outputs.enabled == 'true' &&
           steps.mode.outputs.upload_ddl_to_r2 == 'true' &&
@@ -235,24 +265,42 @@ jobs:
         run: |
           set -euo pipefail
 
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+            echo "::warning::R2 credentials are missing. Skipping R2 upload."
+            exit 0
+          fi
+
           ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
           DATE=$(date -u +%Y-%m-%d)
           RUN_ID="${{ github.run_id }}"
           PREFIX="s3://$R2_BUCKET_NAME/$DATE/$RUN_ID"
 
           gzip -c schema.sql > schema.sql.gz
+          gzip -c roles.sql > roles.sql.gz
           gzip -c exports/functions_triggers.sql > exports/functions_triggers.sql.gz
 
           aws s3 cp schema.sql.gz \
             "$PREFIX/schema.sql.gz" \
             --endpoint-url "$ENDPOINT"
 
+          aws s3 cp roles.sql.gz \
+            "$PREFIX/roles.sql.gz" \
+            --endpoint-url "$ENDPOINT"
+
           aws s3 cp exports/functions_triggers.sql.gz \
             "$PREFIX/functions_triggers.sql.gz" \
             --endpoint-url "$ENDPOINT"
 
-      - name: Upload full data backups to Cloudflare R2
-        if: steps.gate.outputs.enabled == 'true' && steps.mode.outputs.upload_to_r2 == 'true'
+          aws s3 cp exports/config_data.sql.gz \
+            "$PREFIX/config_data.sql.gz" \
+            --endpoint-url "$ENDPOINT"
+
+      - name: Upload full data backup to Cloudflare R2
+        if: >
+          steps.gate.outputs.enabled == 'true' &&
+          steps.mode.outputs.upload_to_r2 == 'true' &&
+          env.R2_BUCKET_NAME != '' &&
+          env.R2_ACCOUNT_ID != ''
         shell: bash
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
@@ -261,6 +309,16 @@ jobs:
         run: |
           set -euo pipefail
 
+          if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
+            echo "::error::R2 credentials are missing. Full data backup cannot be uploaded."
+            exit 1
+          fi
+
+          if [ ! -f data.sql.gz ]; then
+            echo "::error::data.sql.gz was not generated."
+            exit 1
+          fi
+
           ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
           DATE=$(date -u +%Y-%m-%d)
           RUN_ID="${{ github.run_id }}"
@@ -268,8 +326,4 @@ jobs:
 
           aws s3 cp data.sql.gz \
             "$PREFIX/data.sql.gz" \
-            --endpoint-url "$ENDPOINT"
-
-          aws s3 cp exports/config_data.sql.gz \
-            "$PREFIX/config_data.sql.gz" \
             --endpoint-url "$ENDPOINT"

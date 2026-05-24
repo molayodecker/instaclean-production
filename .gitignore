@@ -1,2 +1,9 @@
 .env
 .envrc
+
+# Generated backup artifacts (stored in R2 / CI only)
+data.sql
+data.sql.gz
+schema.sql.gz
+roles.sql.gz
+exports/functions_triggers.sql.gz
