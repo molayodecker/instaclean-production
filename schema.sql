@@ -1307,6 +1307,62 @@ $$;
 ALTER FUNCTION "public"."create_preferred_cleaner_invite"("p_invitee_email" "text", "p_invitee_phone_e164" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."decline_booking_by_cleaner"("p_booking_id" "uuid", "p_reason" "text" DEFAULT NULL::"text") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_row public.bookings%ROWTYPE;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  IF p_booking_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'missing_booking_id');
+  END IF;
+
+  SELECT * INTO v_row
+  FROM public.bookings
+  WHERE id = p_booking_id
+    AND cleaner_id = v_uid
+    AND status IN ('confirmed', 'scheduled')
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_declinable');
+  END IF;
+
+  UPDATE public.bookings
+  SET
+    status = 'cancelled',
+    updated_at = now()
+  WHERE id = p_booking_id;
+
+  IF v_row.customer_id IS NOT NULL THEN
+    INSERT INTO public.notifications (user_id, type, title, message, data)
+    VALUES (
+      v_row.customer_id,
+      'booking_cancelled',
+      'Booking cancelled',
+      'Your cleaner had to decline this job. Please book again or contact support if you need help.',
+      jsonb_build_object(
+        'booking_id', p_booking_id,
+        'declined_by_cleaner_id', v_uid,
+        'reason', NULLIF(trim(p_reason), '')
+      )
+    );
+  END IF;
+
+  RETURN jsonb_build_object('success', true, 'booking_id', p_booking_id);
+END;
+$$;
+
+
+ALTER FUNCTION "public"."decline_booking_by_cleaner"("p_booking_id" "uuid", "p_reason" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."ensure_single_default_platform_fee"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     AS $$
@@ -9892,6 +9948,13 @@ GRANT ALL ON FUNCTION "public"."date_dist"("date", "date") TO "postgres";
 GRANT ALL ON FUNCTION "public"."date_dist"("date", "date") TO "anon";
 GRANT ALL ON FUNCTION "public"."date_dist"("date", "date") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."date_dist"("date", "date") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."decline_booking_by_cleaner"("p_booking_id" "uuid", "p_reason" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."decline_booking_by_cleaner"("p_booking_id" "uuid", "p_reason" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."decline_booking_by_cleaner"("p_booking_id" "uuid", "p_reason" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."decline_booking_by_cleaner"("p_booking_id" "uuid", "p_reason" "text") TO "service_role";
 
 
 
