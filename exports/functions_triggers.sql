@@ -4864,54 +4864,47 @@ CREATE OR REPLACE FUNCTION public.get_best_available_cleaners(p_date date, p_tim
  RETURNS TABLE(cleaner_id uuid, cleaner_name text, avatar_url text, bio text, hourly_rate numeric, rating double precision, distance_meters double precision, final_score double precision)
  LANGUAGE plpgsql
  STABLE
-AS $function$DECLARE 
-  v_cust_id uuid := auth.uid(); 
+AS $function$
+DECLARE
+  v_cust_id uuid := auth.uid();
   v_booking_range tstzrange;
   v_cust_loc geography := ST_SetSRID(ST_MakePoint(p_lng, p_lat), 4326)::geography;
-BEGIN 
-  -- 1. Security Check
+BEGIN
   IF v_cust_id IS NULL THEN
     RAISE EXCEPTION 'Not authorized';
   END IF;
 
-  -- 2. Define the Booking Window
   v_booking_range := tstzrange(
-    (p_date + p_time)::timestamptz, 
-    (p_date + p_time + (p_duration || ' hours')::interval)::timestamptz, 
+    (p_date + p_time)::timestamptz,
+    (p_date + p_time + (p_duration || ' hours')::interval)::timestamptz,
     '[)'
   );
 
-  -- 3. Return Query
   RETURN QUERY
   WITH available_cleaners AS (
-    SELECT 
-      cd.user_id AS cleaner_user_id, 
-      p.fullname AS cleaner_fullname, 
-      p.avatar_url AS profile_avatar_url, 
-      COALESCE(cd.bio, p.bio) AS profile_bio, 
-      cd.hourly_rate AS cleaner_hourly_rate, 
-      cd.rating AS cleaner_rating, 
-      cd.skills AS cleaner_skills, 
+    SELECT
+      cd.user_id AS cleaner_user_id,
+      p.fullname AS cleaner_fullname,
+      p.avatar_url AS profile_avatar_url,
+      COALESCE(cd.bio, p.bio) AS profile_bio,
+      cd.hourly_rate AS cleaner_hourly_rate,
+      cd.rating AS cleaner_rating,
+      cd.skills AS cleaner_skills,
       cd.specialties AS cleaner_specialties,
-
-      COALESCE(
-        cd.base_location::geography,
-        p.location_wkt
-      ) AS effective_location,
-
+      COALESCE(cd.base_location::geography, p.location_wkt) AS effective_location,
       ST_Distance(
         COALESCE(cd.base_location::geography, p.location_wkt),
         v_cust_loc
       )::float AS dist
-
     FROM public.cleaner_data cd
-    JOIN public.profiles p
-      ON p.user_id = cd.user_id
-
+    JOIN public.profiles p ON p.user_id = cd.user_id
     WHERE cd.status = 'active'
       AND cd.verified = true
       AND COALESCE(cd.base_location::geography, p.location_wkt) IS NOT NULL
-
+      AND (
+        auth.uid() = cd.user_id
+        OR public.is_profile_discoverable_by_others(p)
+      )
       AND ST_DWithin(
         COALESCE(cd.base_location::geography, p.location_wkt),
         v_cust_loc,
@@ -4920,15 +4913,13 @@ BEGIN
           p_max_distance_meters
         )
       )
-
       AND NOT EXISTS (
         SELECT 1
-        FROM public.bookings b 
-        WHERE b.cleaner_id = cd.user_id 
+        FROM public.bookings b
+        WHERE b.cleaner_id = cd.user_id
           AND b.booking_period && v_booking_range
           AND b.status != 'cancelled'
       )
-
       AND NOT EXISTS (
         SELECT 1
         FROM public.cleaner_availability_exceptions cae
@@ -4936,9 +4927,8 @@ BEGIN
           AND cae.exception_date = p_date
       )
   ),
-
   scored_cleaners AS (
-    SELECT 
+    SELECT
       ac.cleaner_user_id,
       ac.cleaner_fullname,
       ac.profile_avatar_url,
@@ -4948,40 +4938,35 @@ BEGIN
       ac.cleaner_skills,
       ac.cleaner_specialties,
       ac.dist,
-
-      CASE 
-        WHEN cardinality(COALESCE(p_requested_services, ARRAY[]::text[])) > 0 
+      CASE
+        WHEN cardinality(COALESCE(p_requested_services, ARRAY[]::text[])) > 0
         THEN (
           SELECT count(*)::float / cardinality(p_requested_services)
-          FROM unnest(p_requested_services) s 
+          FROM unnest(p_requested_services) s
           WHERE s = ANY(COALESCE(ac.cleaner_skills, ARRAY[]::text[]))
              OR s = ANY(COALESCE(ac.cleaner_specialties, ARRAY[]::text[]))
         ) * 40
-        ELSE 20 
+        ELSE 20
       END AS s_score
-
     FROM available_cleaners ac
   )
-
-  SELECT 
-    sc.cleaner_user_id AS cleaner_id, 
-    sc.cleaner_fullname AS cleaner_name, 
-    sc.profile_avatar_url AS avatar_url, 
-    sc.profile_bio AS bio, 
-    sc.cleaner_hourly_rate AS hourly_rate, 
-    sc.cleaner_rating::float AS rating, 
+  SELECT
+    sc.cleaner_user_id AS cleaner_id,
+    sc.cleaner_fullname AS cleaner_name,
+    sc.profile_avatar_url AS avatar_url,
+    sc.profile_bio AS bio,
+    sc.cleaner_hourly_rate AS hourly_rate,
+    sc.cleaner_rating::float AS rating,
     sc.dist::float AS distance_meters,
-
     (
-      (GREATEST(0, (1.0 - (sc.dist / p_max_distance_meters))) * 30) + 
-      (COALESCE(sc.cleaner_rating, 0) / 5.0 * 30) +
-      sc.s_score
+      (GREATEST(0, (1.0 - (sc.dist / p_max_distance_meters))) * 30)
+      + (COALESCE(sc.cleaner_rating, 0) / 5.0 * 30)
+      + sc.s_score
     )::float AS final_score
-
   FROM scored_cleaners sc
   ORDER BY final_score DESC, sc.dist ASC;
-
-END;$function$
+END;
+$function$
 
 
 CREATE OR REPLACE FUNCTION public.get_cleaner_availability_by_id(p_cleaner_id uuid, p_date date, p_time time without time zone, p_duration numeric, p_timezone text DEFAULT 'UTC'::text)
@@ -5029,19 +5014,51 @@ CREATE OR REPLACE FUNCTION public.get_cleaner_profile_v1(target_user_id uuid)
  RETURNS jsonb
  LANGUAGE plpgsql
  SECURITY DEFINER
+ SET search_path TO 'public'
 AS $function$
 DECLARE
-  result JSONB;
+  v_profile public.profiles%ROWTYPE;
+  result jsonb;
 BEGIN
+  SELECT *
+  INTO v_profile
+  FROM public.profiles p
+  WHERE p.id = target_user_id
+     OR p.user_id = target_user_id
+  LIMIT 1;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object(
+      'profile', NULL,
+      'cleaner_data', NULL,
+      'verification', NULL
+    );
+  END IF;
+
+  IF auth.uid() IS DISTINCT FROM v_profile.id
+     AND auth.uid() IS DISTINCT FROM v_profile.user_id
+     AND NOT public.is_profile_discoverable_by_others(v_profile) THEN
+    RETURN jsonb_build_object(
+      'profile', NULL,
+      'cleaner_data', NULL,
+      'verification', NULL
+    );
+  END IF;
+
   SELECT jsonb_build_object(
-    'profile', (SELECT to_jsonb(p) FROM profiles p WHERE p.id = target_user_id),
+    'profile', (SELECT to_jsonb(p) FROM profiles p WHERE p.id = target_user_id OR p.user_id = target_user_id LIMIT 1),
     'cleaner_data', (SELECT to_jsonb(cd) FROM cleaner_data cd WHERE cd.user_id = target_user_id),
-    'verification', (SELECT jsonb_build_object(
-                        'id_front_url', cv.id_front_url,
-                        'id_back_url', cv.id_back_url
-                      ) FROM cleaner_verifications cv WHERE cv.id = target_user_id)
-  ) INTO result;
-  
+    'verification', (
+      SELECT jsonb_build_object(
+        'id_front_url', cv.id_front_url,
+        'id_back_url', cv.id_back_url
+      )
+      FROM cleaner_verifications cv
+      WHERE cv.id = target_user_id
+    )
+  )
+  INTO result;
+
   RETURN result;
 END;
 $function$
@@ -6111,6 +6128,19 @@ BEGIN
   END IF;
   RETURN false;
 END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.is_profile_discoverable_by_others(p profiles)
+ RETURNS boolean
+ LANGUAGE sql
+ STABLE
+AS $function$
+  SELECT
+    p.deleted_at IS NULL
+    AND p.deactivated_at IS NULL
+    AND COALESCE(p.deletion_status, 'none') NOT IN ('scheduled', 'processing', 'completed')
+    AND COALESCE((p.preferences->>'profile_visibility')::boolean, true) IS TRUE;
 $function$
 
 
@@ -8213,47 +8243,47 @@ CREATE OR REPLACE FUNCTION public.search_available_cleaners(p_lat double precisi
  LANGUAGE plpgsql
  STABLE SECURITY DEFINER
 AS $function$
-DECLARE 
-    v_cust_loc geography := ST_SetSRID(ST_MakePoint(p_lng, p_lat), 4326)::geography;
-    v_booking_range tstzrange := tstzrange(
-        (p_date + p_time)::timestamptz, 
-        (p_date + p_time + (p_duration || ' hours')::interval)::timestamptz, 
-        '[)'
-    );
-BEGIN 
-    -- Security Check for 2026 standards
-    IF auth.uid() IS NULL THEN
-        RAISE EXCEPTION 'Not authorized';
-    END IF;
+DECLARE
+  v_cust_loc geography := ST_SetSRID(ST_MakePoint(p_lng, p_lat), 4326)::geography;
+  v_booking_range tstzrange := tstzrange(
+    (p_date + p_time)::timestamptz,
+    (p_date + p_time + (p_duration || ' hours')::interval)::timestamptz,
+    '[)'
+  );
+BEGIN
+  IF auth.uid() IS NULL THEN
+    RAISE EXCEPTION 'Not authorized';
+  END IF;
 
-    RETURN QUERY
-    SELECT 
-        cd.user_id, 
-        p.fullname, 
-        p.avatar_url,
-        cd.rating::float,
-        -- Corrected to use base_location
-        (cd.base_location::geography <-> v_cust_loc)::float as dist_m,
-        (
-            SELECT count(*)::int 
-            FROM unnest(p_requested_services) s 
-            WHERE s = ANY(cd.skills) OR s = ANY(cd.specialties)
-        ) as matching_skills_count,
-        COALESCE(array_length(cd.skills, 1), 0) as total_skills_count
-    FROM public.cleaner_data cd
-    JOIN public.profiles p ON p.id = cd.user_id
-    WHERE cd.status = 'active'
-    -- Corrected to use base_location
+  RETURN QUERY
+  SELECT
+    cd.user_id,
+    p.fullname,
+    p.avatar_url,
+    cd.rating::float,
+    (cd.base_location::geography <-> v_cust_loc)::float AS dist_m,
+    (
+      SELECT count(*)::int
+      FROM unnest(p_requested_services) s
+      WHERE s = ANY(cd.skills) OR s = ANY(cd.specialties)
+    ) AS matching_skills_count,
+    COALESCE(array_length(cd.skills, 1), 0) AS total_skills_count
+  FROM public.cleaner_data cd
+  JOIN public.profiles p ON p.id = cd.user_id
+  WHERE cd.status = 'active'
+    AND (
+      auth.uid() = cd.user_id
+      OR public.is_profile_discoverable_by_others(p)
+    )
     AND ST_DWithin(cd.base_location::geography, v_cust_loc, p_max_distance_meters)
-    -- Availability check against bookings table
     AND NOT EXISTS (
-        SELECT 1 FROM public.bookings b 
-        WHERE b.cleaner_id = cd.user_id 
+      SELECT 1
+      FROM public.bookings b
+      WHERE b.cleaner_id = cd.user_id
         AND b.booking_period && v_booking_range
         AND b.status != 'cancelled'
     )
-    -- Efficient spatial sorting
-    ORDER BY cd.base_location::geography <-> v_cust_loc ASC;
+  ORDER BY cd.base_location::geography <-> v_cust_loc ASC;
 END;
 $function$
 

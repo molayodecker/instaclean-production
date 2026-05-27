@@ -1954,54 +1954,47 @@ ALTER FUNCTION "public"."get_available_timeslots_old"("p_booking_date" "date", "
 
 CREATE OR REPLACE FUNCTION "public"."get_best_available_cleaners"("p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer, "p_requested_services" "text"[]) RETURNS TABLE("cleaner_id" "uuid", "cleaner_name" "text", "avatar_url" "text", "bio" "text", "hourly_rate" numeric, "rating" double precision, "distance_meters" double precision, "final_score" double precision)
     LANGUAGE "plpgsql" STABLE
-    AS $$DECLARE 
-  v_cust_id uuid := auth.uid(); 
+    AS $$
+DECLARE
+  v_cust_id uuid := auth.uid();
   v_booking_range tstzrange;
   v_cust_loc geography := ST_SetSRID(ST_MakePoint(p_lng, p_lat), 4326)::geography;
-BEGIN 
-  -- 1. Security Check
+BEGIN
   IF v_cust_id IS NULL THEN
     RAISE EXCEPTION 'Not authorized';
   END IF;
 
-  -- 2. Define the Booking Window
   v_booking_range := tstzrange(
-    (p_date + p_time)::timestamptz, 
-    (p_date + p_time + (p_duration || ' hours')::interval)::timestamptz, 
+    (p_date + p_time)::timestamptz,
+    (p_date + p_time + (p_duration || ' hours')::interval)::timestamptz,
     '[)'
   );
 
-  -- 3. Return Query
   RETURN QUERY
   WITH available_cleaners AS (
-    SELECT 
-      cd.user_id AS cleaner_user_id, 
-      p.fullname AS cleaner_fullname, 
-      p.avatar_url AS profile_avatar_url, 
-      COALESCE(cd.bio, p.bio) AS profile_bio, 
-      cd.hourly_rate AS cleaner_hourly_rate, 
-      cd.rating AS cleaner_rating, 
-      cd.skills AS cleaner_skills, 
+    SELECT
+      cd.user_id AS cleaner_user_id,
+      p.fullname AS cleaner_fullname,
+      p.avatar_url AS profile_avatar_url,
+      COALESCE(cd.bio, p.bio) AS profile_bio,
+      cd.hourly_rate AS cleaner_hourly_rate,
+      cd.rating AS cleaner_rating,
+      cd.skills AS cleaner_skills,
       cd.specialties AS cleaner_specialties,
-
-      COALESCE(
-        cd.base_location::geography,
-        p.location_wkt
-      ) AS effective_location,
-
+      COALESCE(cd.base_location::geography, p.location_wkt) AS effective_location,
       ST_Distance(
         COALESCE(cd.base_location::geography, p.location_wkt),
         v_cust_loc
       )::float AS dist
-
     FROM public.cleaner_data cd
-    JOIN public.profiles p
-      ON p.user_id = cd.user_id
-
+    JOIN public.profiles p ON p.user_id = cd.user_id
     WHERE cd.status = 'active'
       AND cd.verified = true
       AND COALESCE(cd.base_location::geography, p.location_wkt) IS NOT NULL
-
+      AND (
+        auth.uid() = cd.user_id
+        OR public.is_profile_discoverable_by_others(p)
+      )
       AND ST_DWithin(
         COALESCE(cd.base_location::geography, p.location_wkt),
         v_cust_loc,
@@ -2010,15 +2003,13 @@ BEGIN
           p_max_distance_meters
         )
       )
-
       AND NOT EXISTS (
         SELECT 1
-        FROM public.bookings b 
-        WHERE b.cleaner_id = cd.user_id 
+        FROM public.bookings b
+        WHERE b.cleaner_id = cd.user_id
           AND b.booking_period && v_booking_range
           AND b.status != 'cancelled'
       )
-
       AND NOT EXISTS (
         SELECT 1
         FROM public.cleaner_availability_exceptions cae
@@ -2026,9 +2017,8 @@ BEGIN
           AND cae.exception_date = p_date
       )
   ),
-
   scored_cleaners AS (
-    SELECT 
+    SELECT
       ac.cleaner_user_id,
       ac.cleaner_fullname,
       ac.profile_avatar_url,
@@ -2038,40 +2028,35 @@ BEGIN
       ac.cleaner_skills,
       ac.cleaner_specialties,
       ac.dist,
-
-      CASE 
-        WHEN cardinality(COALESCE(p_requested_services, ARRAY[]::text[])) > 0 
+      CASE
+        WHEN cardinality(COALESCE(p_requested_services, ARRAY[]::text[])) > 0
         THEN (
           SELECT count(*)::float / cardinality(p_requested_services)
-          FROM unnest(p_requested_services) s 
+          FROM unnest(p_requested_services) s
           WHERE s = ANY(COALESCE(ac.cleaner_skills, ARRAY[]::text[]))
              OR s = ANY(COALESCE(ac.cleaner_specialties, ARRAY[]::text[]))
         ) * 40
-        ELSE 20 
+        ELSE 20
       END AS s_score
-
     FROM available_cleaners ac
   )
-
-  SELECT 
-    sc.cleaner_user_id AS cleaner_id, 
-    sc.cleaner_fullname AS cleaner_name, 
-    sc.profile_avatar_url AS avatar_url, 
-    sc.profile_bio AS bio, 
-    sc.cleaner_hourly_rate AS hourly_rate, 
-    sc.cleaner_rating::float AS rating, 
+  SELECT
+    sc.cleaner_user_id AS cleaner_id,
+    sc.cleaner_fullname AS cleaner_name,
+    sc.profile_avatar_url AS avatar_url,
+    sc.profile_bio AS bio,
+    sc.cleaner_hourly_rate AS hourly_rate,
+    sc.cleaner_rating::float AS rating,
     sc.dist::float AS distance_meters,
-
     (
-      (GREATEST(0, (1.0 - (sc.dist / p_max_distance_meters))) * 30) + 
-      (COALESCE(sc.cleaner_rating, 0) / 5.0 * 30) +
-      sc.s_score
+      (GREATEST(0, (1.0 - (sc.dist / p_max_distance_meters))) * 30)
+      + (COALESCE(sc.cleaner_rating, 0) / 5.0 * 30)
+      + sc.s_score
     )::float AS final_score
-
   FROM scored_cleaners sc
   ORDER BY final_score DESC, sc.dist ASC;
-
-END;$$;
+END;
+$$;
 
 
 ALTER FUNCTION "public"."get_best_available_cleaners"("p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer, "p_requested_services" "text"[]) OWNER TO "postgres";
@@ -2121,19 +2106,51 @@ ALTER FUNCTION "public"."get_cleaner_availability_by_id"("p_cleaner_id" "uuid", 
 
 CREATE OR REPLACE FUNCTION "public"."get_cleaner_profile_v1"("target_user_id" "uuid") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
     AS $$
 DECLARE
-  result JSONB;
+  v_profile public.profiles%ROWTYPE;
+  result jsonb;
 BEGIN
+  SELECT *
+  INTO v_profile
+  FROM public.profiles p
+  WHERE p.id = target_user_id
+     OR p.user_id = target_user_id
+  LIMIT 1;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object(
+      'profile', NULL,
+      'cleaner_data', NULL,
+      'verification', NULL
+    );
+  END IF;
+
+  IF auth.uid() IS DISTINCT FROM v_profile.id
+     AND auth.uid() IS DISTINCT FROM v_profile.user_id
+     AND NOT public.is_profile_discoverable_by_others(v_profile) THEN
+    RETURN jsonb_build_object(
+      'profile', NULL,
+      'cleaner_data', NULL,
+      'verification', NULL
+    );
+  END IF;
+
   SELECT jsonb_build_object(
-    'profile', (SELECT to_jsonb(p) FROM profiles p WHERE p.id = target_user_id),
+    'profile', (SELECT to_jsonb(p) FROM profiles p WHERE p.id = target_user_id OR p.user_id = target_user_id LIMIT 1),
     'cleaner_data', (SELECT to_jsonb(cd) FROM cleaner_data cd WHERE cd.user_id = target_user_id),
-    'verification', (SELECT jsonb_build_object(
-                        'id_front_url', cv.id_front_url,
-                        'id_back_url', cv.id_back_url
-                      ) FROM cleaner_verifications cv WHERE cv.id = target_user_id)
-  ) INTO result;
-  
+    'verification', (
+      SELECT jsonb_build_object(
+        'id_front_url', cv.id_front_url,
+        'id_back_url', cv.id_back_url
+      )
+      FROM cleaner_verifications cv
+      WHERE cv.id = target_user_id
+    )
+  )
+  INTO result;
+
   RETURN result;
 END;
 $$;
@@ -3161,6 +3178,79 @@ $$;
 ALTER FUNCTION "public"."is_platform_fee_admin"() OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."profiles" (
+    "id" "uuid" NOT NULL,
+    "firstname" "text",
+    "lastname" "text",
+    "fullname" "text",
+    "avatar_url" "text",
+    "bio" "text",
+    "address" "text",
+    "location_wkt" "public"."geography"(Point,4326) DEFAULT "public"."st_geomfromtext"('POINT(-0.186964 5.650562)'::"text", 4326),
+    "preferences" "jsonb" DEFAULT '{}'::"jsonb",
+    "notification_settings" "jsonb" DEFAULT '{"app": true, "sms": true, "email": true}'::"jsonb",
+    "updated_at" timestamp with time zone DEFAULT "now"(),
+    "user_id" "uuid" NOT NULL,
+    "deleted_at" timestamp with time zone,
+    "deactivated_at" timestamp with time zone,
+    "deletion_requested_at" timestamp with time zone,
+    "deletion_scheduled_for" timestamp with time zone,
+    "deletion_started_at" timestamp with time zone,
+    "deletion_completed_at" timestamp with time zone,
+    "deletion_status" "text" DEFAULT 'none'::"text" NOT NULL,
+    CONSTRAINT "profiles_deletion_status_check" CHECK (("deletion_status" = ANY (ARRAY['none'::"text", 'scheduled'::"text", 'cancelled'::"text", 'processing'::"text", 'completed'::"text"])))
+);
+
+
+ALTER TABLE "public"."profiles" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."profiles"."deleted_at" IS 'When set, the customer account is soft-deleted: app signs the user out and hides the profile from others.';
+
+
+
+COMMENT ON COLUMN "public"."profiles"."deactivated_at" IS 'When set, profile is deactivated (hidden from others per RLS + app rules). Distinct from permanent deletion lifecycle.';
+
+
+
+COMMENT ON COLUMN "public"."profiles"."deletion_requested_at" IS 'When the user requested permanent account deletion.';
+
+
+
+COMMENT ON COLUMN "public"."profiles"."deletion_scheduled_for" IS 'End of the cancellation grace period; trusted deletion job may start at or after this time.';
+
+
+
+COMMENT ON COLUMN "public"."profiles"."deletion_started_at" IS 'When the anonymization/removal job began for this account.';
+
+
+
+COMMENT ON COLUMN "public"."profiles"."deletion_completed_at" IS 'When active-system anonymization completed; backups may persist longer (~90 days).';
+
+
+
+COMMENT ON COLUMN "public"."profiles"."deletion_status" IS 'Lifecycle: none | scheduled | cancelled | processing | completed.';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."is_profile_discoverable_by_others"("p" "public"."profiles") RETURNS boolean
+    LANGUAGE "sql" STABLE
+    AS $$
+  SELECT
+    p.deleted_at IS NULL
+    AND p.deactivated_at IS NULL
+    AND COALESCE(p.deletion_status, 'none') NOT IN ('scheduled', 'processing', 'completed')
+    AND COALESCE((p.preferences->>'profile_visibility')::boolean, true) IS TRUE;
+$$;
+
+
+ALTER FUNCTION "public"."is_profile_discoverable_by_others"("p" "public"."profiles") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."is_profile_discoverable_by_others"("p" "public"."profiles") IS 'True when the profile may appear in cleaner search and public profile views (matches mobile app profile_visibility default-on semantics).';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."lookup_sign_in_account"("lookup_identifier" "text") RETURNS TABLE("has_account" boolean, "matched_by" "text", "user_id" "uuid", "providers" "text"[], "supports_email_password" boolean, "supports_phone_otp" boolean, "email" "text", "phone_e164" "text")
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -4019,47 +4109,47 @@ ALTER FUNCTION "public"."rls_auto_enable"() OWNER TO "postgres";
 CREATE OR REPLACE FUNCTION "public"."search_available_cleaners"("p_lat" double precision, "p_lng" double precision, "p_date" "date", "p_time" time without time zone, "p_duration" double precision, "p_requested_services" "text"[] DEFAULT '{}'::"text"[], "p_max_distance_meters" double precision DEFAULT 50000) RETURNS TABLE("cleaner_id" "uuid", "cleaner_name" "text", "avatar_url" "text", "rating" double precision, "distance_meters" double precision, "matching_skills_count" integer, "total_skills_count" integer)
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     AS $$
-DECLARE 
-    v_cust_loc geography := ST_SetSRID(ST_MakePoint(p_lng, p_lat), 4326)::geography;
-    v_booking_range tstzrange := tstzrange(
-        (p_date + p_time)::timestamptz, 
-        (p_date + p_time + (p_duration || ' hours')::interval)::timestamptz, 
-        '[)'
-    );
-BEGIN 
-    -- Security Check for 2026 standards
-    IF auth.uid() IS NULL THEN
-        RAISE EXCEPTION 'Not authorized';
-    END IF;
+DECLARE
+  v_cust_loc geography := ST_SetSRID(ST_MakePoint(p_lng, p_lat), 4326)::geography;
+  v_booking_range tstzrange := tstzrange(
+    (p_date + p_time)::timestamptz,
+    (p_date + p_time + (p_duration || ' hours')::interval)::timestamptz,
+    '[)'
+  );
+BEGIN
+  IF auth.uid() IS NULL THEN
+    RAISE EXCEPTION 'Not authorized';
+  END IF;
 
-    RETURN QUERY
-    SELECT 
-        cd.user_id, 
-        p.fullname, 
-        p.avatar_url,
-        cd.rating::float,
-        -- Corrected to use base_location
-        (cd.base_location::geography <-> v_cust_loc)::float as dist_m,
-        (
-            SELECT count(*)::int 
-            FROM unnest(p_requested_services) s 
-            WHERE s = ANY(cd.skills) OR s = ANY(cd.specialties)
-        ) as matching_skills_count,
-        COALESCE(array_length(cd.skills, 1), 0) as total_skills_count
-    FROM public.cleaner_data cd
-    JOIN public.profiles p ON p.id = cd.user_id
-    WHERE cd.status = 'active'
-    -- Corrected to use base_location
+  RETURN QUERY
+  SELECT
+    cd.user_id,
+    p.fullname,
+    p.avatar_url,
+    cd.rating::float,
+    (cd.base_location::geography <-> v_cust_loc)::float AS dist_m,
+    (
+      SELECT count(*)::int
+      FROM unnest(p_requested_services) s
+      WHERE s = ANY(cd.skills) OR s = ANY(cd.specialties)
+    ) AS matching_skills_count,
+    COALESCE(array_length(cd.skills, 1), 0) AS total_skills_count
+  FROM public.cleaner_data cd
+  JOIN public.profiles p ON p.id = cd.user_id
+  WHERE cd.status = 'active'
+    AND (
+      auth.uid() = cd.user_id
+      OR public.is_profile_discoverable_by_others(p)
+    )
     AND ST_DWithin(cd.base_location::geography, v_cust_loc, p_max_distance_meters)
-    -- Availability check against bookings table
     AND NOT EXISTS (
-        SELECT 1 FROM public.bookings b 
-        WHERE b.cleaner_id = cd.user_id 
+      SELECT 1
+      FROM public.bookings b
+      WHERE b.cleaner_id = cd.user_id
         AND b.booking_period && v_booking_range
         AND b.status != 'cancelled'
     )
-    -- Efficient spatial sorting
-    ORDER BY cd.base_location::geography <-> v_cust_loc ASC;
+  ORDER BY cd.base_location::geography <-> v_cust_loc ASC;
 END;
 $$;
 
@@ -5205,61 +5295,6 @@ CREATE TABLE IF NOT EXISTS "public"."messages" (
 
 
 ALTER TABLE "public"."messages" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."profiles" (
-    "id" "uuid" NOT NULL,
-    "firstname" "text",
-    "lastname" "text",
-    "fullname" "text",
-    "avatar_url" "text",
-    "bio" "text",
-    "address" "text",
-    "location_wkt" "public"."geography"(Point,4326) DEFAULT "public"."st_geomfromtext"('POINT(-0.186964 5.650562)'::"text", 4326),
-    "preferences" "jsonb" DEFAULT '{}'::"jsonb",
-    "notification_settings" "jsonb" DEFAULT '{"app": true, "sms": true, "email": true}'::"jsonb",
-    "updated_at" timestamp with time zone DEFAULT "now"(),
-    "user_id" "uuid" NOT NULL,
-    "deleted_at" timestamp with time zone,
-    "deactivated_at" timestamp with time zone,
-    "deletion_requested_at" timestamp with time zone,
-    "deletion_scheduled_for" timestamp with time zone,
-    "deletion_started_at" timestamp with time zone,
-    "deletion_completed_at" timestamp with time zone,
-    "deletion_status" "text" DEFAULT 'none'::"text" NOT NULL,
-    CONSTRAINT "profiles_deletion_status_check" CHECK (("deletion_status" = ANY (ARRAY['none'::"text", 'scheduled'::"text", 'cancelled'::"text", 'processing'::"text", 'completed'::"text"])))
-);
-
-
-ALTER TABLE "public"."profiles" OWNER TO "postgres";
-
-
-COMMENT ON COLUMN "public"."profiles"."deleted_at" IS 'When set, the customer account is soft-deleted: app signs the user out and hides the profile from others.';
-
-
-
-COMMENT ON COLUMN "public"."profiles"."deactivated_at" IS 'When set, profile is deactivated (hidden from others per RLS + app rules). Distinct from permanent deletion lifecycle.';
-
-
-
-COMMENT ON COLUMN "public"."profiles"."deletion_requested_at" IS 'When the user requested permanent account deletion.';
-
-
-
-COMMENT ON COLUMN "public"."profiles"."deletion_scheduled_for" IS 'End of the cancellation grace period; trusted deletion job may start at or after this time.';
-
-
-
-COMMENT ON COLUMN "public"."profiles"."deletion_started_at" IS 'When the anonymization/removal job began for this account.';
-
-
-
-COMMENT ON COLUMN "public"."profiles"."deletion_completed_at" IS 'When active-system anonymization completed; backups may persist longer (~90 days).';
-
-
-
-COMMENT ON COLUMN "public"."profiles"."deletion_status" IS 'Lifecycle: none | scheduled | cancelled | processing | completed.';
-
 
 
 CREATE OR REPLACE VIEW "public"."conversation_list" AS
@@ -12203,6 +12238,25 @@ GRANT ALL ON FUNCTION "public"."is_platform_fee_admin"() TO "service_role";
 
 
 
+GRANT ALL ON FUNCTION "public"."st_geomfromtext"("text", integer) TO "postgres";
+GRANT ALL ON FUNCTION "public"."st_geomfromtext"("text", integer) TO "anon";
+GRANT ALL ON FUNCTION "public"."st_geomfromtext"("text", integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."st_geomfromtext"("text", integer) TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."profiles" TO "anon";
+GRANT ALL ON TABLE "public"."profiles" TO "authenticated";
+GRANT ALL ON TABLE "public"."profiles" TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."is_profile_discoverable_by_others"("p" "public"."profiles") TO "anon";
+GRANT ALL ON FUNCTION "public"."is_profile_discoverable_by_others"("p" "public"."profiles") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."is_profile_discoverable_by_others"("p" "public"."profiles") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."lockrow"("text", "text", "text") TO "postgres";
 GRANT ALL ON FUNCTION "public"."lockrow"("text", "text", "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."lockrow"("text", "text", "text") TO "authenticated";
@@ -14223,13 +14277,6 @@ GRANT ALL ON FUNCTION "public"."st_geomfromtext"("text") TO "postgres";
 GRANT ALL ON FUNCTION "public"."st_geomfromtext"("text") TO "anon";
 GRANT ALL ON FUNCTION "public"."st_geomfromtext"("text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."st_geomfromtext"("text") TO "service_role";
-
-
-
-GRANT ALL ON FUNCTION "public"."st_geomfromtext"("text", integer) TO "postgres";
-GRANT ALL ON FUNCTION "public"."st_geomfromtext"("text", integer) TO "anon";
-GRANT ALL ON FUNCTION "public"."st_geomfromtext"("text", integer) TO "authenticated";
-GRANT ALL ON FUNCTION "public"."st_geomfromtext"("text", integer) TO "service_role";
 
 
 
@@ -16269,12 +16316,6 @@ GRANT ALL ON TABLE "public"."conversations" TO "service_role";
 GRANT ALL ON TABLE "public"."messages" TO "anon";
 GRANT ALL ON TABLE "public"."messages" TO "authenticated";
 GRANT ALL ON TABLE "public"."messages" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."profiles" TO "anon";
-GRANT ALL ON TABLE "public"."profiles" TO "authenticated";
-GRANT ALL ON TABLE "public"."profiles" TO "service_role";
 
 
 
