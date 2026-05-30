@@ -79,7 +79,9 @@ CREATE TYPE "public"."booking_status" AS ENUM (
     'scheduled',
     'in_progress',
     'completed',
-    'cancelled'
+    'cancelled',
+    'en_route',
+    'arrived'
 );
 
 
@@ -128,7 +130,9 @@ CREATE TYPE "public"."notification_type" AS ENUM (
     'booking_cancelled',
     'cleaner_assigned',
     'payment_received',
-    'admin_message'
+    'admin_message',
+    'cleaner_en_route',
+    'cleaner_arrived'
 );
 
 
@@ -194,11 +198,8 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'error', 'cannot_accept_own_invite');
   END IF;
 
-  IF NOT EXISTS (
-    SELECT 1 FROM public.cleaner_data
-    WHERE user_id = v_uid AND verified IS TRUE
-  ) THEN
-    RETURN jsonb_build_object('success', false, 'error', 'co_cleaner_not_verified');
+  IF NOT public.is_co_cleaner_invitee_eligible(v_uid) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'co_cleaner_verification_required');
   END IF;
 
   IF NOT EXISTS (
@@ -206,6 +207,15 @@ BEGIN
     WHERE user_id = r.inviter_user_id AND verified IS TRUE
   ) THEN
     RETURN jsonb_build_object('success', false, 'error', 'inviter_not_verified');
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM public.co_cleaner_relationships AS rel
+    WHERE rel.co_cleaner_id = v_uid
+      AND rel.lead_cleaner_id <> r.inviter_user_id
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'co_cleaner_already_on_team');
   END IF;
 
   INSERT INTO public.co_cleaner_relationships (lead_cleaner_id, co_cleaner_id)
@@ -3148,6 +3158,58 @@ $$;
 ALTER FUNCTION "public"."is_admin"("user_uuid" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."is_co_cleaner_background_check_eligible"("p_user_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT public.is_co_cleaner_invitee_eligible(p_user_id);
+$$;
+
+
+ALTER FUNCTION "public"."is_co_cleaner_background_check_eligible"("p_user_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."is_co_cleaner_invitee_eligible"("p_user_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT
+    EXISTS (
+      SELECT 1
+      FROM public.cleaner_data AS cd
+      WHERE cd.user_id = p_user_id
+        AND cd.verified IS TRUE
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM public.kyc_profiles AS kp
+      WHERE kp.user_id = p_user_id
+        AND (
+          kp.review_answer = 'GREEN'
+          OR kp.kyc_status IN ('completed', 'approved', 'verified')
+        )
+    );
+$$;
+
+
+ALTER FUNCTION "public"."is_co_cleaner_invitee_eligible"("p_user_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."is_co_cleaner_team_member"("p_user_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.co_cleaner_relationships AS r
+    WHERE r.co_cleaner_id = p_user_id
+  );
+$$;
+
+
+ALTER FUNCTION "public"."is_co_cleaner_team_member"("p_user_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."is_platform_fee_admin"() RETURNS boolean
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -3249,6 +3311,34 @@ ALTER FUNCTION "public"."is_profile_discoverable_by_others"("p" "public"."profil
 
 COMMENT ON FUNCTION "public"."is_profile_discoverable_by_others"("p" "public"."profiles") IS 'True when the profile may appear in cleaner search and public profile views (matches mobile app profile_visibility default-on semantics).';
 
+
+
+CREATE OR REPLACE FUNCTION "public"."leave_co_cleaner_team"() RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_lead uuid;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  DELETE FROM public.co_cleaner_relationships
+  WHERE co_cleaner_id = v_uid
+  RETURNING lead_cleaner_id INTO v_lead;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_on_team');
+  END IF;
+
+  RETURN jsonb_build_object('success', true, 'lead_cleaner_id', v_lead);
+END;
+$$;
+
+
+ALTER FUNCTION "public"."leave_co_cleaner_team"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."lookup_sign_in_account"("lookup_identifier" "text") RETURNS TABLE("has_account" boolean, "matched_by" "text", "user_id" "uuid", "providers" "text"[], "supports_email_password" boolean, "supports_phone_otp" boolean, "email" "text", "phone_e164" "text")
@@ -3435,6 +3525,98 @@ $$;
 
 
 ALTER FUNCTION "public"."manage_extra_tasks"("action" "text", "task_id" "text", "new_hours" numeric) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."mark_cleaner_booking_milestone"("p_booking_id" "uuid", "p_milestone" "text") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_row public.bookings%ROWTYPE;
+  v_new_status public.booking_status;
+  v_notif_type public.notification_type;
+  v_title text;
+  v_message text;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  IF p_booking_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'missing_booking_id');
+  END IF;
+
+  IF p_milestone NOT IN ('en_route', 'arrived') THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_milestone');
+  END IF;
+
+  IF p_milestone = 'en_route' THEN
+    v_new_status := 'en_route';
+    v_notif_type := 'cleaner_en_route';
+    v_title := 'Cleaner on the way';
+    v_message := 'Your cleaner is heading to your location.';
+  ELSE
+    v_new_status := 'arrived';
+    v_notif_type := 'cleaner_arrived';
+    v_title := 'Cleaner has arrived';
+    v_message := 'Your cleaner has arrived at your location.';
+  END IF;
+
+  SELECT * INTO v_row
+  FROM public.bookings
+  WHERE id = p_booking_id
+    AND cleaner_id = v_uid
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_found');
+  END IF;
+
+  IF p_milestone = 'en_route' AND v_row.status NOT IN ('confirmed', 'scheduled') THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_transition');
+  END IF;
+
+  IF p_milestone = 'arrived' AND v_row.status <> 'en_route' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_transition');
+  END IF;
+
+  UPDATE public.bookings
+  SET
+    status = v_new_status,
+    updated_at = now()
+  WHERE id = p_booking_id;
+
+  INSERT INTO public.booking_timeline (booking_id, stage, changed_at, notes)
+  VALUES (p_booking_id, v_new_status, now(), NULL);
+
+  IF v_row.customer_id IS NOT NULL THEN
+    INSERT INTO public.notifications (user_id, type, title, message, data)
+    VALUES (
+      v_row.customer_id,
+      v_notif_type,
+      v_title,
+      v_message,
+      jsonb_build_object(
+        'booking_id', p_booking_id,
+        'milestone', p_milestone,
+        'cleaner_id', v_uid
+      )
+    );
+  END IF;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'booking_id', p_booking_id,
+    'milestone', p_milestone,
+    'customer_id', v_row.customer_id,
+    'new_status', v_new_status::text
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."mark_cleaner_booking_milestone"("p_booking_id" "uuid", "p_milestone" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."merge_user_accounts"("p_primary" "uuid", "p_secondary" "uuid", "p_merged_by" "uuid" DEFAULT NULL::"uuid") RETURNS "jsonb"
@@ -3989,6 +4171,45 @@ $$;
 ALTER FUNCTION "public"."refresh_auth_identity_lookup"("target_user_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."register_device_push_token"("p_token" "text", "p_platform" "text") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_user_id uuid := auth.uid();
+BEGIN
+  IF v_user_id IS NULL THEN
+    RAISE EXCEPTION 'Not authenticated' USING ERRCODE = '42501';
+  END IF;
+
+  IF p_token IS NULL OR btrim(p_token) = '' THEN
+    RAISE EXCEPTION 'token is required' USING ERRCODE = '22004';
+  END IF;
+
+  IF p_platform NOT IN ('ios', 'android') THEN
+    RAISE EXCEPTION 'invalid platform' USING ERRCODE = '22023';
+  END IF;
+
+  -- Legacy accounts may exist in auth.users without a public.users shell row.
+  INSERT INTO public.users (id, email)
+  SELECT au.id, au.email
+  FROM auth.users AS au
+  WHERE au.id = v_user_id
+  ON CONFLICT (id) DO NOTHING;
+
+  INSERT INTO public.device_tokens (user_id, token, platform, updated_at)
+  VALUES (v_user_id, btrim(p_token), p_platform, now())
+  ON CONFLICT (token) DO UPDATE SET
+    user_id = EXCLUDED.user_id,
+    platform = EXCLUDED.platform,
+    updated_at = EXCLUDED.updated_at;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."register_device_push_token"("p_token" "text", "p_platform" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."release_cleaner_after_15min_hold"() RETURNS integer
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -4016,6 +4237,46 @@ $$;
 
 
 ALTER FUNCTION "public"."release_cleaner_after_15min_hold"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."remove_co_cleaner_from_team"("p_co_cleaner_id" "uuid") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_uid uuid := auth.uid();
+  n int;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  IF p_co_cleaner_id IS NULL OR p_co_cleaner_id = v_uid THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_co_cleaner');
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM public.cleaner_data
+    WHERE user_id = v_uid AND verified IS TRUE
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'only_verified_leads_can_remove');
+  END IF;
+
+  DELETE FROM public.co_cleaner_relationships
+  WHERE lead_cleaner_id = v_uid
+    AND co_cleaner_id = p_co_cleaner_id;
+
+  GET DIAGNOSTICS n = ROW_COUNT;
+  IF n = 0 THEN
+    RETURN jsonb_build_object('success', false, 'error', 'co_cleaner_not_on_team');
+  END IF;
+
+  RETURN jsonb_build_object('success', true, 'co_cleaner_id', p_co_cleaner_id);
+END;
+$$;
+
+
+ALTER FUNCTION "public"."remove_co_cleaner_from_team"("p_co_cleaner_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."revoke_co_cleaner_invite"("p_invite_id" "uuid") RETURNS "jsonb"
@@ -6932,6 +7193,10 @@ CREATE UNIQUE INDEX "cleaner_upload_links_short_code_uidx" ON "public"."cleaner_
 
 
 
+CREATE UNIQUE INDEX "co_cleaner_relationships_one_team_per_co_cleaner" ON "public"."co_cleaner_relationships" USING "btree" ("co_cleaner_id");
+
+
+
 CREATE INDEX "email_signup_tokens_email_idx" ON "public"."email_signup_tokens" USING "btree" ("email");
 
 
@@ -8142,6 +8407,18 @@ CREATE POLICY "Users can view their own roles" ON "public"."user_roles" FOR SELE
 
 
 
+CREATE POLICY "Users delete own device tokens" ON "public"."device_tokens" FOR DELETE TO "authenticated" USING (("auth"."uid"() = "user_id"));
+
+
+
+CREATE POLICY "Users insert own device tokens" ON "public"."device_tokens" FOR INSERT TO "authenticated" WITH CHECK (("auth"."uid"() = "user_id"));
+
+
+
+CREATE POLICY "Users manage own device tokens" ON "public"."device_tokens" USING (("auth"."uid"() = "user_id")) WITH CHECK (("auth"."uid"() = "user_id"));
+
+
+
 CREATE POLICY "Users queue own avatar deletions" ON "public"."avatar_storage_deletions" FOR INSERT TO "authenticated" WITH CHECK ((("user_id" = ( SELECT "auth"."uid"() AS "uid")) AND ("bucket" = 'avatars'::"text") AND ("object_path" ~~ ((( SELECT "auth"."uid"() AS "uid"))::"text" || '/%'::"text"))));
 
 
@@ -8150,7 +8427,15 @@ CREATE POLICY "Users read own avatar deletions" ON "public"."avatar_storage_dele
 
 
 
+CREATE POLICY "Users read own device tokens" ON "public"."device_tokens" FOR SELECT TO "authenticated" USING (("auth"."uid"() = "user_id"));
+
+
+
 CREATE POLICY "Users update own avatar deletions" ON "public"."avatar_storage_deletions" FOR UPDATE TO "authenticated" USING ((("user_id" = ( SELECT "auth"."uid"() AS "uid")) AND ("bucket" = 'avatars'::"text") AND ("object_path" ~~ ((( SELECT "auth"."uid"() AS "uid"))::"text" || '/%'::"text")))) WITH CHECK ((("user_id" = ( SELECT "auth"."uid"() AS "uid")) AND ("bucket" = 'avatars'::"text") AND ("object_path" ~~ ((( SELECT "auth"."uid"() AS "uid"))::"text" || '/%'::"text"))));
+
+
+
+CREATE POLICY "Users update own device tokens" ON "public"."device_tokens" FOR UPDATE TO "authenticated" USING (("auth"."uid"() = "user_id")) WITH CHECK (("auth"."uid"() = "user_id"));
 
 
 
@@ -12211,6 +12496,27 @@ GRANT ALL ON FUNCTION "public"."is_admin"("user_uuid" "uuid") TO "service_role";
 
 
 
+REVOKE ALL ON FUNCTION "public"."is_co_cleaner_background_check_eligible"("p_user_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."is_co_cleaner_background_check_eligible"("p_user_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."is_co_cleaner_background_check_eligible"("p_user_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."is_co_cleaner_background_check_eligible"("p_user_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."is_co_cleaner_invitee_eligible"("p_user_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."is_co_cleaner_invitee_eligible"("p_user_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."is_co_cleaner_invitee_eligible"("p_user_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."is_co_cleaner_invitee_eligible"("p_user_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."is_co_cleaner_team_member"("p_user_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."is_co_cleaner_team_member"("p_user_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."is_co_cleaner_team_member"("p_user_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."is_co_cleaner_team_member"("p_user_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."is_contained_2d"("public"."box2df", "public"."box2df") TO "postgres";
 GRANT ALL ON FUNCTION "public"."is_contained_2d"("public"."box2df", "public"."box2df") TO "anon";
 GRANT ALL ON FUNCTION "public"."is_contained_2d"("public"."box2df", "public"."box2df") TO "authenticated";
@@ -12254,6 +12560,13 @@ GRANT ALL ON TABLE "public"."profiles" TO "service_role";
 GRANT ALL ON FUNCTION "public"."is_profile_discoverable_by_others"("p" "public"."profiles") TO "anon";
 GRANT ALL ON FUNCTION "public"."is_profile_discoverable_by_others"("p" "public"."profiles") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."is_profile_discoverable_by_others"("p" "public"."profiles") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."leave_co_cleaner_team"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."leave_co_cleaner_team"() TO "anon";
+GRANT ALL ON FUNCTION "public"."leave_co_cleaner_team"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."leave_co_cleaner_team"() TO "service_role";
 
 
 
@@ -12307,6 +12620,13 @@ GRANT ALL ON FUNCTION "public"."manage_base_durations"("action" "text", "duratio
 GRANT ALL ON FUNCTION "public"."manage_extra_tasks"("action" "text", "task_id" "text", "new_hours" numeric) TO "anon";
 GRANT ALL ON FUNCTION "public"."manage_extra_tasks"("action" "text", "task_id" "text", "new_hours" numeric) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."manage_extra_tasks"("action" "text", "task_id" "text", "new_hours" numeric) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."mark_cleaner_booking_milestone"("p_booking_id" "uuid", "p_milestone" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."mark_cleaner_booking_milestone"("p_booking_id" "uuid", "p_milestone" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."mark_cleaner_booking_milestone"("p_booking_id" "uuid", "p_milestone" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."mark_cleaner_booking_milestone"("p_booking_id" "uuid", "p_milestone" "text") TO "service_role";
 
 
 
@@ -12886,9 +13206,23 @@ GRANT ALL ON FUNCTION "public"."refresh_auth_identity_lookup"("target_user_id" "
 
 
 
+REVOKE ALL ON FUNCTION "public"."register_device_push_token"("p_token" "text", "p_platform" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."register_device_push_token"("p_token" "text", "p_platform" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."register_device_push_token"("p_token" "text", "p_platform" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."register_device_push_token"("p_token" "text", "p_platform" "text") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."release_cleaner_after_15min_hold"() TO "anon";
 GRANT ALL ON FUNCTION "public"."release_cleaner_after_15min_hold"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."release_cleaner_after_15min_hold"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."remove_co_cleaner_from_team"("p_co_cleaner_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."remove_co_cleaner_from_team"("p_co_cleaner_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."remove_co_cleaner_from_team"("p_co_cleaner_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."remove_co_cleaner_from_team"("p_co_cleaner_id" "uuid") TO "service_role";
 
 
 

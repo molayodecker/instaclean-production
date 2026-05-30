@@ -419,11 +419,8 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'error', 'cannot_accept_own_invite');
   END IF;
 
-  IF NOT EXISTS (
-    SELECT 1 FROM public.cleaner_data
-    WHERE user_id = v_uid AND verified IS TRUE
-  ) THEN
-    RETURN jsonb_build_object('success', false, 'error', 'co_cleaner_not_verified');
+  IF NOT public.is_co_cleaner_invitee_eligible(v_uid) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'co_cleaner_verification_required');
   END IF;
 
   IF NOT EXISTS (
@@ -431,6 +428,15 @@ BEGIN
     WHERE user_id = r.inviter_user_id AND verified IS TRUE
   ) THEN
     RETURN jsonb_build_object('success', false, 'error', 'inviter_not_verified');
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM public.co_cleaner_relationships AS rel
+    WHERE rel.co_cleaner_id = v_uid
+      AND rel.lead_cleaner_id <> r.inviter_user_id
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'co_cleaner_already_on_team');
   END IF;
 
   INSERT INTO public.co_cleaner_relationships (lead_cleaner_id, co_cleaner_id)
@@ -6081,6 +6087,55 @@ AS $function$
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.is_co_cleaner_background_check_eligible(p_user_id uuid)
+ RETURNS boolean
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+  SELECT public.is_co_cleaner_invitee_eligible(p_user_id);
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.is_co_cleaner_invitee_eligible(p_user_id uuid)
+ RETURNS boolean
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+  SELECT
+    EXISTS (
+      SELECT 1
+      FROM public.cleaner_data AS cd
+      WHERE cd.user_id = p_user_id
+        AND cd.verified IS TRUE
+    )
+    OR EXISTS (
+      SELECT 1
+      FROM public.kyc_profiles AS kp
+      WHERE kp.user_id = p_user_id
+        AND (
+          kp.review_answer = 'GREEN'
+          OR kp.kyc_status IN ('completed', 'approved', 'verified')
+        )
+    );
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.is_co_cleaner_team_member(p_user_id uuid)
+ RETURNS boolean
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.co_cleaner_relationships AS r
+    WHERE r.co_cleaner_id = p_user_id
+  );
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.is_contained_2d(box2df, box2df)
  RETURNS boolean
  LANGUAGE c
@@ -6156,6 +6211,33 @@ CREATE OR REPLACE FUNCTION public.jsonb(geometry)
  LANGUAGE c
  IMMUTABLE PARALLEL SAFE STRICT COST 500
 AS '$libdir/postgis-3', $function$geometry_to_jsonb$function$
+
+
+CREATE OR REPLACE FUNCTION public.leave_co_cleaner_team()
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_lead uuid;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  DELETE FROM public.co_cleaner_relationships
+  WHERE co_cleaner_id = v_uid
+  RETURNING lead_cleaner_id INTO v_lead;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_on_team');
+  END IF;
+
+  RETURN jsonb_build_object('success', true, 'lead_cleaner_id', v_lead);
+END;
+$function$
 
 
 CREATE OR REPLACE FUNCTION public.lockrow(text, text, text)
@@ -6426,6 +6508,97 @@ BEGIN
 
     -- Return all rows regardless of whether an update happened
     RETURN QUERY SELECT t.id, t.label, t.hours FROM public.extra_tasks t ORDER BY t.label ASC;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.mark_cleaner_booking_milestone(p_booking_id uuid, p_milestone text)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_row public.bookings%ROWTYPE;
+  v_new_status public.booking_status;
+  v_notif_type public.notification_type;
+  v_title text;
+  v_message text;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  IF p_booking_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'missing_booking_id');
+  END IF;
+
+  IF p_milestone NOT IN ('en_route', 'arrived') THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_milestone');
+  END IF;
+
+  IF p_milestone = 'en_route' THEN
+    v_new_status := 'en_route';
+    v_notif_type := 'cleaner_en_route';
+    v_title := 'Cleaner on the way';
+    v_message := 'Your cleaner is heading to your location.';
+  ELSE
+    v_new_status := 'arrived';
+    v_notif_type := 'cleaner_arrived';
+    v_title := 'Cleaner has arrived';
+    v_message := 'Your cleaner has arrived at your location.';
+  END IF;
+
+  SELECT * INTO v_row
+  FROM public.bookings
+  WHERE id = p_booking_id
+    AND cleaner_id = v_uid
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_found');
+  END IF;
+
+  IF p_milestone = 'en_route' AND v_row.status NOT IN ('confirmed', 'scheduled') THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_transition');
+  END IF;
+
+  IF p_milestone = 'arrived' AND v_row.status <> 'en_route' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_transition');
+  END IF;
+
+  UPDATE public.bookings
+  SET
+    status = v_new_status,
+    updated_at = now()
+  WHERE id = p_booking_id;
+
+  INSERT INTO public.booking_timeline (booking_id, stage, changed_at, notes)
+  VALUES (p_booking_id, v_new_status, now(), NULL);
+
+  IF v_row.customer_id IS NOT NULL THEN
+    INSERT INTO public.notifications (user_id, type, title, message, data)
+    VALUES (
+      v_row.customer_id,
+      v_notif_type,
+      v_title,
+      v_message,
+      jsonb_build_object(
+        'booking_id', p_booking_id,
+        'milestone', p_milestone,
+        'cleaner_id', v_uid
+      )
+    );
+  END IF;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'booking_id', p_booking_id,
+    'milestone', p_milestone,
+    'customer_id', v_row.customer_id,
+    'new_status', v_new_status::text
+  );
 END;
 $function$
 
@@ -8125,6 +8298,44 @@ end;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.register_device_push_token(p_token text, p_platform text)
+ RETURNS void
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_user_id uuid := auth.uid();
+BEGIN
+  IF v_user_id IS NULL THEN
+    RAISE EXCEPTION 'Not authenticated' USING ERRCODE = '42501';
+  END IF;
+
+  IF p_token IS NULL OR btrim(p_token) = '' THEN
+    RAISE EXCEPTION 'token is required' USING ERRCODE = '22004';
+  END IF;
+
+  IF p_platform NOT IN ('ios', 'android') THEN
+    RAISE EXCEPTION 'invalid platform' USING ERRCODE = '22023';
+  END IF;
+
+  -- Legacy accounts may exist in auth.users without a public.users shell row.
+  INSERT INTO public.users (id, email)
+  SELECT au.id, au.email
+  FROM auth.users AS au
+  WHERE au.id = v_user_id
+  ON CONFLICT (id) DO NOTHING;
+
+  INSERT INTO public.device_tokens (user_id, token, platform, updated_at)
+  VALUES (v_user_id, btrim(p_token), p_platform, now())
+  ON CONFLICT (token) DO UPDATE SET
+    user_id = EXCLUDED.user_id,
+    platform = EXCLUDED.platform,
+    updated_at = EXCLUDED.updated_at;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.release_cleaner_after_15min_hold()
  RETURNS integer
  LANGUAGE plpgsql
@@ -8149,6 +8360,45 @@ BEGIN
   SELECT count(*) INTO v_updated FROM upd;
 
   RETURN v_updated;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.remove_co_cleaner_from_team(p_co_cleaner_id uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+  n int;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  IF p_co_cleaner_id IS NULL OR p_co_cleaner_id = v_uid THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_co_cleaner');
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM public.cleaner_data
+    WHERE user_id = v_uid AND verified IS TRUE
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'only_verified_leads_can_remove');
+  END IF;
+
+  DELETE FROM public.co_cleaner_relationships
+  WHERE lead_cleaner_id = v_uid
+    AND co_cleaner_id = p_co_cleaner_id;
+
+  GET DIAGNOSTICS n = ROW_COUNT;
+  IF n = 0 THEN
+    RETURN jsonb_build_object('success', false, 'error', 'co_cleaner_not_on_team');
+  END IF;
+
+  RETURN jsonb_build_object('success', true, 'co_cleaner_id', p_co_cleaner_id);
 END;
 $function$
 
