@@ -684,6 +684,35 @@ COMMENT ON FUNCTION "public"."backfill_cleaner_application_approval"("p_user_id"
 
 
 
+CREATE OR REPLACE FUNCTION "public"."bookings_guard_payment_status"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF OLD.payment_status IS NOT DISTINCT FROM NEW.payment_status THEN
+    RETURN NEW;
+  END IF;
+
+  IF NEW.payment_status IN ('paid', 'refunded', 'partially_refunded')
+     AND auth.role() IN ('authenticated', 'anon') THEN
+    RAISE EXCEPTION
+      'payment_status % cannot be set by client',
+      NEW.payment_status
+      USING ERRCODE = '42501';
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."bookings_guard_payment_status"() OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."bookings_guard_payment_status"() IS 'Blocks client roles from setting paid/refunded/partially_refunded; service role only.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."bookings_set_duration"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     AS $$
@@ -4589,6 +4618,19 @@ $$;
 ALTER FUNCTION "public"."sync_auth_user_to_public_user"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."touch_booking_refunds_updated_at"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+BEGIN
+  NEW.updated_at = now();
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."touch_booking_refunds_updated_at"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."touch_payout_methods_updated_at"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     AS $$
@@ -5106,6 +5148,33 @@ CREATE TABLE IF NOT EXISTS "public"."base_durations" (
 ALTER TABLE "public"."base_durations" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."booking_refunds" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "booking_id" "uuid" NOT NULL,
+    "customer_id" "uuid" NOT NULL,
+    "tier" "text" NOT NULL,
+    "refund_percent" integer NOT NULL,
+    "refund_amount_minor" integer DEFAULT 0 NOT NULL,
+    "paystack_transaction_reference" "text",
+    "paystack_refund_reference" "text",
+    "status" "text" DEFAULT 'pending'::"text" NOT NULL,
+    "failure_reason" "text",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "booking_refunds_refund_amount_minor_check" CHECK (("refund_amount_minor" >= 0)),
+    CONSTRAINT "booking_refunds_refund_percent_check" CHECK (("refund_percent" = ANY (ARRAY[0, 50, 100]))),
+    CONSTRAINT "booking_refunds_status_check" CHECK (("status" = ANY (ARRAY['pending'::"text", 'processed'::"text", 'failed'::"text", 'skipped'::"text", 'manual_review'::"text"]))),
+    CONSTRAINT "booking_refunds_tier_check" CHECK (("tier" = ANY (ARRAY['full_refund'::"text", 'partial_refund'::"text", 'no_refund'::"text"])))
+);
+
+
+ALTER TABLE "public"."booking_refunds" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."booking_refunds" IS 'One row per customer-cancelled booking: Paystack refund attempt + policy tier audit.';
+
+
+
 CREATE TABLE IF NOT EXISTS "public"."booking_settings" (
     "key" "text" NOT NULL,
     "value_numeric" numeric,
@@ -5176,10 +5245,17 @@ CREATE TABLE IF NOT EXISTS "public"."bookings" (
     "is_weekend" boolean,
     "scheduled_at_utc" timestamp with time zone,
     "idempotency_key" "text",
+    "service_duration_option_id" "uuid",
+    "cancelled_at" timestamp with time zone,
+    "cancellation_tier" "text",
+    "cancelled_by" "uuid",
+    "cancellation_reason" "text",
+    CONSTRAINT "bookings_cancellation_tier_check" CHECK ((("cancellation_tier" IS NULL) OR ("cancellation_tier" = ANY (ARRAY['full_refund'::"text", 'partial_refund'::"text", 'no_refund'::"text"])))),
     CONSTRAINT "bookings_core_amount_nonnegative_check" CHECK ((("core_amount_minor" IS NULL) OR ("core_amount_minor" >= 0))),
     CONSTRAINT "bookings_customer_rating_range" CHECK ((("customer_rating" IS NULL) OR (("customer_rating" >= 1) AND ("customer_rating" <= 5)))),
     CONSTRAINT "bookings_duration_hours_valid" CHECK ((("duration_hours" > (0)::numeric) AND ("duration_hours" <= (24)::numeric))),
     CONSTRAINT "bookings_final_amount_nonnegative_check" CHECK ((("final_amount_minor" IS NULL) OR ("final_amount_minor" >= 0))),
+    CONSTRAINT "bookings_payment_status_check" CHECK ((("payment_status" IS NULL) OR ("payment_status" = ANY (ARRAY['pending'::"text", 'failed'::"text", 'paid'::"text", 'refunded'::"text", 'partially_refunded'::"text"])))),
     CONSTRAINT "bookings_recurrence_interval_check" CHECK ((("recurrence_interval" IS NULL) OR ("recurrence_interval" = ANY (ARRAY['weekly'::"text", 'bi-weekly'::"text", 'monthly'::"text"])))),
     CONSTRAINT "bookings_recurring_discount_nonnegative_check" CHECK (("recurring_discount_minor" >= 0)),
     CONSTRAINT "bookings_same_day_surcharge_nonnegative_check" CHECK (("same_day_surcharge_minor" >= 0)),
@@ -6663,6 +6739,16 @@ ALTER TABLE ONLY "public"."base_durations"
 
 
 
+ALTER TABLE ONLY "public"."booking_refunds"
+    ADD CONSTRAINT "booking_refunds_booking_id_key" UNIQUE ("booking_id");
+
+
+
+ALTER TABLE ONLY "public"."booking_refunds"
+    ADD CONSTRAINT "booking_refunds_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."booking_settings"
     ADD CONSTRAINT "booking_settings_pkey" PRIMARY KEY ("key");
 
@@ -7233,6 +7319,14 @@ CREATE INDEX "idx_availability_times" ON "public"."availability" USING "btree" (
 
 
 
+CREATE INDEX "idx_booking_refunds_customer_id" ON "public"."booking_refunds" USING "btree" ("customer_id");
+
+
+
+CREATE INDEX "idx_booking_refunds_paystack_tx_ref" ON "public"."booking_refunds" USING "btree" ("paystack_transaction_reference") WHERE ("paystack_transaction_reference" IS NOT NULL);
+
+
+
 CREATE INDEX "idx_bookings_cleaner" ON "public"."bookings" USING "btree" ("cleaner_id");
 
 
@@ -7294,6 +7388,10 @@ CREATE INDEX "idx_bookings_pending_holds_cleanup" ON "public"."bookings" USING "
 
 
 CREATE INDEX "idx_bookings_scheduled_date" ON "public"."bookings" USING "btree" ("scheduled_date" DESC);
+
+
+
+CREATE INDEX "idx_bookings_service_duration_option_id" ON "public"."bookings" USING "btree" ("service_duration_option_id") WHERE ("service_duration_option_id" IS NOT NULL);
 
 
 
@@ -7793,6 +7891,14 @@ CREATE OR REPLACE TRIGGER "tr_on_cleaner_created" AFTER INSERT ON "public"."clea
 
 
 
+CREATE OR REPLACE TRIGGER "trg_booking_refunds_updated_at" BEFORE UPDATE ON "public"."booking_refunds" FOR EACH ROW EXECUTE FUNCTION "public"."touch_booking_refunds_updated_at"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_bookings_guard_payment_status" BEFORE UPDATE OF "payment_status" ON "public"."bookings" FOR EACH ROW EXECUTE FUNCTION "public"."bookings_guard_payment_status"();
+
+
+
 CREATE OR REPLACE TRIGGER "trg_profiles_fullname" BEFORE INSERT OR UPDATE OF "firstname", "lastname" ON "public"."profiles" FOR EACH ROW EXECUTE FUNCTION "public"."fn_sync_profile_fullname"();
 
 
@@ -7832,8 +7938,23 @@ ALTER TABLE ONLY "public"."avatar_storage_deletions"
 
 
 
+ALTER TABLE ONLY "public"."booking_refunds"
+    ADD CONSTRAINT "booking_refunds_booking_id_fkey" FOREIGN KEY ("booking_id") REFERENCES "public"."bookings"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."booking_refunds"
+    ADD CONSTRAINT "booking_refunds_customer_id_fkey" FOREIGN KEY ("customer_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."booking_timeline"
     ADD CONSTRAINT "booking_timeline_booking_id_fkey" FOREIGN KEY ("booking_id") REFERENCES "public"."bookings"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."bookings"
+    ADD CONSTRAINT "bookings_cancelled_by_fkey" FOREIGN KEY ("cancelled_by") REFERENCES "auth"."users"("id");
 
 
 
@@ -7844,6 +7965,11 @@ ALTER TABLE ONLY "public"."bookings"
 
 ALTER TABLE ONLY "public"."bookings"
     ADD CONSTRAINT "bookings_customer_id_fkey" FOREIGN KEY ("customer_id") REFERENCES "public"."profiles"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."bookings"
+    ADD CONSTRAINT "bookings_service_duration_option_id_fkey" FOREIGN KEY ("service_duration_option_id") REFERENCES "public"."service_duration_options"("id") ON DELETE SET NULL;
 
 
 
@@ -8657,6 +8783,13 @@ ALTER TABLE "public"."avatar_storage_deletions" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."base_durations" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."booking_refunds" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "booking_refunds_select_own" ON "public"."booking_refunds" FOR SELECT TO "authenticated" USING (("customer_id" = "auth"."uid"()));
+
 
 
 ALTER TABLE "public"."booking_settings" ENABLE ROW LEVEL SECURITY;
@@ -10136,6 +10269,12 @@ GRANT ALL ON FUNCTION "public"."assign_user_role"("target_user_id" "uuid", "targ
 
 REVOKE ALL ON FUNCTION "public"."backfill_cleaner_application_approval"("p_user_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."backfill_cleaner_application_approval"("p_user_id" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."bookings_guard_payment_status"() TO "anon";
+GRANT ALL ON FUNCTION "public"."bookings_guard_payment_status"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."bookings_guard_payment_status"() TO "service_role";
 
 
 
@@ -16214,6 +16353,12 @@ GRANT ALL ON FUNCTION "public"."time_dist"(time without time zone, time without 
 
 
 
+GRANT ALL ON FUNCTION "public"."touch_booking_refunds_updated_at"() TO "anon";
+GRANT ALL ON FUNCTION "public"."touch_booking_refunds_updated_at"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."touch_booking_refunds_updated_at"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."touch_payout_methods_updated_at"() TO "anon";
 GRANT ALL ON FUNCTION "public"."touch_payout_methods_updated_at"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."touch_payout_methods_updated_at"() TO "service_role";
@@ -16521,6 +16666,12 @@ GRANT ALL ON TABLE "public"."avatar_storage_deletions" TO "service_role";
 GRANT ALL ON TABLE "public"."base_durations" TO "anon";
 GRANT ALL ON TABLE "public"."base_durations" TO "authenticated";
 GRANT ALL ON TABLE "public"."base_durations" TO "service_role";
+
+
+
+GRANT SELECT,REFERENCES,TRIGGER,TRUNCATE,MAINTAIN ON TABLE "public"."booking_refunds" TO "anon";
+GRANT SELECT,REFERENCES,TRIGGER,TRUNCATE,MAINTAIN ON TABLE "public"."booking_refunds" TO "authenticated";
+GRANT ALL ON TABLE "public"."booking_refunds" TO "service_role";
 
 
 

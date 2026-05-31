@@ -1097,6 +1097,30 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.bookings_guard_payment_status()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  IF OLD.payment_status IS NOT DISTINCT FROM NEW.payment_status THEN
+    RETURN NEW;
+  END IF;
+
+  IF NEW.payment_status IN ('paid', 'refunded', 'partially_refunded')
+     AND auth.role() IN ('authenticated', 'anon') THEN
+    RAISE EXCEPTION
+      'payment_status % cannot be set by client',
+      NEW.payment_status
+      USING ERRCODE = '42501';
+  END IF;
+
+  RETURN NEW;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.bookings_set_duration()
  RETURNS trigger
  LANGUAGE plpgsql
@@ -12027,6 +12051,17 @@ CREATE OR REPLACE FUNCTION public.time_dist(time without time zone, time without
 AS '$libdir/btree_gist', $function$time_dist$function$
 
 
+CREATE OR REPLACE FUNCTION public.touch_booking_refunds_updated_at()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+  NEW.updated_at = now();
+  RETURN NEW;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.touch_payout_methods_updated_at()
  RETURNS trigger
  LANGUAGE plpgsql
@@ -12645,6 +12680,8 @@ CREATE TRIGGER on_auth_user_identity_lookup_sync AFTER INSERT OR DELETE OR UPDAT
 
 CREATE TRIGGER on_auth_user_updated_sync_public AFTER UPDATE ON auth.users FOR EACH ROW EXECUTE FUNCTION sync_auth_user_to_public_user();
 
+CREATE TRIGGER trg_booking_refunds_updated_at BEFORE UPDATE ON booking_refunds FOR EACH ROW EXECUTE FUNCTION touch_booking_refunds_updated_at();
+
 CREATE TRIGGER bookings_compute_scheduled_at_utc BEFORE INSERT OR UPDATE OF scheduled_date, scheduled_time, timezone_name ON bookings FOR EACH ROW EXECUTE FUNCTION compute_booking_scheduled_at_utc();
 
 CREATE TRIGGER bookings_guard_payment_status BEFORE UPDATE ON bookings FOR EACH ROW EXECUTE FUNCTION guard_booking_payment_status_writes();
@@ -12652,6 +12689,8 @@ CREATE TRIGGER bookings_guard_payment_status BEFORE UPDATE ON bookings FOR EACH 
 CREATE TRIGGER on_booking_completed AFTER UPDATE ON bookings FOR EACH ROW EXECUTE FUNCTION handle_job_completion();
 
 CREATE TRIGGER tr_log_booking_status_change AFTER UPDATE OF status ON bookings FOR EACH ROW EXECUTE FUNCTION fn_log_status_change();
+
+CREATE TRIGGER trg_bookings_guard_payment_status BEFORE UPDATE OF payment_status ON bookings FOR EACH ROW EXECUTE FUNCTION bookings_guard_payment_status();
 
 CREATE TRIGGER trigger_calculate_booking_period BEFORE INSERT OR UPDATE OF scheduled_date, scheduled_time, duration_hours, timezone ON bookings FOR EACH ROW EXECUTE FUNCTION calculate_booking_period();
 
