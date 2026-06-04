@@ -8369,16 +8369,30 @@ AS $function$
 DECLARE
   v_updated integer;
 BEGIN
+  /*
+    Release cleaners only after the cleaner hold expires.
+
+    This avoids using bookings.created_at, because a booking may be older
+    than 15 minutes before a cleaner is selected.
+
+    Expected behavior:
+    - Cleaner selected/assigned -> cleaner_hold_expires_at is set
+    - Payment paid before expiry -> cleaner is kept
+    - Payment still unpaid after expiry -> cleaner is released
+  */
+
   WITH upd AS (
     UPDATE public.bookings
     SET
       cleaner_id = NULL,
+      cleaner_hold_expires_at = NULL,
       updated_at = now(),
       last_updated = now()
     WHERE cleaner_id IS NOT NULL
       AND status = 'confirmed'::public.booking_status
-      AND COALESCE(payment_status, 'pending') = 'pending'
-      AND created_at < now() - interval '15 minutes'
+      AND COALESCE(payment_status, 'pending') <> 'paid'
+      AND cleaner_hold_expires_at IS NOT NULL
+      AND cleaner_hold_expires_at < now()
     RETURNING 1
   )
   SELECT count(*) INTO v_updated FROM upd;
