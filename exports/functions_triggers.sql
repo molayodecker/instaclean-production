@@ -4592,7 +4592,184 @@ END;
 $function$
 
 
-CREATE OR REPLACE FUNCTION public.get_available_timeslots(p_booking_date date, p_timezone text DEFAULT 'UTC'::text, p_duration_hours numeric DEFAULT NULL::numeric)
+CREATE OR REPLACE FUNCTION public.get_available_timeslots(p_booking_date date, p_timezone text DEFAULT 'UTC'::text, p_duration_hours numeric DEFAULT NULL::numeric, p_exclude_booking_id uuid DEFAULT NULL::uuid)
+ RETURNS TABLE(time_12h text, time_24h text, same_day_cutoff numeric, travel_buffer numeric, work_day_start numeric, work_day_end numeric, slot_interval_minutes integer, duration_hours numeric, disable_same_day_booking boolean, is_meta_row boolean)
+ LANGUAGE plpgsql
+ STABLE
+AS $function$
+DECLARE
+  v_same_day_cutoff numeric;
+  v_travel_buffer numeric;
+  v_work_day_start numeric;
+  v_work_day_end numeric;
+
+  v_slot_interval_minutes int := 30;
+
+  v_duration numeric;
+  v_now_local timestamp;
+
+  v_start_minute int;
+  v_latest_start_minute int;
+
+  v_disable_same_day_booking boolean;
+BEGIN
+  -- p_exclude_booking_id: accepted for client RPC compatibility (slot list uses work-hour rules only).
+
+  SELECT value_numeric INTO v_same_day_cutoff
+  FROM booking_settings
+  WHERE key = 'same_day_cutoff';
+
+  SELECT value_numeric INTO v_travel_buffer
+  FROM booking_settings
+  WHERE key = 'travel_buffer';
+
+  SELECT value_numeric INTO v_work_day_start
+  FROM booking_settings
+  WHERE key = 'work_day_start';
+
+  SELECT value_numeric INTO v_work_day_end
+  FROM booking_settings
+  WHERE key = 'work_day_end';
+
+  v_same_day_cutoff := COALESCE(v_same_day_cutoff, 24.0);
+  v_travel_buffer   := COALESCE(v_travel_buffer, 1.0);
+  v_work_day_start  := COALESCE(v_work_day_start, 5.0);
+  v_work_day_end    := COALESCE(v_work_day_end, 17.0);
+
+  v_duration := COALESCE(p_duration_hours, 3.0);
+
+  IF v_duration <= 0 OR v_duration > 12 THEN
+    RETURN QUERY
+    SELECT
+      NULL::text,
+      NULL::text,
+      v_same_day_cutoff,
+      v_travel_buffer,
+      v_work_day_start,
+      v_work_day_end,
+      v_slot_interval_minutes,
+      v_duration,
+      false,
+      true;
+    RETURN;
+  END IF;
+
+  v_now_local := now() AT TIME ZONE p_timezone;
+
+  v_disable_same_day_booking :=
+    p_booking_date = v_now_local::date
+    AND (
+      EXTRACT(HOUR FROM v_now_local)
+      + EXTRACT(MINUTE FROM v_now_local) / 60.0
+    ) >= v_same_day_cutoff;
+
+  v_start_minute := floor(v_work_day_start * 60)::int;
+  v_latest_start_minute :=
+    floor((v_work_day_end - v_duration - v_travel_buffer) * 60)::int;
+
+  RETURN QUERY
+  WITH candidates AS (
+    SELECT generate_series(
+      v_start_minute,
+      v_latest_start_minute,
+      v_slot_interval_minutes
+    ) AS minute_of_day
+    WHERE v_latest_start_minute >= v_start_minute
+  ),
+  labeled AS (
+    SELECT
+      minute_of_day,
+      (minute_of_day / 60)::int AS h24,
+      (minute_of_day % 60)::int AS m
+    FROM candidates
+  ),
+  stamped AS (
+    SELECT
+      (p_booking_date::timestamp
+        + (h24 * interval '1 hour')
+        + (m  * interval '1 minute')) AS ts,
+      h24, m
+    FROM labeled
+  ),
+  formatted AS (
+    SELECT
+      to_char(ts, 'FMHH12:MI AM') AS time_12h,
+      to_char(ts, 'HH24:MI')      AS time_24h,
+      h24, m
+    FROM stamped
+  ),
+  slots AS (
+    SELECT
+      f.time_12h,
+      f.time_24h,
+      v_same_day_cutoff           AS same_day_cutoff,
+      v_travel_buffer             AS travel_buffer,
+      v_work_day_start            AS work_day_start,
+      v_work_day_end              AS work_day_end,
+      v_slot_interval_minutes     AS slot_interval_minutes,
+      v_duration                  AS duration_hours,
+      v_disable_same_day_booking  AS disable_same_day_booking,
+      false                       AS is_meta_row,
+      (f.h24 * 60 + f.m)          AS sort_key
+    FROM formatted f
+    WHERE
+      NOT v_disable_same_day_booking
+      AND public.validate_booking_timeslot_24h(
+        f.time_24h,
+        v_duration,
+        p_booking_date,
+        p_timezone
+      ) = true
+  ),
+  unioned AS (
+    SELECT
+      s.time_12h,
+      s.time_24h,
+      s.same_day_cutoff,
+      s.travel_buffer,
+      s.work_day_start,
+      s.work_day_end,
+      s.slot_interval_minutes,
+      s.duration_hours,
+      s.disable_same_day_booking,
+      s.is_meta_row,
+      s.sort_key
+    FROM slots s
+
+    UNION ALL
+
+    SELECT
+      NULL::text AS time_12h,
+      NULL::text AS time_24h,
+      v_same_day_cutoff,
+      v_travel_buffer,
+      v_work_day_start,
+      v_work_day_end,
+      v_slot_interval_minutes,
+      v_duration,
+      v_disable_same_day_booking,
+      true AS is_meta_row,
+      NULL::int AS sort_key
+    WHERE NOT EXISTS (SELECT 1 FROM slots)
+  )
+  SELECT
+    u.time_12h,
+    u.time_24h,
+    u.same_day_cutoff,
+    u.travel_buffer,
+    u.work_day_start,
+    u.work_day_end,
+    u.slot_interval_minutes,
+    u.duration_hours,
+    u.disable_same_day_booking,
+    u.is_meta_row
+  FROM unioned u
+  ORDER BY u.sort_key NULLS LAST;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.get_available_timeslots_old(p_booking_date date, p_timezone text DEFAULT 'UTC'::text, p_duration_hours numeric DEFAULT NULL::numeric)
  RETURNS TABLE(time_12h text, time_24h text, same_day_cutoff numeric, travel_buffer numeric, work_day_start numeric, work_day_end numeric, slot_interval_minutes integer, duration_hours numeric, disable_same_day_booking boolean, is_meta_row boolean)
  LANGUAGE plpgsql
  STABLE
@@ -4777,120 +4954,120 @@ END;
 $function$
 
 
-CREATE OR REPLACE FUNCTION public.get_available_timeslots_old(p_booking_date date, p_timezone text DEFAULT 'UTC'::text, p_duration_hours numeric DEFAULT NULL::numeric)
- RETURNS TABLE(time_12h text, time_24h text)
+CREATE OR REPLACE FUNCTION public.get_best_available_cleaners(p_date date, p_time time without time zone, p_duration numeric, p_lat double precision, p_lng double precision, p_max_distance_meters integer, p_requested_services text[], p_exclude_booking_id uuid DEFAULT NULL::uuid)
+ RETURNS TABLE(cleaner_id uuid, cleaner_name text, avatar_url text, bio text, hourly_rate numeric, rating double precision, distance_meters double precision, final_score double precision)
  LANGUAGE plpgsql
  STABLE
 AS $function$
 DECLARE
-  v_same_day_cutoff numeric;
-  v_travel_buffer numeric;
-  v_work_day_start numeric;
-  v_work_day_end numeric;
-
-  v_slot_interval_minutes int := 30;
-
-  v_duration numeric;
-  v_now_local timestamp;
-
-  v_start_minute int;
-  v_latest_start_minute int;
+  v_cust_id uuid := auth.uid();
+  v_booking_range tstzrange;
+  v_cust_loc geography := ST_SetSRID(ST_MakePoint(p_lng, p_lat), 4326)::geography;
 BEGIN
-  -- 1) Settings (based on your existing keys)
-  SELECT value_numeric INTO v_same_day_cutoff
-  FROM booking_settings
-  WHERE key = 'same_day_cutoff';
-
-  SELECT value_numeric INTO v_travel_buffer
-  FROM booking_settings
-  WHERE key = 'travel_buffer';
-
-  SELECT value_numeric INTO v_work_day_start
-  FROM booking_settings
-  WHERE key = 'work_day_start';
-
-  SELECT value_numeric INTO v_work_day_end
-  FROM booking_settings
-  WHERE key = 'work_day_end';
-
-  v_same_day_cutoff := COALESCE(v_same_day_cutoff, 24.0);
-  v_travel_buffer   := COALESCE(v_travel_buffer, 1.0);
-  v_work_day_start  := COALESCE(v_work_day_start, 5.0);
-  v_work_day_end    := COALESCE(v_work_day_end, 17.0);
-
-  -- 2) Duration (default Medium: 3.0h)
-  v_duration := COALESCE(p_duration_hours, 3.0);
-
-  IF v_duration <= 0 OR v_duration > 12 THEN
-    RETURN;
+  IF v_cust_id IS NULL THEN
+    RAISE EXCEPTION 'Not authorized';
   END IF;
 
-  -- 3) Local "now" (wall clock time at booking location)
-  v_now_local := now() AT TIME ZONE p_timezone;
+  v_booking_range := tstzrange(
+    (p_date + p_time)::timestamptz,
+    (p_date + p_time + (p_duration || ' hours')::interval)::timestamptz,
+    '[)'
+  );
 
-  -- 4) Convert to minute bounds
-  v_start_minute := floor(v_work_day_start * 60)::int;
-
-  -- Latest allowed start so (start + duration + buffer) <= work_day_end
-  v_latest_start_minute :=
-    floor((v_work_day_end - v_duration - v_travel_buffer) * 60)::int;
-
-  -- If nothing fits, return no rows
-  IF v_latest_start_minute < v_start_minute THEN
-    RETURN;
-  END IF;
-
-  -- 5) Generate slots only within allowed range
   RETURN QUERY
-  WITH candidates AS (
-    SELECT generate_series(v_start_minute, v_latest_start_minute, v_slot_interval_minutes) AS minute_of_day
-  ),
-  labeled AS (
+  WITH available_cleaners AS (
     SELECT
-      minute_of_day,
-      (minute_of_day / 60)::int AS h24,
-      (minute_of_day % 60)::int AS m
-    FROM candidates
+      cd.user_id AS cleaner_user_id,
+      p.fullname AS cleaner_fullname,
+      p.avatar_url AS profile_avatar_url,
+      COALESCE(cd.bio, p.bio) AS profile_bio,
+      cd.hourly_rate AS cleaner_hourly_rate,
+      cd.rating AS cleaner_rating,
+      cd.skills AS cleaner_skills,
+      cd.specialties AS cleaner_specialties,
+      COALESCE(cd.base_location::geography, p.location_wkt) AS effective_location,
+      ST_Distance(
+        COALESCE(cd.base_location::geography, p.location_wkt),
+        v_cust_loc
+      )::float AS dist
+    FROM public.cleaner_data cd
+    JOIN public.profiles p ON p.user_id = cd.user_id
+    WHERE cd.status = 'active'
+      AND cd.verified = true
+      AND COALESCE(cd.base_location::geography, p.location_wkt) IS NOT NULL
+      AND (
+        auth.uid() = cd.user_id
+        OR public.is_profile_discoverable_by_others(p)
+      )
+      AND ST_DWithin(
+        COALESCE(cd.base_location::geography, p.location_wkt),
+        v_cust_loc,
+        LEAST(
+          COALESCE(cd.max_travel_distance_meters, p_max_distance_meters),
+          p_max_distance_meters
+        )
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM public.bookings b
+        WHERE b.cleaner_id = cd.user_id
+          AND b.booking_period && v_booking_range
+          AND b.status != 'cancelled'
+          AND (
+            p_exclude_booking_id IS NULL
+            OR b.id <> p_exclude_booking_id
+          )
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM public.cleaner_availability_exceptions cae
+        WHERE cae.cleaner_id = cd.user_id
+          AND cae.exception_date = p_date
+      )
   ),
-  stamped AS (
+  scored_cleaners AS (
     SELECT
-      (p_booking_date::timestamp
-        + (h24 * interval '1 hour')
-        + (m  * interval '1 minute')) AS ts,
-      h24, m
-    FROM labeled
-  ),
-  formatted AS (
-    SELECT
-      to_char(ts, 'FMHH12:MI AM') AS time_12h,
-      to_char(ts, 'HH24:MI')      AS time_24h,
-      h24, m
-    FROM stamped
+      ac.cleaner_user_id,
+      ac.cleaner_fullname,
+      ac.profile_avatar_url,
+      ac.profile_bio,
+      ac.cleaner_hourly_rate,
+      ac.cleaner_rating,
+      ac.cleaner_skills,
+      ac.cleaner_specialties,
+      ac.dist,
+      CASE
+        WHEN cardinality(COALESCE(p_requested_services, ARRAY[]::text[])) > 0
+        THEN (
+          SELECT count(*)::float / cardinality(p_requested_services)
+          FROM unnest(p_requested_services) s
+          WHERE s = ANY(COALESCE(ac.cleaner_skills, ARRAY[]::text[]))
+             OR s = ANY(COALESCE(ac.cleaner_specialties, ARRAY[]::text[]))
+        ) * 40
+        ELSE 20
+      END AS s_score
+    FROM available_cleaners ac
   )
   SELECT
-    f.time_12h,
-    f.time_24h
-  FROM formatted f
-  WHERE
-    -- 6) Same-day cutoff rule
-    NOT (
-      p_booking_date = v_now_local::date
-      AND (EXTRACT(HOUR FROM v_now_local) + EXTRACT(MINUTE FROM v_now_local)/60.0) >= v_same_day_cutoff
-    )
-    -- 7) Final authority: validate all rules in one place
-    AND public.validate_booking_timeslot_24h(
-      f.time_24h,
-      v_duration,
-      p_booking_date,
-      p_timezone
-    ) = true
-  ORDER BY f.h24, f.m;
-
+    sc.cleaner_user_id AS cleaner_id,
+    sc.cleaner_fullname AS cleaner_name,
+    sc.profile_avatar_url AS avatar_url,
+    sc.profile_bio AS bio,
+    sc.cleaner_hourly_rate AS hourly_rate,
+    sc.cleaner_rating::float AS rating,
+    sc.dist::float AS distance_meters,
+    (
+      (GREATEST(0, (1.0 - (sc.dist / p_max_distance_meters))) * 30)
+      + (COALESCE(sc.cleaner_rating, 0) / 5.0 * 30)
+      + sc.s_score
+    )::float AS final_score
+  FROM scored_cleaners sc
+  ORDER BY final_score DESC, sc.dist ASC;
 END;
 $function$
 
 
-CREATE OR REPLACE FUNCTION public.get_best_available_cleaners(p_date date, p_time time without time zone, p_duration numeric, p_lat double precision, p_lng double precision, p_max_distance_meters integer, p_requested_services text[])
+CREATE OR REPLACE FUNCTION public.get_best_available_cleaners_old(p_date date, p_time time without time zone, p_duration numeric, p_lat double precision, p_lng double precision, p_max_distance_meters integer, p_requested_services text[])
  RETURNS TABLE(cleaner_id uuid, cleaner_name text, avatar_url text, bio text, hourly_rate numeric, rating double precision, distance_meters double precision, final_score double precision)
  LANGUAGE plpgsql
  STABLE
@@ -4999,7 +5176,51 @@ END;
 $function$
 
 
-CREATE OR REPLACE FUNCTION public.get_cleaner_availability_by_id(p_cleaner_id uuid, p_date date, p_time time without time zone, p_duration numeric, p_timezone text DEFAULT 'UTC'::text)
+CREATE OR REPLACE FUNCTION public.get_cleaner_availability_by_id(p_cleaner_id uuid, p_date date, p_time time without time zone, p_duration numeric, p_timezone text DEFAULT 'UTC'::text, p_exclude_booking_id uuid DEFAULT NULL::uuid)
+ RETURNS TABLE(id uuid, fullname text, avatar_url text, hourly_rate numeric, is_available boolean)
+ LANGUAGE plpgsql
+ STABLE
+AS $function$
+DECLARE
+  v_start_local timestamp;
+  v_end_local timestamp;
+  v_requested_range tstzrange;
+BEGIN
+  v_start_local := (p_date + p_time)::timestamp;
+  v_end_local := v_start_local + (p_duration * interval '1 hour') + interval '1 hour';
+
+  v_requested_range := tstzrange(
+    (v_start_local AT TIME ZONE p_timezone),
+    (v_end_local AT TIME ZONE p_timezone),
+    '[)'
+  );
+
+  RETURN QUERY
+  SELECT
+    cd.user_id,
+    p.fullname,
+    p.avatar_url,
+    cd.hourly_rate,
+    NOT EXISTS (
+      SELECT 1
+      FROM public.bookings b
+      WHERE b.cleaner_id = p_cleaner_id
+        AND b.booking_period && v_requested_range
+        AND b.status IS DISTINCT FROM 'cancelled'
+        AND (
+          p_exclude_booking_id IS NULL
+          OR b.id <> p_exclude_booking_id
+        )
+    ) AS is_available
+  FROM public.cleaner_data cd
+  JOIN public.profiles p ON p.id = cd.user_id
+  WHERE cd.user_id = p_cleaner_id
+    AND cd.status = 'active';
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.get_cleaner_availability_by_id_old(p_cleaner_id uuid, p_date date, p_time time without time zone, p_duration numeric, p_timezone text DEFAULT 'UTC'::text)
  RETURNS TABLE(id uuid, fullname text, avatar_url text, hourly_rate numeric, is_available boolean)
  LANGUAGE plpgsql
  STABLE
@@ -5539,6 +5760,56 @@ AS $function$
   FROM net._http_response q
   ORDER BY q.id DESC
   LIMIT 500;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.get_pending_booking_for_edit(p_customer_id uuid, p_booking_id uuid)
+ RETURNS TABLE(id uuid, customer_id uuid, cleaner_id uuid, service_id integer, title text, scheduled_date date, scheduled_time time without time zone, duration_hours numeric, address text, special_instructions text, status booking_status, payment_status text, subscription_id uuid, home_size text, extra_task_ids text[], duration_adjustment numeric, duration_computed numeric, duration_final numeric, timezone_name text, cleaner_assigned_at timestamp with time zone, service_duration_option_id uuid, location_latitude double precision, location_longitude double precision, service jsonb)
+ LANGUAGE sql
+ STABLE
+ SET search_path TO 'public'
+AS $function$
+  SELECT
+    b.id,
+    b.customer_id,
+    b.cleaner_id,
+    b.service_id,
+    b.title,
+    b.scheduled_date,
+    b.scheduled_time,
+    b.duration_hours,
+    b.address,
+    b.special_instructions,
+    b.status,
+    b.payment_status,
+    b.subscription_id,
+    b.home_size,
+    b.extra_task_ids,
+    b.duration_adjustment,
+    b.duration_computed,
+    b.duration_final,
+    b.timezone_name,
+    b.cleaner_assigned_at,
+    b.service_duration_option_id,
+    CASE
+      WHEN b.location_coordinates IS NOT NULL
+        THEN ST_Y(b.location_coordinates::geometry)
+      ELSE NULL
+    END AS location_latitude,
+    CASE
+      WHEN b.location_coordinates IS NOT NULL
+        THEN ST_X(b.location_coordinates::geometry)
+      ELSE NULL
+    END AS location_longitude,
+    to_jsonb(s.*) AS service
+  FROM public.bookings b
+  JOIN public.service_types s
+    ON s.id = b.service_id
+  WHERE b.id = p_booking_id
+    AND b.customer_id = p_customer_id
+    AND b.status IN ('pending', 'confirmed', 'scheduled')
+    AND b.subscription_id IS NULL
+  LIMIT 1;
 $function$
 
 
@@ -6223,6 +6494,21 @@ AS $function$
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.is_profile_visible_to_viewer(p profiles, viewer_id uuid)
+ RETURNS boolean
+ LANGUAGE sql
+ STABLE
+AS $function$
+  SELECT
+    viewer_id IS NOT NULL
+    AND (
+      viewer_id = p.id
+      OR viewer_id = p.user_id
+      OR public.is_profile_discoverable_by_others(p)
+    );
+$function$
+
+
 CREATE OR REPLACE FUNCTION public."json"(geometry)
  RETURNS json
  LANGUAGE c
@@ -6354,147 +6640,151 @@ $function$
 
 
 CREATE OR REPLACE FUNCTION public.lookup_sign_in_account(lookup_identifier text)
- RETURNS TABLE(has_account boolean, matched_by text, user_id uuid, providers text[], supports_email_password boolean, supports_phone_otp boolean, email text, phone_e164 text)
- LANGUAGE plpgsql
+ RETURNS TABLE(email text, has_account boolean, matched_by text, phone_e164 text, providers text[], supports_email_password boolean, supports_phone_otp boolean, user_id uuid)
+ LANGUAGE sql
  STABLE SECURITY DEFINER
- SET search_path TO 'public'
+ SET search_path TO 'public', 'auth'
 AS $function$
-declare
-  normalized_identifier text := nullif(trim(coalesce(lookup_identifier, '')), '');
-  computed_phone_e164 text;
-  computed_phone_variants text[];
-  forwarded_ip text;
-  blocked boolean;
-begin
-  -- Empty identifier: short-circuit with the standard "no account" shape.
-  if normalized_identifier is null then
-    return query
-    select
-      false,
-      null::text,
-      null::uuid,
-      '{}'::text[],
-      false,
-      false,
-      null::text,
-      null::text;
-    return;
-  end if;
+  WITH input AS (
+    SELECT
+      trim(lookup_identifier) AS raw_identifier,
+      lower(trim(lookup_identifier)) AS normalized_email,
+      public.phone_lookup_variants(trim(lookup_identifier)) AS phone_variants
+  ),
 
-  -- Per-identifier limit.
-  blocked := public.record_lookup_attempt(
-    'identifier',
-    lower(normalized_identifier),
-    10,    -- max attempts
-    300    -- 5-minute window
-  );
-
-  -- Per-IP limit (best-effort — only the first IP in x-forwarded-for).
-  begin
-    forwarded_ip := split_part(
-      coalesce(current_setting('request.headers', true)::json ->> 'x-forwarded-for', ''),
-      ',',
-      1
-    );
-    forwarded_ip := nullif(trim(forwarded_ip), '');
-  exception when others then
-    forwarded_ip := null;
-  end;
-
-  if forwarded_ip is not null then
-    blocked := blocked or public.record_lookup_attempt(
-      'ip',
-      forwarded_ip,
-      60,    -- max attempts
-      300    -- 5-minute window
-    );
-  end if;
-
-  if blocked then
-    -- Indistinguishable-from-no-account response.
-    return query
-    select
-      false,
-      null::text,
-      null::uuid,
-      '{}'::text[],
-      false,
-      false,
-      null::text,
-      null::text;
-    return;
-  end if;
-
-  -- Below this point: original lookup logic (unchanged).
-
-  if position('@' in normalized_identifier) > 0 then
-    return query
-    select
-      true,
-      'email'::text,
-      ail.user_id,
-      ail.providers,
-      coalesce('email' = any(ail.providers), false),
-      coalesce('phone' = any(ail.providers), false),
-      ail.email,
-      ail.phone_e164
-    from public.auth_identity_lookup ail
-    where ail.email_normalized = lower(normalized_identifier)
-    order by ail.updated_at desc
-    limit 1;
-
-    if found then
-      return;
-    end if;
-  else
-    -- Qualify columns: bare `phone_e164` clashes with RETURNS TABLE output column.
-    select
-      pv.phone_e164,
-      pv.phone_variants
-    into
-      computed_phone_e164,
-      computed_phone_variants
-    from public.compute_ghana_phone_variants(normalized_identifier) as pv;
-
-    return query
-    select
-      true,
-      'phone'::text,
-      ail.user_id,
-      ail.providers,
-      coalesce('email' = any(ail.providers), false),
-      coalesce('phone' = any(ail.providers), false),
-      ail.email,
-      ail.phone_e164
-    from public.auth_identity_lookup ail
-    where
-      (computed_phone_e164 is not null and ail.phone_e164 = computed_phone_e164)
-      or (
-        coalesce(array_length(computed_phone_variants, 1), 0) > 0
-        and ail.phone_variants && computed_phone_variants
+  matched_auth_user AS (
+    SELECT
+      au.id,
+      au.email,
+      au.phone,
+      au.encrypted_password,
+      CASE
+        WHEN i.raw_identifier LIKE '%@%'
+          AND lower(au.email) = i.normalized_email
+          THEN 'email'
+        WHEN i.raw_identifier NOT LIKE '%@%'
+          AND coalesce(au.phone, '') <> ''
+          AND public.phone_lookup_variants(au.phone) && i.phone_variants
+          THEN 'phone'
+        ELSE NULL
+      END AS matched_by
+    FROM auth.users au
+    CROSS JOIN input i
+    WHERE
+      (
+        i.raw_identifier LIKE '%@%'
+        AND lower(au.email) = i.normalized_email
       )
-    order by
-      case when computed_phone_e164 is not null and ail.phone_e164 = computed_phone_e164 then 0 else 1 end,
-      ail.updated_at desc
-    limit 1;
+      OR
+      (
+        i.raw_identifier NOT LIKE '%@%'
+        AND coalesce(au.phone, '') <> ''
+        AND public.phone_lookup_variants(au.phone) && i.phone_variants
+      )
+    ORDER BY au.created_at DESC
+    LIMIT 1
+  ),
 
-    if found then
-      return;
-    end if;
-  end if;
+  matched_public_user AS (
+    SELECT
+      pu.id,
+      pu.email,
+      pu.phone,
+      NULL::text AS encrypted_password,
+      CASE
+        WHEN i.raw_identifier LIKE '%@%'
+          AND lower(pu.email) = i.normalized_email
+          THEN 'email'
+        WHEN i.raw_identifier NOT LIKE '%@%'
+          AND coalesce(pu.phone, '') <> ''
+          AND public.phone_lookup_variants(pu.phone) && i.phone_variants
+          THEN 'phone'
+        ELSE NULL
+      END AS matched_by
+    FROM public.users pu
+    CROSS JOIN input i
+    WHERE NOT EXISTS (SELECT 1 FROM matched_auth_user)
+      AND (
+        (
+          i.raw_identifier LIKE '%@%'
+          AND lower(pu.email) = i.normalized_email
+        )
+        OR
+        (
+          i.raw_identifier NOT LIKE '%@%'
+          AND coalesce(pu.phone, '') <> ''
+          AND public.phone_lookup_variants(pu.phone) && i.phone_variants
+        )
+      )
+    ORDER BY pu.created_at DESC
+    LIMIT 1
+  ),
 
-  -- No match.
-  return query
-  select
+  matched_user AS (
+    SELECT * FROM matched_auth_user
+    UNION ALL
+    SELECT * FROM matched_public_user
+    LIMIT 1
+  ),
+
+  identity_providers AS (
+    SELECT
+      ai.user_id,
+      array_agg(DISTINCT lower(ai.provider) ORDER BY lower(ai.provider)) AS providers
+    FROM auth.identities ai
+    WHERE ai.user_id IN (SELECT id FROM matched_user)
+    GROUP BY ai.user_id
+  ),
+
+  canonical_phone AS (
+    SELECT
+      mu.id,
+      coalesce(
+        (
+          SELECT v
+          FROM unnest(public.phone_lookup_variants(mu.phone)) AS v
+          WHERE v ~ '^\+[1-9][0-9]{6,14}$'
+          ORDER BY length(v) DESC
+          LIMIT 1
+        ),
+        NULLIF(btrim(mu.phone), '')
+      ) AS phone_e164
+    FROM matched_user mu
+  )
+
+  SELECT
+    mu.email,
+    true AS has_account,
+    mu.matched_by,
+    cp.phone_e164,
+    coalesce(ip.providers, ARRAY[]::text[]) AS providers,
+    (
+      coalesce(mu.encrypted_password, '') <> ''
+      OR 'email' = ANY (coalesce(ip.providers, ARRAY[]::text[]))
+    ) AS supports_email_password,
+    (
+      coalesce(cp.phone_e164, '') <> ''
+      OR 'phone' = ANY (coalesce(ip.providers, ARRAY[]::text[]))
+    ) AS supports_phone_otp,
+    mu.id AS user_id
+  FROM matched_user mu
+  LEFT JOIN identity_providers ip ON ip.user_id = mu.id
+  LEFT JOIN canonical_phone cp ON cp.id = mu.id
+
+  UNION ALL
+
+  SELECT
+    NULL::text,
     false,
-    null::text,
-    null::uuid,
-    '{}'::text[],
+    NULL::text,
+    NULL::text,
+    ARRAY[]::text[],
     false,
     false,
-    null::text,
-    null::text;
-end;
+    NULL::uuid
+  WHERE NOT EXISTS (SELECT 1 FROM matched_user)
+
+  LIMIT 1;
 $function$
 
 
@@ -7256,6 +7546,115 @@ CREATE OR REPLACE FUNCTION public.pgis_geometry_union_parallel_transfn(internal,
  LANGUAGE c
  IMMUTABLE PARALLEL SAFE COST 50
 AS '$libdir/postgis-3', $function$pgis_geometry_union_parallel_transfn$function$
+
+
+CREATE OR REPLACE FUNCTION public.phone_lookup_variants(p_raw text)
+ RETURNS text[]
+ LANGUAGE plpgsql
+ IMMUTABLE PARALLEL SAFE
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_trimmed text;
+  v_sanitized text;
+  v_digits text;
+  v_national text;
+  v_e164 text;
+  v_variants text[] := ARRAY[]::text[];
+BEGIN
+  v_trimmed := trim(coalesce(p_raw, ''));
+  IF v_trimmed = '' THEN
+    RETURN v_variants;
+  END IF;
+
+  v_sanitized := regexp_replace(v_trimmed, '[^\d+]', '', 'g');
+  v_digits := regexp_replace(v_sanitized, '\D', '', 'g');
+
+  IF v_digits = '' THEN
+    RETURN ARRAY[v_trimmed, v_sanitized]::text[];
+  END IF;
+
+  -- Ghana local: 0[2-5] + 8 digits (e.g. 0501234567)
+  IF v_digits ~ '^0[2-5][0-9]{8}$' THEN
+    v_national := substring(v_digits from 2);
+    v_e164 := '+233' || v_national;
+    v_variants := ARRAY[
+      v_digits,
+      v_national,
+      '233' || v_national,
+      v_e164,
+      v_sanitized
+    ];
+  -- Ghana legacy: 2330[2-5] + 8 digits
+  ELSIF v_digits ~ '^2330[2-5][0-9]{8}$' THEN
+    v_national := substring(v_digits from 5);
+    v_e164 := '+233' || v_national;
+    v_variants := ARRAY[
+      '0' || v_national,
+      v_national,
+      '233' || v_national,
+      v_e164,
+      v_digits,
+      v_sanitized
+    ];
+  -- Ghana without leading +: 233[2-5] + 8 digits
+  ELSIF v_digits ~ '^233[2-5][0-9]{8}$' THEN
+    v_national := substring(v_digits from 4);
+    v_e164 := '+233' || v_national;
+    v_variants := ARRAY[
+      '0' || v_national,
+      v_national,
+      v_digits,
+      v_e164,
+      v_sanitized
+    ];
+  -- Ghana national only: [2-5] + 8 digits (e.g. 501234567)
+  ELSIF v_digits ~ '^[2-5][0-9]{8}$' THEN
+    v_national := v_digits;
+    v_e164 := '+233' || v_national;
+    v_variants := ARRAY[
+      '0' || v_national,
+      v_national,
+      '233' || v_national,
+      v_e164,
+      v_sanitized
+    ];
+  -- International / other E.164 stored as +digits
+  ELSIF v_sanitized ~ '^\+' AND v_digits ~ '^[1-9][0-9]{6,14}$' THEN
+    v_e164 := '+' || v_digits;
+    v_variants := ARRAY[v_e164, v_digits, v_sanitized];
+    -- If this is Ghana E.164, add local variants too
+    IF v_digits ~ '^233[2-5][0-9]{8}$' THEN
+      v_national := substring(v_digits from 4);
+      v_variants := v_variants || ARRAY[
+        '0' || v_national,
+        v_national,
+        '233' || v_national
+      ];
+    END IF;
+  -- Bare international digits without +
+  ELSIF v_digits ~ '^[1-9][0-9]{6,14}$' THEN
+    v_e164 := '+' || v_digits;
+    v_variants := ARRAY[v_digits, v_e164, v_sanitized];
+    IF v_digits ~ '^233[2-5][0-9]{8}$' THEN
+      v_national := substring(v_digits from 4);
+      v_variants := v_variants || ARRAY[
+        '0' || v_national,
+        v_national
+      ];
+    END IF;
+  ELSE
+    v_variants := ARRAY[v_digits, v_sanitized, v_trimmed];
+  END IF;
+
+  SELECT coalesce(array_agg(DISTINCT x), ARRAY[]::text[])
+  INTO v_variants
+  FROM unnest(v_variants) AS x
+  WHERE x IS NOT NULL AND btrim(x) <> '';
+
+  RETURN v_variants;
+END;
+$function$
 
 
 CREATE OR REPLACE FUNCTION public.point(geometry)
@@ -8361,43 +8760,41 @@ $function$
 
 
 CREATE OR REPLACE FUNCTION public.release_cleaner_after_15min_hold()
- RETURNS integer
+ RETURNS jsonb
  LANGUAGE plpgsql
  SECURITY DEFINER
- SET search_path TO 'public'
 AS $function$
 DECLARE
-  v_updated integer;
+  released_count integer := 0;
 BEGIN
-  /*
-    Release cleaners only after the cleaner hold expires.
+  UPDATE public.bookings
+  SET
+    cleaner_id = NULL,
+    cleaner_hold_expires_at = NULL,
+    status = CASE
+      WHEN status IN ('confirmed', 'pending') AND COALESCE(payment_status, 'pending') <> 'paid'
+        THEN 'pending'::public.booking_status
+      ELSE status
+    END,
+    updated_at = now(),
+    last_updated = now()
+  WHERE cleaner_id IS NOT NULL
+    AND COALESCE(payment_status, 'pending') <> 'paid'
+    AND status IN ('confirmed', 'pending') 
+    AND (
+      payment_status = 'failed'
+      OR (
+        cleaner_assigned_at IS NOT NULL
+        AND cleaner_assigned_at::timestamptz <= (now() - interval '15 minutes')::timestamptz
+      )
+    );
 
-    This avoids using bookings.created_at, because a booking may be older
-    than 15 minutes before a cleaner is selected.
+  GET DIAGNOSTICS released_count = ROW_COUNT;
 
-    Expected behavior:
-    - Cleaner selected/assigned -> cleaner_hold_expires_at is set
-    - Payment paid before expiry -> cleaner is kept
-    - Payment still unpaid after expiry -> cleaner is released
-  */
-
-  WITH upd AS (
-    UPDATE public.bookings
-    SET
-      cleaner_id = NULL,
-      cleaner_hold_expires_at = NULL,
-      updated_at = now(),
-      last_updated = now()
-    WHERE cleaner_id IS NOT NULL
-      AND status = 'confirmed'::public.booking_status
-      AND COALESCE(payment_status, 'pending') <> 'paid'
-      AND cleaner_hold_expires_at IS NOT NULL
-      AND cleaner_hold_expires_at < now()
-    RETURNING 1
-  )
-  SELECT count(*) INTO v_updated FROM upd;
-
-  RETURN v_updated;
+  RETURN jsonb_build_object(
+    'ok', true,
+    'released_count', released_count
+  );
 END;
 $function$
 
@@ -8526,7 +8923,61 @@ END;
 $function$
 
 
-CREATE OR REPLACE FUNCTION public.search_available_cleaners(p_lat double precision, p_lng double precision, p_date date, p_time time without time zone, p_duration double precision, p_requested_services text[] DEFAULT '{}'::text[], p_max_distance_meters double precision DEFAULT 50000)
+CREATE OR REPLACE FUNCTION public.search_available_cleaners(p_lat double precision, p_lng double precision, p_date date, p_time time without time zone, p_duration double precision, p_requested_services text[] DEFAULT '{}'::text[], p_max_distance_meters double precision DEFAULT 50000, p_exclude_booking_id uuid DEFAULT NULL::uuid)
+ RETURNS TABLE(cleaner_id uuid, cleaner_name text, avatar_url text, rating double precision, distance_meters double precision, matching_skills_count integer, total_skills_count integer)
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+AS $function$
+DECLARE
+  v_cust_loc geography := ST_SetSRID(ST_MakePoint(p_lng, p_lat), 4326)::geography;
+  v_booking_range tstzrange := tstzrange(
+    (p_date + p_time)::timestamptz,
+    (p_date + p_time + (p_duration || ' hours')::interval)::timestamptz,
+    '[)'
+  );
+BEGIN
+  IF auth.uid() IS NULL THEN
+    RAISE EXCEPTION 'Not authorized';
+  END IF;
+
+  RETURN QUERY
+  SELECT
+    cd.user_id,
+    p.fullname,
+    p.avatar_url,
+    cd.rating::float,
+    (cd.base_location::geography <-> v_cust_loc)::float AS dist_m,
+    (
+      SELECT count(*)::int
+      FROM unnest(p_requested_services) s
+      WHERE s = ANY(cd.skills) OR s = ANY(cd.specialties)
+    ) AS matching_skills_count,
+    COALESCE(array_length(cd.skills, 1), 0) AS total_skills_count
+  FROM public.cleaner_data cd
+  JOIN public.profiles p ON p.id = cd.user_id
+  WHERE cd.status = 'active'
+    AND (
+      auth.uid() = cd.user_id
+      OR public.is_profile_discoverable_by_others(p)
+    )
+    AND ST_DWithin(cd.base_location::geography, v_cust_loc, p_max_distance_meters)
+    AND NOT EXISTS (
+      SELECT 1
+      FROM public.bookings b
+      WHERE b.cleaner_id = cd.user_id
+        AND b.booking_period && v_booking_range
+        AND b.status != 'cancelled'
+        AND (
+          p_exclude_booking_id IS NULL
+          OR b.id <> p_exclude_booking_id
+        )
+    )
+  ORDER BY cd.base_location::geography <-> v_cust_loc ASC;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.search_available_cleaners_old(p_lat double precision, p_lng double precision, p_date date, p_time time without time zone, p_duration double precision, p_requested_services text[] DEFAULT '{}'::text[], p_max_distance_meters double precision DEFAULT 50000)
  RETURNS TABLE(cleaner_id uuid, cleaner_name text, avatar_url text, rating double precision, distance_meters double precision, matching_skills_count integer, total_skills_count integer)
  LANGUAGE plpgsql
  STABLE SECURITY DEFINER
@@ -8591,6 +9042,39 @@ BEGIN
   IF NEW.timezone_name IS NULL THEN
     NEW.timezone_name := 'UTC';
     RAISE WARNING 'No timezone found for point %, defaulting to UTC', ST_AsText(NEW.location_coordinates);
+  END IF;
+
+  RETURN NEW;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.set_cleaner_assigned_at_for_hold()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+  -- Paid bookings: only clear legacy expiry column; do not reset hold/assignment timestamps.
+  IF COALESCE(NEW.payment_status, 'pending') = 'paid' THEN
+    NEW.cleaner_hold_expires_at := NULL;
+    RETURN NEW;
+  END IF;
+
+  IF NEW.cleaner_id IS NOT NULL
+     AND COALESCE(NEW.payment_status, 'pending') <> 'paid'
+     AND (
+       TG_OP = 'INSERT'
+       OR OLD.cleaner_id IS NULL
+       OR OLD.cleaner_id IS DISTINCT FROM NEW.cleaner_id
+     )
+  THEN
+    NEW.cleaner_assigned_at := now();
+    NEW.cleaner_hold_expires_at := NULL;
+  END IF;
+
+  -- Cron may clear cleaner_id but keep cleaner_assigned_at for "hold expired" detection.
+  IF NEW.cleaner_id IS NULL THEN
+    NEW.cleaner_hold_expires_at := NULL;
   END IF;
 
   RETURN NEW;
@@ -12705,6 +13189,8 @@ CREATE TRIGGER on_booking_completed AFTER UPDATE ON bookings FOR EACH ROW EXECUT
 CREATE TRIGGER tr_log_booking_status_change AFTER UPDATE OF status ON bookings FOR EACH ROW EXECUTE FUNCTION fn_log_status_change();
 
 CREATE TRIGGER trg_bookings_guard_payment_status BEFORE UPDATE OF payment_status ON bookings FOR EACH ROW EXECUTE FUNCTION bookings_guard_payment_status();
+
+CREATE TRIGGER trg_set_cleaner_assigned_at_for_hold BEFORE INSERT OR UPDATE OF cleaner_id, payment_status ON bookings FOR EACH ROW EXECUTE FUNCTION set_cleaner_assigned_at_for_hold();
 
 CREATE TRIGGER trigger_calculate_booking_period BEFORE INSERT OR UPDATE OF scheduled_date, scheduled_time, duration_hours, timezone ON bookings FOR EACH ROW EXECUTE FUNCTION calculate_booking_period();
 
