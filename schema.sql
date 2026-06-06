@@ -5784,6 +5784,8 @@ CREATE TABLE IF NOT EXISTS "public"."bookings" (
     "cancellation_reason" "text",
     "cleaner_assigned_at" timestamp with time zone,
     "cleaner_hold_expires_at" timestamp with time zone,
+    "ops_new_booking_notice_sent_at" timestamp with time zone,
+    "ops_confirmed_reminder_sent_at" timestamp with time zone,
     CONSTRAINT "bookings_cancellation_tier_check" CHECK ((("cancellation_tier" IS NULL) OR ("cancellation_tier" = ANY (ARRAY['full_refund'::"text", 'partial_refund'::"text", 'no_refund'::"text"])))),
     CONSTRAINT "bookings_core_amount_nonnegative_check" CHECK ((("core_amount_minor" IS NULL) OR ("core_amount_minor" >= 0))),
     CONSTRAINT "bookings_customer_rating_range" CHECK ((("customer_rating" IS NULL) OR (("customer_rating" >= 1) AND ("customer_rating" <= 5)))),
@@ -5813,6 +5815,14 @@ COMMENT ON COLUMN "public"."bookings"."cleaner_assigned_at" IS 'When cleaner_id 
 
 
 COMMENT ON COLUMN "public"."bookings"."cleaner_hold_expires_at" IS 'Legacy optional expiry; prefer cleaner_assigned_at + interval. Keep null for new rows.';
+
+
+
+COMMENT ON COLUMN "public"."bookings"."ops_new_booking_notice_sent_at" IS 'When ops support list was notified of this new booking (cron).';
+
+
+
+COMMENT ON COLUMN "public"."bookings"."ops_confirmed_reminder_sent_at" IS 'When ops support list was reminded this paid confirmed booking still needs attention after the cron threshold.';
 
 
 
@@ -7766,6 +7776,14 @@ CREATE UNIQUE INDEX "bookings_customer_idempotency_key_uidx" ON "public"."bookin
 
 
 CREATE INDEX "bookings_location_idx" ON "public"."bookings" USING "gist" ("location_coordinates");
+
+
+
+CREATE INDEX "bookings_ops_confirmed_reminder_idx" ON "public"."bookings" USING "btree" ("created_at") WHERE (("status" = 'confirmed'::"public"."booking_status") AND ("payment_status" = 'paid'::"text") AND ("ops_confirmed_reminder_sent_at" IS NULL));
+
+
+
+CREATE INDEX "bookings_ops_new_booking_notice_idx" ON "public"."bookings" USING "btree" ("created_at") WHERE ("ops_new_booking_notice_sent_at" IS NULL);
 
 
 
