@@ -920,6 +920,26 @@ COMMENT ON FUNCTION "public"."backfill_cleaner_application_approval"("p_user_id"
 
 
 
+CREATE OR REPLACE FUNCTION "public"."booking_cover_major_from_booking"("p_cover_amount" numeric) RETURNS numeric
+    LANGUAGE "plpgsql" IMMUTABLE
+    AS $$
+DECLARE
+  v_raw numeric := COALESCE(p_cover_amount, 0);
+BEGIN
+  IF v_raw <= 0 THEN
+    RETURN 0;
+  END IF;
+  IF v_raw >= 100 THEN
+    RETURN ROUND(GREATEST(0, v_raw / 100.0), 2);
+  END IF;
+  RETURN ROUND(GREATEST(0, v_raw), 2);
+END;
+$$;
+
+
+ALTER FUNCTION "public"."booking_cover_major_from_booking"("p_cover_amount" numeric) OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."bookings_guard_payment_status"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -1167,6 +1187,43 @@ $$;
 
 
 ALTER FUNCTION "public"."claim_job"("p_job_id" "uuid", "p_cleaner_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."cleaner_earnings_subunit_from_booking"("p_final_amount_minor" integer, "p_total_price" numeric, "p_platform_fee" numeric, "p_booking_cover" boolean, "p_booking_cover_amount" numeric, "p_core_amount_minor" integer) RETURNS integer
+    LANGUAGE "plpgsql" IMMUTABLE
+    AS $$
+DECLARE
+  v_final_minor integer;
+  v_final_major numeric;
+  v_platform numeric;
+  v_cover numeric;
+  v_earnings_major numeric;
+BEGIN
+  v_final_minor := COALESCE(
+    NULLIF(p_final_amount_minor, 0),
+    NULLIF(FLOOR(COALESCE(p_total_price, 0))::integer, 0)
+  );
+
+  IF v_final_minor IS NULL OR v_final_minor <= 0 THEN
+    RETURN 0;
+  END IF;
+
+  v_final_major := v_final_minor / 100.0;
+  v_platform := public.platform_fee_major_from_booking(p_platform_fee, p_core_amount_minor);
+  v_cover := public.resolve_booking_cover_major_for_cleaner_earnings(
+    p_booking_cover,
+    p_booking_cover_amount,
+    p_core_amount_minor,
+    p_platform_fee
+  );
+  v_earnings_major := ROUND(GREATEST(0, v_final_major - v_platform - v_cover), 2);
+
+  RETURN GREATEST(0, (v_earnings_major * 100)::integer);
+END;
+$$;
+
+
+ALTER FUNCTION "public"."cleaner_earnings_subunit_from_booking"("p_final_amount_minor" integer, "p_total_price" numeric, "p_platform_fee" numeric, "p_booking_cover" boolean, "p_booking_cover_amount" numeric, "p_core_amount_minor" integer) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."compute_booking_pricing"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_recurrence_interval" "text" DEFAULT NULL::"text", "p_is_recurring" boolean DEFAULT false) RETURNS TABLE("pricing_version" "text", "currency" "text", "same_day_surcharge_bps" integer, "weekend_surcharge_bps" integer, "recurring_weekly_discount_bps" integer, "recurring_monthly_discount_bps" integer, "work_rate_ghs_per_hour" numeric, "duration_hours" numeric, "subtotal_labor_major" numeric, "platform_fee_major" numeric, "booking_cover_major" numeric, "core_amount_minor" bigint, "same_day_surcharge_minor" bigint, "weekend_surcharge_minor" bigint, "recurring_discount_minor" bigint, "final_amount_minor" bigint, "recurring_amount_minor" bigint, "first_charge_amount_minor" bigint, "discount_rate_bps" integer, "is_same_day" boolean, "is_weekend" boolean)
@@ -1598,6 +1655,103 @@ $$;
 ALTER FUNCTION "public"."create_preferred_cleaner_invite"("p_invitee_email" "text", "p_invitee_phone_e164" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."credit_cleaner_wallet_for_booking"("p_booking_id" "uuid") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_booking public.bookings%ROWTYPE;
+  v_wallet_id uuid;
+  v_earnings_subunit integer;
+  v_inserted_id uuid;
+BEGIN
+  SELECT * INTO v_booking
+  FROM public.bookings
+  WHERE id = p_booking_id;
+
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  IF v_booking.status IS DISTINCT FROM 'completed' THEN
+    RETURN;
+  END IF;
+
+  IF v_booking.cleaner_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  IF v_booking.payment_status IS DISTINCT FROM 'paid' THEN
+    RETURN;
+  END IF;
+
+  v_earnings_subunit := public.cleaner_earnings_subunit_from_booking(
+    v_booking.final_amount_minor,
+    v_booking.total_price,
+    v_booking.platform_fee,
+    v_booking.booking_cover,
+    v_booking.booking_cover_amount,
+    v_booking.core_amount_minor
+  );
+
+  IF v_earnings_subunit <= 0 THEN
+    RETURN;
+  END IF;
+
+  SELECT w.id INTO v_wallet_id
+  FROM public.wallets w
+  WHERE w.user_id = v_booking.cleaner_id;
+
+  IF v_wallet_id IS NULL THEN
+    INSERT INTO public.wallets (user_id, balance_subunit, currency)
+    VALUES (v_booking.cleaner_id, 0, COALESCE(v_booking.currency, 'GHS'))
+    ON CONFLICT (user_id) DO UPDATE
+      SET updated_at = NOW()
+    RETURNING id INTO v_wallet_id;
+
+    IF v_wallet_id IS NULL THEN
+      SELECT w.id INTO v_wallet_id
+      FROM public.wallets w
+      WHERE w.user_id = v_booking.cleaner_id;
+    END IF;
+  END IF;
+
+  WITH inserted AS (
+    INSERT INTO public.wallet_transactions (
+      wallet_id,
+      booking_id,
+      amount_subunit,
+      type,
+      description
+    ) VALUES (
+      v_wallet_id,
+      p_booking_id,
+      v_earnings_subunit,
+      'credit',
+      'Job earning'
+    )
+    ON CONFLICT (booking_id) WHERE type = 'credit' AND booking_id IS NOT NULL
+    DO NOTHING
+    RETURNING id
+  )
+  SELECT id INTO v_inserted_id FROM inserted;
+
+  IF v_inserted_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  UPDATE public.wallets
+  SET
+    balance_subunit = COALESCE(balance_subunit, 0) + v_earnings_subunit,
+    updated_at = NOW()
+  WHERE id = v_wallet_id;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."credit_cleaner_wallet_for_booking"("p_booking_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."decline_booking_by_cleaner"("p_booking_id" "uuid", "p_reason" "text" DEFAULT NULL::"text") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -1752,6 +1906,107 @@ $$;
 ALTER FUNCTION "public"."fetch_cleaner_earnings"("p_user_id" "uuid", "p_start_date" timestamp with time zone, "p_end_date" timestamp with time zone) OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."fn_begin_cleaner_withdrawal"("p_cleaner_id" "uuid", "p_amount_subunit" integer, "p_withdrawal_id" "uuid", "p_recipient_code" "text" DEFAULT NULL::"text", "p_payout_method_id" "uuid" DEFAULT NULL::"uuid") RETURNS "uuid"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_wallet_id uuid;
+  v_balance integer;
+  v_min_subunit constant integer := 5000; -- GHS 50
+BEGIN
+  IF p_cleaner_id IS NULL OR p_withdrawal_id IS NULL THEN
+    RAISE EXCEPTION 'missing_cleaner_or_withdrawal_id';
+  END IF;
+
+  IF p_amount_subunit IS NULL OR p_amount_subunit < v_min_subunit THEN
+    RAISE EXCEPTION 'below_minimum_withdrawal';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM public.withdrawal_requests wr
+    WHERE wr.id = p_withdrawal_id
+      AND wr.cleaner_id = p_cleaner_id
+      AND wr.amount_subunit = p_amount_subunit
+  ) THEN
+    RETURN p_withdrawal_id;
+  END IF;
+
+  IF EXISTS (
+    SELECT 1 FROM public.withdrawal_requests wr
+    WHERE wr.id = p_withdrawal_id
+  ) THEN
+    RAISE EXCEPTION 'withdrawal_id_conflict';
+  END IF;
+
+  SELECT w.id, COALESCE(w.balance_subunit, 0)
+  INTO v_wallet_id, v_balance
+  FROM public.wallets w
+  WHERE w.user_id = p_cleaner_id
+  FOR UPDATE;
+
+  IF v_wallet_id IS NULL THEN
+    RAISE EXCEPTION 'wallet_not_found';
+  END IF;
+
+  IF v_balance < p_amount_subunit THEN
+    RAISE EXCEPTION 'insufficient_balance';
+  END IF;
+
+  UPDATE public.wallets
+  SET
+    balance_subunit = v_balance - p_amount_subunit,
+    updated_at = NOW()
+  WHERE id = v_wallet_id;
+
+  INSERT INTO public.withdrawal_requests (
+    id,
+    cleaner_id,
+    wallet_id,
+    amount_subunit,
+    status,
+    paystack_reference,
+    bank_details,
+    created_at,
+    updated_at
+  ) VALUES (
+    p_withdrawal_id,
+    p_cleaner_id,
+    v_wallet_id,
+    p_amount_subunit,
+    'processing',
+    p_withdrawal_id::text,
+    jsonb_build_object(
+      'recipient_code', p_recipient_code,
+      'payout_method_id', p_payout_method_id
+    ),
+    NOW(),
+    NOW()
+  );
+
+  INSERT INTO public.wallet_transactions (
+    wallet_id,
+    amount_subunit,
+    type,
+    description,
+    withdrawal_request_id
+  ) VALUES (
+    v_wallet_id,
+    p_amount_subunit,
+    'debit',
+    'Withdrawal pending',
+    p_withdrawal_id
+  );
+
+  RETURN p_withdrawal_id;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."fn_begin_cleaner_withdrawal"("p_cleaner_id" "uuid", "p_amount_subunit" integer, "p_withdrawal_id" "uuid", "p_recipient_code" "text", "p_payout_method_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."fn_create_wallet_for_new_cleaner"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     AS $$
@@ -1820,6 +2075,132 @@ $$;
 
 
 ALTER FUNCTION "public"."fn_finalize_withdrawal"("p_transfer_reference" "text", "p_status" "public"."withdrawal_status", "p_error_msg" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."fn_finalize_withdrawal"("p_transfer_reference" "text", "p_status" "public"."withdrawal_status", "p_error_msg" "text" DEFAULT NULL::"text", "p_paystack_transfer_code" "text" DEFAULT NULL::"text") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $_$
+DECLARE
+  v_request public.withdrawal_requests%ROWTYPE;
+  v_ref text := NULLIF(trim(p_transfer_reference), '');
+BEGIN
+  IF v_ref IS NULL THEN
+    RAISE EXCEPTION 'missing_transfer_reference';
+  END IF;
+
+  SELECT * INTO v_request
+  FROM public.withdrawal_requests
+  WHERE paystack_reference = v_ref
+  FOR UPDATE;
+
+  IF NOT FOUND AND v_ref ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
+    SELECT * INTO v_request
+    FROM public.withdrawal_requests
+    WHERE id = v_ref::uuid
+    FOR UPDATE;
+  END IF;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Withdrawal request not found';
+  END IF;
+
+  -- Terminal-state safety (webhook order chaos).
+  -- Allowed: processing/pending -> success | failed/reversed (refund)
+  --          success -> reversed (refund)
+  --          same terminal status -> no-op
+  IF v_request.status = p_status THEN
+    RETURN;
+  END IF;
+
+  IF v_request.status IN ('failed', 'reversed') THEN
+    RETURN;
+  END IF;
+
+  IF v_request.status = 'success' AND p_status <> 'reversed' THEN
+    RETURN;
+  END IF;
+
+  IF p_status = 'success' THEN
+    UPDATE public.withdrawal_requests
+    SET
+      status = 'success',
+      paystack_transfer_code = COALESCE(p_paystack_transfer_code, paystack_transfer_code),
+      error_message = NULL,
+      updated_at = NOW()
+    WHERE id = v_request.id;
+
+    UPDATE public.wallet_transactions
+    SET description = 'Withdrawal completed (Ref: ' || COALESCE(
+      p_paystack_transfer_code,
+      v_request.paystack_transfer_code,
+      v_ref
+    ) || ')'
+    WHERE withdrawal_request_id = v_request.id
+      AND type = 'debit';
+
+    RETURN;
+  END IF;
+
+  IF p_status IN ('failed', 'reversed') THEN
+    IF v_request.status IN ('processing', 'pending') THEN
+      UPDATE public.wallets
+      SET
+        balance_subunit = COALESCE(balance_subunit, 0) + v_request.amount_subunit,
+        updated_at = NOW()
+      WHERE id = v_request.wallet_id;
+
+      INSERT INTO public.wallet_transactions (
+        wallet_id,
+        amount_subunit,
+        type,
+        description,
+        withdrawal_request_id
+      ) VALUES (
+        v_request.wallet_id,
+        v_request.amount_subunit,
+        'credit',
+        CASE
+          WHEN p_status = 'reversed' THEN 'Withdrawal reversed — refunded'
+          ELSE 'Withdrawal failed — refunded'
+        END,
+        v_request.id
+      );
+    ELSIF v_request.status = 'success' AND p_status = 'reversed' THEN
+      UPDATE public.wallets
+      SET
+        balance_subunit = COALESCE(balance_subunit, 0) + v_request.amount_subunit,
+        updated_at = NOW()
+      WHERE id = v_request.wallet_id;
+
+      INSERT INTO public.wallet_transactions (
+        wallet_id,
+        amount_subunit,
+        type,
+        description,
+        withdrawal_request_id
+      ) VALUES (
+        v_request.wallet_id,
+        v_request.amount_subunit,
+        'credit',
+        'Withdrawal reversed — refunded to wallet',
+        v_request.id
+      );
+    END IF;
+
+    UPDATE public.withdrawal_requests
+    SET
+      status = p_status,
+      paystack_transfer_code = COALESCE(p_paystack_transfer_code, paystack_transfer_code),
+      error_message = p_error_msg,
+      updated_at = NOW()
+    WHERE id = v_request.id;
+  END IF;
+END;
+$_$;
+
+
+ALTER FUNCTION "public"."fn_finalize_withdrawal"("p_transfer_reference" "text", "p_status" "public"."withdrawal_status", "p_error_msg" "text", "p_paystack_transfer_code" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."fn_log_status_change"() RETURNS "trigger"
@@ -3529,16 +3910,10 @@ ALTER FUNCTION "public"."guard_booking_payment_status_writes"() OWNER TO "postgr
 
 CREATE OR REPLACE FUNCTION "public"."handle_job_completion"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
     AS $$
 BEGIN
-  -- When booking is marked 'completed', move associated transaction to 'available'
-  IF NEW.status = 'completed' AND OLD.status != 'completed' THEN
-    UPDATE public.transactions
-    SET status = 'available',
-        updated_at = now()
-    WHERE booking_id = NEW.id 
-    AND type = 'job_payment';
-  END IF;
+  PERFORM public.credit_cleaner_wallet_for_booking(NEW.id);
   RETURN NEW;
 END;
 $$;
@@ -4796,6 +5171,34 @@ COMMENT ON FUNCTION "public"."phone_lookup_variants"("p_raw" "text") IS 'E.164 a
 
 
 
+CREATE OR REPLACE FUNCTION "public"."platform_fee_major_from_booking"("p_platform_fee" numeric, "p_core_amount_minor" integer) RETURNS numeric
+    LANGUAGE "plpgsql" IMMUTABLE
+    AS $$
+DECLARE
+  v_raw numeric := COALESCE(p_platform_fee, 0);
+  v_core_major numeric;
+BEGIN
+  IF v_raw <= 0 THEN
+    RETURN 0;
+  END IF;
+
+  IF p_core_amount_minor IS NOT NULL AND p_core_amount_minor > 0 THEN
+    v_core_major := p_core_amount_minor / 100.0;
+    IF v_raw > v_core_major THEN
+      RETURN ROUND(GREATEST(0, v_raw / 100.0), 2);
+    END IF;
+  ELSIF v_raw >= 1000 THEN
+    RETURN ROUND(GREATEST(0, v_raw / 100.0), 2);
+  END IF;
+
+  RETURN ROUND(GREATEST(0, v_raw), 2);
+END;
+$$;
+
+
+ALTER FUNCTION "public"."platform_fee_major_from_booking"("p_platform_fee" numeric, "p_core_amount_minor" integer) OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."psk_transaction"("p_booking_id" "uuid", "p_user_id" "uuid", "p_reference" "text", "p_paystack_id" bigint, "p_amount" numeric, "p_fee_amount" numeric, "p_total_captured" numeric, "p_currency" "text", "p_metadata" "jsonb") RETURNS "public"."psk_transaction"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
@@ -5110,6 +5513,46 @@ $$;
 
 
 ALTER FUNCTION "public"."remove_co_cleaner_from_team"("p_co_cleaner_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."resolve_booking_cover_major_for_cleaner_earnings"("p_booking_cover" boolean, "p_booking_cover_amount" numeric, "p_core_amount_minor" integer, "p_platform_fee" numeric) RETURNS numeric
+    LANGUAGE "plpgsql" IMMUTABLE
+    AS $$
+DECLARE
+  v_stored numeric;
+  v_platform numeric;
+  v_core_major numeric;
+  v_default_cover numeric := 21.0;
+BEGIN
+  IF p_booking_cover IS FALSE THEN
+    RETURN 0;
+  END IF;
+
+  v_stored := COALESCE(p_booking_cover_amount, 0);
+  IF v_stored > 0 THEN
+    RETURN public.booking_cover_major_from_booking(v_stored);
+  END IF;
+
+  IF p_booking_cover IS TRUE THEN
+    RETURN v_default_cover;
+  END IF;
+
+  IF p_core_amount_minor IS NULL OR p_core_amount_minor <= 0 THEN
+    RETURN 0;
+  END IF;
+
+  v_platform := public.platform_fee_major_from_booking(p_platform_fee, p_core_amount_minor);
+  v_core_major := p_core_amount_minor / 100.0;
+  IF v_core_major - v_platform >= v_default_cover THEN
+    RETURN v_default_cover;
+  END IF;
+
+  RETURN 0;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."resolve_booking_cover_major_for_cleaner_earnings"("p_booking_cover" boolean, "p_booking_cover_amount" numeric, "p_core_amount_minor" integer, "p_platform_fee" numeric) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."revoke_co_cleaner_invite"("p_invite_id" "uuid") RETURNS "jsonb"
@@ -6409,6 +6852,28 @@ COMMENT ON COLUMN "public"."cleaner_leads"."ops_started_notice_sent_at" IS 'Firs
 
 
 
+CREATE TABLE IF NOT EXISTS "public"."cleaner_payouts" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "recipient_code" "text" NOT NULL,
+    "amount" bigint NOT NULL,
+    "currency" "text" DEFAULT 'GHS'::"text" NOT NULL,
+    "reference" "text" NOT NULL,
+    "status" "text" DEFAULT 'pending'::"text" NOT NULL,
+    "paystack_transfer_code" "text",
+    "paystack_transfer_id" bigint,
+    "reason" "text",
+    "error_message" "text",
+    "metadata" "jsonb",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "cleaner_payouts_amount_check" CHECK (("amount" > 0))
+);
+
+
+ALTER TABLE "public"."cleaner_payouts" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."cleaner_schedules" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "cleaner_id" "uuid",
@@ -7541,6 +8006,7 @@ CREATE TABLE IF NOT EXISTS "public"."wallet_transactions" (
     "type" "text",
     "description" "text",
     "created_at" timestamp with time zone DEFAULT "now"(),
+    "withdrawal_request_id" "uuid",
     CONSTRAINT "wallet_transactions_type_check" CHECK (("type" = ANY (ARRAY['credit'::"text", 'debit'::"text"])))
 );
 
@@ -7720,6 +8186,11 @@ ALTER TABLE ONLY "public"."cleaner_devices"
 
 ALTER TABLE ONLY "public"."cleaner_leads"
     ADD CONSTRAINT "cleaner_leads_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."cleaner_payouts"
+    ADD CONSTRAINT "cleaner_payouts_pkey" PRIMARY KEY ("id");
 
 
 
@@ -8187,6 +8658,18 @@ CREATE INDEX "cleaner_leads_status_current_step_idx" ON "public"."cleaner_leads"
 
 
 CREATE UNIQUE INDEX "cleaner_leads_web_continuation_code_key" ON "public"."cleaner_leads" USING "btree" ("web_continuation_code") WHERE ("web_continuation_code" IS NOT NULL);
+
+
+
+CREATE INDEX "cleaner_payouts_transfer_code_idx" ON "public"."cleaner_payouts" USING "btree" ("paystack_transfer_code") WHERE ("paystack_transfer_code" IS NOT NULL);
+
+
+
+CREATE INDEX "cleaner_payouts_user_created_idx" ON "public"."cleaner_payouts" USING "btree" ("user_id", "created_at" DESC);
+
+
+
+CREATE UNIQUE INDEX "cleaner_payouts_user_reference_uidx" ON "public"."cleaner_payouts" USING "btree" ("user_id", "reference");
 
 
 
@@ -8802,6 +9285,18 @@ CREATE UNIQUE INDEX "users_phone_unique_idx" ON "public"."users" USING "btree" (
 
 
 
+CREATE UNIQUE INDEX "wallet_transactions_booking_credit_uidx" ON "public"."wallet_transactions" USING "btree" ("booking_id") WHERE (("type" = 'credit'::"text") AND ("booking_id" IS NOT NULL));
+
+
+
+CREATE INDEX "wallet_transactions_withdrawal_request_id_idx" ON "public"."wallet_transactions" USING "btree" ("withdrawal_request_id") WHERE ("withdrawal_request_id" IS NOT NULL);
+
+
+
+CREATE UNIQUE INDEX "wallets_user_id_uidx" ON "public"."wallets" USING "btree" ("user_id");
+
+
+
 CREATE OR REPLACE TRIGGER "bookings_compute_scheduled_at_utc" BEFORE INSERT OR UPDATE OF "scheduled_date", "scheduled_time", "timezone_name" ON "public"."bookings" FOR EACH ROW EXECUTE FUNCTION "public"."compute_booking_scheduled_at_utc"();
 
 
@@ -8815,10 +9310,6 @@ CREATE OR REPLACE TRIGGER "ensure_single_default_platform_fee_trigger" BEFORE IN
 
 
 CREATE OR REPLACE TRIGGER "geo_reverse_cache_set_updated_at" BEFORE UPDATE ON "public"."geo_reverse_cache" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
-
-
-
-CREATE OR REPLACE TRIGGER "on_booking_completed" AFTER UPDATE ON "public"."bookings" FOR EACH ROW EXECUTE FUNCTION "public"."handle_job_completion"();
 
 
 
@@ -8839,6 +9330,10 @@ CREATE OR REPLACE TRIGGER "trg_booking_refunds_updated_at" BEFORE UPDATE ON "pub
 
 
 CREATE OR REPLACE TRIGGER "trg_bookings_guard_payment_status" BEFORE UPDATE OF "payment_status" ON "public"."bookings" FOR EACH ROW EXECUTE FUNCTION "public"."bookings_guard_payment_status"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_credit_cleaner_wallet_on_completion" AFTER UPDATE OF "status" ON "public"."bookings" FOR EACH ROW WHEN ((("new"."status" = 'completed'::"public"."booking_status") AND ("old"."status" IS DISTINCT FROM 'completed'::"public"."booking_status"))) EXECUTE FUNCTION "public"."handle_job_completion"();
 
 
 
@@ -8961,6 +9456,11 @@ ALTER TABLE ONLY "public"."cleaner_devices"
 
 ALTER TABLE ONLY "public"."cleaner_leads"
     ADD CONSTRAINT "cleaner_leads_linked_user_id_fkey" FOREIGN KEY ("linked_user_id") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."cleaner_payouts"
+    ADD CONSTRAINT "cleaner_payouts_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "public"."users"("id") ON DELETE CASCADE;
 
 
 
@@ -9266,6 +9766,11 @@ ALTER TABLE ONLY "public"."wallet_transactions"
 
 ALTER TABLE ONLY "public"."wallet_transactions"
     ADD CONSTRAINT "wallet_transactions_wallet_id_fkey" FOREIGN KEY ("wallet_id") REFERENCES "public"."wallets"("id");
+
+
+
+ALTER TABLE ONLY "public"."wallet_transactions"
+    ADD CONSTRAINT "wallet_transactions_withdrawal_request_id_fkey" FOREIGN KEY ("withdrawal_request_id") REFERENCES "public"."withdrawal_requests"("id");
 
 
 
@@ -9792,6 +10297,13 @@ CREATE POLICY "cleaner_devices_cleaner_all" ON "public"."cleaner_devices" USING 
 
 
 ALTER TABLE "public"."cleaner_leads" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."cleaner_payouts" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "cleaner_payouts_select_own" ON "public"."cleaner_payouts" FOR SELECT TO "authenticated" USING (("user_id" = "auth"."uid"()));
+
 
 
 ALTER TABLE "public"."cleaner_schedules" ENABLE ROW LEVEL SECURITY;
@@ -11266,6 +11778,12 @@ GRANT ALL ON FUNCTION "public"."backfill_cleaner_application_approval"("p_user_i
 
 
 
+GRANT ALL ON FUNCTION "public"."booking_cover_major_from_booking"("p_cover_amount" numeric) TO "anon";
+GRANT ALL ON FUNCTION "public"."booking_cover_major_from_booking"("p_cover_amount" numeric) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."booking_cover_major_from_booking"("p_cover_amount" numeric) TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."bookings_guard_payment_status"() TO "anon";
 GRANT ALL ON FUNCTION "public"."bookings_guard_payment_status"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."bookings_guard_payment_status"() TO "service_role";
@@ -11344,6 +11862,12 @@ GRANT ALL ON FUNCTION "public"."claim_job"("p_job_id" "uuid", "p_cleaner_id" "uu
 
 
 
+GRANT ALL ON FUNCTION "public"."cleaner_earnings_subunit_from_booking"("p_final_amount_minor" integer, "p_total_price" numeric, "p_platform_fee" numeric, "p_booking_cover" boolean, "p_booking_cover_amount" numeric, "p_core_amount_minor" integer) TO "anon";
+GRANT ALL ON FUNCTION "public"."cleaner_earnings_subunit_from_booking"("p_final_amount_minor" integer, "p_total_price" numeric, "p_platform_fee" numeric, "p_booking_cover" boolean, "p_booking_cover_amount" numeric, "p_core_amount_minor" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."cleaner_earnings_subunit_from_booking"("p_final_amount_minor" integer, "p_total_price" numeric, "p_platform_fee" numeric, "p_booking_cover" boolean, "p_booking_cover_amount" numeric, "p_core_amount_minor" integer) TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."compute_booking_pricing"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_recurrence_interval" "text", "p_is_recurring" boolean) TO "anon";
 GRANT ALL ON FUNCTION "public"."compute_booking_pricing"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_recurrence_interval" "text", "p_is_recurring" boolean) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."compute_booking_pricing"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_recurrence_interval" "text", "p_is_recurring" boolean) TO "service_role";
@@ -11400,6 +11924,11 @@ REVOKE ALL ON FUNCTION "public"."create_preferred_cleaner_invite"("p_invitee_ema
 GRANT ALL ON FUNCTION "public"."create_preferred_cleaner_invite"("p_invitee_email" "text", "p_invitee_phone_e164" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."create_preferred_cleaner_invite"("p_invitee_email" "text", "p_invitee_phone_e164" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."create_preferred_cleaner_invite"("p_invitee_email" "text", "p_invitee_phone_e164" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."credit_cleaner_wallet_for_booking"("p_booking_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."credit_cleaner_wallet_for_booking"("p_booking_id" "uuid") TO "service_role";
 
 
 
@@ -11519,6 +12048,11 @@ GRANT ALL ON FUNCTION "public"."float8_dist"(double precision, double precision)
 
 
 
+REVOKE ALL ON FUNCTION "public"."fn_begin_cleaner_withdrawal"("p_cleaner_id" "uuid", "p_amount_subunit" integer, "p_withdrawal_id" "uuid", "p_recipient_code" "text", "p_payout_method_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."fn_begin_cleaner_withdrawal"("p_cleaner_id" "uuid", "p_amount_subunit" integer, "p_withdrawal_id" "uuid", "p_recipient_code" "text", "p_payout_method_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."fn_create_wallet_for_new_cleaner"() TO "anon";
 GRANT ALL ON FUNCTION "public"."fn_create_wallet_for_new_cleaner"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."fn_create_wallet_for_new_cleaner"() TO "service_role";
@@ -11528,6 +12062,11 @@ GRANT ALL ON FUNCTION "public"."fn_create_wallet_for_new_cleaner"() TO "service_
 GRANT ALL ON FUNCTION "public"."fn_finalize_withdrawal"("p_transfer_reference" "text", "p_status" "public"."withdrawal_status", "p_error_msg" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."fn_finalize_withdrawal"("p_transfer_reference" "text", "p_status" "public"."withdrawal_status", "p_error_msg" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."fn_finalize_withdrawal"("p_transfer_reference" "text", "p_status" "public"."withdrawal_status", "p_error_msg" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."fn_finalize_withdrawal"("p_transfer_reference" "text", "p_status" "public"."withdrawal_status", "p_error_msg" "text", "p_paystack_transfer_code" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."fn_finalize_withdrawal"("p_transfer_reference" "text", "p_status" "public"."withdrawal_status", "p_error_msg" "text", "p_paystack_transfer_code" "text") TO "service_role";
 
 
 
@@ -14118,6 +14657,12 @@ GRANT ALL ON FUNCTION "public"."phone_lookup_variants"("p_raw" "text") TO "servi
 
 
 
+GRANT ALL ON FUNCTION "public"."platform_fee_major_from_booking"("p_platform_fee" numeric, "p_core_amount_minor" integer) TO "anon";
+GRANT ALL ON FUNCTION "public"."platform_fee_major_from_booking"("p_platform_fee" numeric, "p_core_amount_minor" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."platform_fee_major_from_booking"("p_platform_fee" numeric, "p_core_amount_minor" integer) TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."populate_geometry_columns"("use_typmod" boolean) TO "postgres";
 GRANT ALL ON FUNCTION "public"."populate_geometry_columns"("use_typmod" boolean) TO "anon";
 GRANT ALL ON FUNCTION "public"."populate_geometry_columns"("use_typmod" boolean) TO "authenticated";
@@ -14406,6 +14951,12 @@ REVOKE ALL ON FUNCTION "public"."remove_co_cleaner_from_team"("p_co_cleaner_id" 
 GRANT ALL ON FUNCTION "public"."remove_co_cleaner_from_team"("p_co_cleaner_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."remove_co_cleaner_from_team"("p_co_cleaner_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."remove_co_cleaner_from_team"("p_co_cleaner_id" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."resolve_booking_cover_major_for_cleaner_earnings"("p_booking_cover" boolean, "p_booking_cover_amount" numeric, "p_core_amount_minor" integer, "p_platform_fee" numeric) TO "anon";
+GRANT ALL ON FUNCTION "public"."resolve_booking_cover_major_for_cleaner_earnings"("p_booking_cover" boolean, "p_booking_cover_amount" numeric, "p_core_amount_minor" integer, "p_platform_fee" numeric) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."resolve_booking_cover_major_for_cleaner_earnings"("p_booking_cover" boolean, "p_booking_cover_amount" numeric, "p_core_amount_minor" integer, "p_platform_fee" numeric) TO "service_role";
 
 
 
@@ -17788,6 +18339,12 @@ GRANT ALL ON TABLE "public"."cleaner_devices" TO "service_role";
 GRANT ALL ON TABLE "public"."cleaner_leads" TO "anon";
 GRANT ALL ON TABLE "public"."cleaner_leads" TO "authenticated";
 GRANT ALL ON TABLE "public"."cleaner_leads" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."cleaner_payouts" TO "anon";
+GRANT ALL ON TABLE "public"."cleaner_payouts" TO "authenticated";
+GRANT ALL ON TABLE "public"."cleaner_payouts" TO "service_role";
 
 
 

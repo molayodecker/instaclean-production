@@ -1317,6 +1317,25 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.booking_cover_major_from_booking(p_cover_amount numeric)
+ RETURNS numeric
+ LANGUAGE plpgsql
+ IMMUTABLE
+AS $function$
+DECLARE
+  v_raw numeric := COALESCE(p_cover_amount, 0);
+BEGIN
+  IF v_raw <= 0 THEN
+    RETURN 0;
+  END IF;
+  IF v_raw >= 100 THEN
+    RETURN ROUND(GREATEST(0, v_raw / 100.0), 2);
+  END IF;
+  RETURN ROUND(GREATEST(0, v_raw), 2);
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.bookings_guard_payment_status()
  RETURNS trigger
  LANGUAGE plpgsql
@@ -1701,6 +1720,42 @@ BEGIN
     'success', true,
     'job', to_jsonb((SELECT j FROM jobs j WHERE j.id = p_job_id))
   );
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.cleaner_earnings_subunit_from_booking(p_final_amount_minor integer, p_total_price numeric, p_platform_fee numeric, p_booking_cover boolean, p_booking_cover_amount numeric, p_core_amount_minor integer)
+ RETURNS integer
+ LANGUAGE plpgsql
+ IMMUTABLE
+AS $function$
+DECLARE
+  v_final_minor integer;
+  v_final_major numeric;
+  v_platform numeric;
+  v_cover numeric;
+  v_earnings_major numeric;
+BEGIN
+  v_final_minor := COALESCE(
+    NULLIF(p_final_amount_minor, 0),
+    NULLIF(FLOOR(COALESCE(p_total_price, 0))::integer, 0)
+  );
+
+  IF v_final_minor IS NULL OR v_final_minor <= 0 THEN
+    RETURN 0;
+  END IF;
+
+  v_final_major := v_final_minor / 100.0;
+  v_platform := public.platform_fee_major_from_booking(p_platform_fee, p_core_amount_minor);
+  v_cover := public.resolve_booking_cover_major_for_cleaner_earnings(
+    p_booking_cover,
+    p_booking_cover_amount,
+    p_core_amount_minor,
+    p_platform_fee
+  );
+  v_earnings_major := ROUND(GREATEST(0, v_final_major - v_platform - v_cover), 2);
+
+  RETURN GREATEST(0, (v_earnings_major * 100)::integer);
 END;
 $function$
 
@@ -2144,6 +2199,102 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.credit_cleaner_wallet_for_booking(p_booking_id uuid)
+ RETURNS void
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_booking public.bookings%ROWTYPE;
+  v_wallet_id uuid;
+  v_earnings_subunit integer;
+  v_inserted_id uuid;
+BEGIN
+  SELECT * INTO v_booking
+  FROM public.bookings
+  WHERE id = p_booking_id;
+
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  IF v_booking.status IS DISTINCT FROM 'completed' THEN
+    RETURN;
+  END IF;
+
+  IF v_booking.cleaner_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  IF v_booking.payment_status IS DISTINCT FROM 'paid' THEN
+    RETURN;
+  END IF;
+
+  v_earnings_subunit := public.cleaner_earnings_subunit_from_booking(
+    v_booking.final_amount_minor,
+    v_booking.total_price,
+    v_booking.platform_fee,
+    v_booking.booking_cover,
+    v_booking.booking_cover_amount,
+    v_booking.core_amount_minor
+  );
+
+  IF v_earnings_subunit <= 0 THEN
+    RETURN;
+  END IF;
+
+  SELECT w.id INTO v_wallet_id
+  FROM public.wallets w
+  WHERE w.user_id = v_booking.cleaner_id;
+
+  IF v_wallet_id IS NULL THEN
+    INSERT INTO public.wallets (user_id, balance_subunit, currency)
+    VALUES (v_booking.cleaner_id, 0, COALESCE(v_booking.currency, 'GHS'))
+    ON CONFLICT (user_id) DO UPDATE
+      SET updated_at = NOW()
+    RETURNING id INTO v_wallet_id;
+
+    IF v_wallet_id IS NULL THEN
+      SELECT w.id INTO v_wallet_id
+      FROM public.wallets w
+      WHERE w.user_id = v_booking.cleaner_id;
+    END IF;
+  END IF;
+
+  WITH inserted AS (
+    INSERT INTO public.wallet_transactions (
+      wallet_id,
+      booking_id,
+      amount_subunit,
+      type,
+      description
+    ) VALUES (
+      v_wallet_id,
+      p_booking_id,
+      v_earnings_subunit,
+      'credit',
+      'Job earning'
+    )
+    ON CONFLICT (booking_id) WHERE type = 'credit' AND booking_id IS NOT NULL
+    DO NOTHING
+    RETURNING id
+  )
+  SELECT id INTO v_inserted_id FROM inserted;
+
+  IF v_inserted_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  UPDATE public.wallets
+  SET
+    balance_subunit = COALESCE(balance_subunit, 0) + v_earnings_subunit,
+    updated_at = NOW()
+  WHERE id = v_wallet_id;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.date_dist(date, date)
  RETURNS integer
  LANGUAGE c
@@ -2564,6 +2715,106 @@ CREATE OR REPLACE FUNCTION public.float8_dist(double precision, double precision
 AS '$libdir/btree_gist', $function$float8_dist$function$
 
 
+CREATE OR REPLACE FUNCTION public.fn_begin_cleaner_withdrawal(p_cleaner_id uuid, p_amount_subunit integer, p_withdrawal_id uuid, p_recipient_code text DEFAULT NULL::text, p_payout_method_id uuid DEFAULT NULL::uuid)
+ RETURNS uuid
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_wallet_id uuid;
+  v_balance integer;
+  v_min_subunit constant integer := 5000; -- GHS 50
+BEGIN
+  IF p_cleaner_id IS NULL OR p_withdrawal_id IS NULL THEN
+    RAISE EXCEPTION 'missing_cleaner_or_withdrawal_id';
+  END IF;
+
+  IF p_amount_subunit IS NULL OR p_amount_subunit < v_min_subunit THEN
+    RAISE EXCEPTION 'below_minimum_withdrawal';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM public.withdrawal_requests wr
+    WHERE wr.id = p_withdrawal_id
+      AND wr.cleaner_id = p_cleaner_id
+      AND wr.amount_subunit = p_amount_subunit
+  ) THEN
+    RETURN p_withdrawal_id;
+  END IF;
+
+  IF EXISTS (
+    SELECT 1 FROM public.withdrawal_requests wr
+    WHERE wr.id = p_withdrawal_id
+  ) THEN
+    RAISE EXCEPTION 'withdrawal_id_conflict';
+  END IF;
+
+  SELECT w.id, COALESCE(w.balance_subunit, 0)
+  INTO v_wallet_id, v_balance
+  FROM public.wallets w
+  WHERE w.user_id = p_cleaner_id
+  FOR UPDATE;
+
+  IF v_wallet_id IS NULL THEN
+    RAISE EXCEPTION 'wallet_not_found';
+  END IF;
+
+  IF v_balance < p_amount_subunit THEN
+    RAISE EXCEPTION 'insufficient_balance';
+  END IF;
+
+  UPDATE public.wallets
+  SET
+    balance_subunit = v_balance - p_amount_subunit,
+    updated_at = NOW()
+  WHERE id = v_wallet_id;
+
+  INSERT INTO public.withdrawal_requests (
+    id,
+    cleaner_id,
+    wallet_id,
+    amount_subunit,
+    status,
+    paystack_reference,
+    bank_details,
+    created_at,
+    updated_at
+  ) VALUES (
+    p_withdrawal_id,
+    p_cleaner_id,
+    v_wallet_id,
+    p_amount_subunit,
+    'processing',
+    p_withdrawal_id::text,
+    jsonb_build_object(
+      'recipient_code', p_recipient_code,
+      'payout_method_id', p_payout_method_id
+    ),
+    NOW(),
+    NOW()
+  );
+
+  INSERT INTO public.wallet_transactions (
+    wallet_id,
+    amount_subunit,
+    type,
+    description,
+    withdrawal_request_id
+  ) VALUES (
+    v_wallet_id,
+    p_amount_subunit,
+    'debit',
+    'Withdrawal pending',
+    p_withdrawal_id
+  );
+
+  RETURN p_withdrawal_id;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.fn_create_wallet_for_new_cleaner()
  RETURNS trigger
  LANGUAGE plpgsql
@@ -2626,6 +2877,131 @@ BEGIN
         WHERE id = v_request_record.id;
     END IF;
 
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.fn_finalize_withdrawal(p_transfer_reference text, p_status withdrawal_status, p_error_msg text DEFAULT NULL::text, p_paystack_transfer_code text DEFAULT NULL::text)
+ RETURNS void
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_request public.withdrawal_requests%ROWTYPE;
+  v_ref text := NULLIF(trim(p_transfer_reference), '');
+BEGIN
+  IF v_ref IS NULL THEN
+    RAISE EXCEPTION 'missing_transfer_reference';
+  END IF;
+
+  SELECT * INTO v_request
+  FROM public.withdrawal_requests
+  WHERE paystack_reference = v_ref
+  FOR UPDATE;
+
+  IF NOT FOUND AND v_ref ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
+    SELECT * INTO v_request
+    FROM public.withdrawal_requests
+    WHERE id = v_ref::uuid
+    FOR UPDATE;
+  END IF;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Withdrawal request not found';
+  END IF;
+
+  -- Terminal-state safety (webhook order chaos).
+  -- Allowed: processing/pending -> success | failed/reversed (refund)
+  --          success -> reversed (refund)
+  --          same terminal status -> no-op
+  IF v_request.status = p_status THEN
+    RETURN;
+  END IF;
+
+  IF v_request.status IN ('failed', 'reversed') THEN
+    RETURN;
+  END IF;
+
+  IF v_request.status = 'success' AND p_status <> 'reversed' THEN
+    RETURN;
+  END IF;
+
+  IF p_status = 'success' THEN
+    UPDATE public.withdrawal_requests
+    SET
+      status = 'success',
+      paystack_transfer_code = COALESCE(p_paystack_transfer_code, paystack_transfer_code),
+      error_message = NULL,
+      updated_at = NOW()
+    WHERE id = v_request.id;
+
+    UPDATE public.wallet_transactions
+    SET description = 'Withdrawal completed (Ref: ' || COALESCE(
+      p_paystack_transfer_code,
+      v_request.paystack_transfer_code,
+      v_ref
+    ) || ')'
+    WHERE withdrawal_request_id = v_request.id
+      AND type = 'debit';
+
+    RETURN;
+  END IF;
+
+  IF p_status IN ('failed', 'reversed') THEN
+    IF v_request.status IN ('processing', 'pending') THEN
+      UPDATE public.wallets
+      SET
+        balance_subunit = COALESCE(balance_subunit, 0) + v_request.amount_subunit,
+        updated_at = NOW()
+      WHERE id = v_request.wallet_id;
+
+      INSERT INTO public.wallet_transactions (
+        wallet_id,
+        amount_subunit,
+        type,
+        description,
+        withdrawal_request_id
+      ) VALUES (
+        v_request.wallet_id,
+        v_request.amount_subunit,
+        'credit',
+        CASE
+          WHEN p_status = 'reversed' THEN 'Withdrawal reversed — refunded'
+          ELSE 'Withdrawal failed — refunded'
+        END,
+        v_request.id
+      );
+    ELSIF v_request.status = 'success' AND p_status = 'reversed' THEN
+      UPDATE public.wallets
+      SET
+        balance_subunit = COALESCE(balance_subunit, 0) + v_request.amount_subunit,
+        updated_at = NOW()
+      WHERE id = v_request.wallet_id;
+
+      INSERT INTO public.wallet_transactions (
+        wallet_id,
+        amount_subunit,
+        type,
+        description,
+        withdrawal_request_id
+      ) VALUES (
+        v_request.wallet_id,
+        v_request.amount_subunit,
+        'credit',
+        'Withdrawal reversed — refunded to wallet',
+        v_request.id
+      );
+    END IF;
+
+    UPDATE public.withdrawal_requests
+    SET
+      status = p_status,
+      paystack_transfer_code = COALESCE(p_paystack_transfer_code, paystack_transfer_code),
+      error_message = p_error_msg,
+      updated_at = NOW()
+    WHERE id = v_request.id;
+  END IF;
 END;
 $function$
 
@@ -6439,16 +6815,10 @@ CREATE OR REPLACE FUNCTION public.handle_job_completion()
  RETURNS trigger
  LANGUAGE plpgsql
  SECURITY DEFINER
+ SET search_path TO 'public'
 AS $function$
 BEGIN
-  -- When booking is marked 'completed', move associated transaction to 'available'
-  IF NEW.status = 'completed' AND OLD.status != 'completed' THEN
-    UPDATE public.transactions
-    SET status = 'available',
-        updated_at = now()
-    WHERE booking_id = NEW.id 
-    AND type = 'job_payment';
-  END IF;
+  PERFORM public.credit_cleaner_wallet_for_booking(NEW.id);
   RETURN NEW;
 END;
 $function$
@@ -8014,6 +8384,33 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.platform_fee_major_from_booking(p_platform_fee numeric, p_core_amount_minor integer)
+ RETURNS numeric
+ LANGUAGE plpgsql
+ IMMUTABLE
+AS $function$
+DECLARE
+  v_raw numeric := COALESCE(p_platform_fee, 0);
+  v_core_major numeric;
+BEGIN
+  IF v_raw <= 0 THEN
+    RETURN 0;
+  END IF;
+
+  IF p_core_amount_minor IS NOT NULL AND p_core_amount_minor > 0 THEN
+    v_core_major := p_core_amount_minor / 100.0;
+    IF v_raw > v_core_major THEN
+      RETURN ROUND(GREATEST(0, v_raw / 100.0), 2);
+    END IF;
+  ELSIF v_raw >= 1000 THEN
+    RETURN ROUND(GREATEST(0, v_raw / 100.0), 2);
+  END IF;
+
+  RETURN ROUND(GREATEST(0, v_raw), 2);
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.point(geometry)
  RETURNS point
  LANGUAGE c
@@ -9191,6 +9588,45 @@ BEGIN
   END IF;
 
   RETURN jsonb_build_object('success', true, 'co_cleaner_id', p_co_cleaner_id);
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.resolve_booking_cover_major_for_cleaner_earnings(p_booking_cover boolean, p_booking_cover_amount numeric, p_core_amount_minor integer, p_platform_fee numeric)
+ RETURNS numeric
+ LANGUAGE plpgsql
+ IMMUTABLE
+AS $function$
+DECLARE
+  v_stored numeric;
+  v_platform numeric;
+  v_core_major numeric;
+  v_default_cover numeric := 21.0;
+BEGIN
+  IF p_booking_cover IS FALSE THEN
+    RETURN 0;
+  END IF;
+
+  v_stored := COALESCE(p_booking_cover_amount, 0);
+  IF v_stored > 0 THEN
+    RETURN public.booking_cover_major_from_booking(v_stored);
+  END IF;
+
+  IF p_booking_cover IS TRUE THEN
+    RETURN v_default_cover;
+  END IF;
+
+  IF p_core_amount_minor IS NULL OR p_core_amount_minor <= 0 THEN
+    RETURN 0;
+  END IF;
+
+  v_platform := public.platform_fee_major_from_booking(p_platform_fee, p_core_amount_minor);
+  v_core_major := p_core_amount_minor / 100.0;
+  IF v_core_major - v_platform >= v_default_cover THEN
+    RETURN v_default_cover;
+  END IF;
+
+  RETURN 0;
 END;
 $function$
 
@@ -13541,11 +13977,11 @@ CREATE TRIGGER bookings_compute_scheduled_at_utc BEFORE INSERT OR UPDATE OF sche
 
 CREATE TRIGGER bookings_guard_payment_status BEFORE UPDATE ON bookings FOR EACH ROW EXECUTE FUNCTION guard_booking_payment_status_writes();
 
-CREATE TRIGGER on_booking_completed AFTER UPDATE ON bookings FOR EACH ROW EXECUTE FUNCTION handle_job_completion();
-
 CREATE TRIGGER tr_log_booking_status_change AFTER UPDATE OF status ON bookings FOR EACH ROW EXECUTE FUNCTION fn_log_status_change();
 
 CREATE TRIGGER trg_bookings_guard_payment_status BEFORE UPDATE OF payment_status ON bookings FOR EACH ROW EXECUTE FUNCTION bookings_guard_payment_status();
+
+CREATE TRIGGER trg_credit_cleaner_wallet_on_completion AFTER UPDATE OF status ON bookings FOR EACH ROW WHEN (new.status = 'completed'::booking_status AND old.status IS DISTINCT FROM 'completed'::booking_status) EXECUTE FUNCTION handle_job_completion();
 
 CREATE TRIGGER trg_set_cleaner_assigned_at_for_hold BEFORE INSERT OR UPDATE OF cleaner_id, payment_status ON bookings FOR EACH ROW EXECUTE FUNCTION set_cleaner_assigned_at_for_hold();
 
