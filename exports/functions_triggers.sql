@@ -938,6 +938,48 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.admin_soft_delete_user(p_user_id uuid, p_reason text DEFAULT 'Deleted by admin'::text)
+ RETURNS void
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+declare
+  v_now timestamptz := now();
+begin
+  update public.users
+  set
+    status = 'inactive',
+    email = 'deleted+' || p_user_id || '@tryinstaclean.local',
+    phone = null,
+    deleted_at = v_now,
+    deleted_reason = p_reason,
+    updated_at = v_now
+  where id = p_user_id;
+
+  if not found then
+    raise exception 'user % not found', p_user_id;
+  end if;
+
+  -- Existing visibility helpers (lib/profile-visibility.ts) hide profiles
+  -- once deleted_at / deactivated_at / deletion_status are set.
+  update public.profiles
+  set
+    fullname = 'Deleted User',
+    firstname = null,
+    lastname = null,
+    bio = null,
+    address = null,
+    avatar_url = null,
+    deleted_at = v_now,
+    deactivated_at = v_now,
+    deletion_status = 'completed',
+    updated_at = v_now
+  where id = p_user_id;
+end;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.approve_and_complete_booking(p_booking_id uuid, p_rating integer, p_feedback text)
  RETURNS void
  LANGUAGE plpgsql
@@ -6170,6 +6212,17 @@ BEGIN
   IF v_row.status IN ('confirmed', 'scheduled')
     AND v_row.scheduled_at_utc IS NOT NULL
     AND v_row.scheduled_at_utc <= now() THEN
+    RETURN jsonb_build_object('success', false, 'error', 'booking_not_active');
+  END IF;
+
+  -- Mid-visit statuses stay contactable past the scheduled slot, but only on
+  -- the appointment day (service TZ). Mirrors bookingAllowsBookingContact in
+  -- the app: a booking never marked complete must not expose phone numbers
+  -- indefinitely.
+  IF v_row.status IN ('en_route', 'arrived', 'in_progress')
+    AND v_row.scheduled_date IS NOT NULL
+    AND v_row.scheduled_date <>
+      (now() AT TIME ZONE COALESCE(NULLIF(trim(v_row.timezone_name), ''), 'Africa/Accra'))::date THEN
     RETURN jsonb_build_object('success', false, 'error', 'booking_not_active');
   END IF;
 

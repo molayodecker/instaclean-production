@@ -533,6 +533,49 @@ COMMENT ON FUNCTION "public"."add_cleaner_record"("p_user_id" "uuid", "p_name" "
 
 
 
+CREATE OR REPLACE FUNCTION "public"."admin_soft_delete_user"("p_user_id" "uuid", "p_reason" "text" DEFAULT 'Deleted by admin'::"text") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+declare
+  v_now timestamptz := now();
+begin
+  update public.users
+  set
+    status = 'inactive',
+    email = 'deleted+' || p_user_id || '@tryinstaclean.local',
+    phone = null,
+    deleted_at = v_now,
+    deleted_reason = p_reason,
+    updated_at = v_now
+  where id = p_user_id;
+
+  if not found then
+    raise exception 'user % not found', p_user_id;
+  end if;
+
+  -- Existing visibility helpers (lib/profile-visibility.ts) hide profiles
+  -- once deleted_at / deactivated_at / deletion_status are set.
+  update public.profiles
+  set
+    fullname = 'Deleted User',
+    firstname = null,
+    lastname = null,
+    bio = null,
+    address = null,
+    avatar_url = null,
+    deleted_at = v_now,
+    deactivated_at = v_now,
+    deletion_status = 'completed',
+    updated_at = v_now
+  where id = p_user_id;
+end;
+$$;
+
+
+ALTER FUNCTION "public"."admin_soft_delete_user"("p_user_id" "uuid", "p_reason" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."approve_and_complete_booking"("p_booking_id" "uuid", "p_rating" integer, "p_feedback" "text") RETURNS "void"
     LANGUAGE "plpgsql"
     AS $$
@@ -3304,6 +3347,17 @@ BEGIN
   IF v_row.status IN ('confirmed', 'scheduled')
     AND v_row.scheduled_at_utc IS NOT NULL
     AND v_row.scheduled_at_utc <= now() THEN
+    RETURN jsonb_build_object('success', false, 'error', 'booking_not_active');
+  END IF;
+
+  -- Mid-visit statuses stay contactable past the scheduled slot, but only on
+  -- the appointment day (service TZ). Mirrors bookingAllowsBookingContact in
+  -- the app: a booking never marked complete must not expose phone numbers
+  -- indefinitely.
+  IF v_row.status IN ('en_route', 'arrived', 'in_progress')
+    AND v_row.scheduled_date IS NOT NULL
+    AND v_row.scheduled_date <>
+      (now() AT TIME ZONE COALESCE(NULLIF(trim(v_row.timezone_name), ''), 'Africa/Accra'))::date THEN
     RETURN jsonb_build_object('success', false, 'error', 'booking_not_active');
   END IF;
 
@@ -8922,11 +8976,21 @@ CREATE TABLE IF NOT EXISTS "public"."users" (
     "updated_at" timestamp with time zone DEFAULT "now"(),
     "last_updated" timestamp with time zone DEFAULT "now"(),
     "password_hash" "text",
+    "deleted_at" timestamp with time zone,
+    "deleted_reason" "text",
     CONSTRAINT "users_phone_e164_chk" CHECK ((("phone" IS NULL) OR ("phone" ~ '^\+?[1-9][0-9]{7,14}$'::"text")))
 );
 
 
 ALTER TABLE "public"."users" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."users"."deleted_at" IS 'Set when an admin soft-deletes the account; row is retained for wallet/booking/audit history.';
+
+
+
+COMMENT ON COLUMN "public"."users"."deleted_reason" IS 'Human-readable reason recorded at soft-delete time.';
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."wallet_deductions" (
@@ -12740,6 +12804,11 @@ GRANT ALL ON FUNCTION "public"."addgeometrycolumn"("catalog_name" character vary
 GRANT ALL ON FUNCTION "public"."addgeometrycolumn"("catalog_name" character varying, "schema_name" character varying, "table_name" character varying, "column_name" character varying, "new_srid_in" integer, "new_type" character varying, "new_dim" integer, "use_typmod" boolean) TO "anon";
 GRANT ALL ON FUNCTION "public"."addgeometrycolumn"("catalog_name" character varying, "schema_name" character varying, "table_name" character varying, "column_name" character varying, "new_srid_in" integer, "new_type" character varying, "new_dim" integer, "use_typmod" boolean) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."addgeometrycolumn"("catalog_name" character varying, "schema_name" character varying, "table_name" character varying, "column_name" character varying, "new_srid_in" integer, "new_type" character varying, "new_dim" integer, "use_typmod" boolean) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."admin_soft_delete_user"("p_user_id" "uuid", "p_reason" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."admin_soft_delete_user"("p_user_id" "uuid", "p_reason" "text") TO "service_role";
 
 
 
