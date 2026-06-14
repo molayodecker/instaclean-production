@@ -3506,10 +3506,22 @@ CREATE OR REPLACE FUNCTION public.fn_sync_profile_fullname()
  RETURNS trigger
  LANGUAGE plpgsql
 AS $function$
-BEGIN 
-    NEW.fullname := TRIM(CONCAT(COALESCE(NEW.firstname, ''), ' ', COALESCE(NEW.lastname, '')));
-    RETURN NEW;
-END;$function$
+BEGIN
+  NEW.fullname := NULLIF(
+    trim(
+      concat_ws(
+        ' ',
+        nullif(trim(coalesce(NEW.firstname, '')), ''),
+        nullif(trim(coalesce(NEW.middlename, '')), ''),
+        nullif(trim(coalesce(NEW.lastname, '')), '')
+      )
+    ),
+    ''
+  );
+
+  RETURN NEW;
+END;
+$function$
 
 
 CREATE OR REPLACE FUNCTION public.fn_update_deduction_rule(p_rule_name text, p_new_rate numeric, p_is_fixed boolean DEFAULT false)
@@ -4775,6 +4787,18 @@ CREATE OR REPLACE FUNCTION public.gbtreekey_var_out(gbtreekey_var)
  LANGUAGE c
  IMMUTABLE PARALLEL SAFE STRICT
 AS '$libdir/btree_gist', $function$gbtreekey_out$function$
+
+
+CREATE OR REPLACE FUNCTION public.generate_cleaner_booking_slug()
+ RETURNS text
+ LANGUAGE sql
+AS $function$
+  select string_agg(
+    substr('23456789abcdefghjkmnpqrstuvwxyz', (floor(random() * 32) + 1)::int, 1),
+    ''
+  )
+  from generate_series(1, 8);
+$function$
 
 
 CREATE OR REPLACE FUNCTION public.generate_referral_code()
@@ -6442,6 +6466,82 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.get_cleaner_by_booking_slug(p_slug text)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+declare
+  v_slug text := lower(trim(coalesce(p_slug, '')));
+  v_row record;
+begin
+  if v_slug = '' or v_slug !~ '^[23456789abcdefghjkmnpqrstuvwxyz]{8}$' then
+    return jsonb_build_object('success', false, 'error', 'invalid_slug');
+  end if;
+
+  select
+    cd.user_id,
+    coalesce(nullif(trim(p.fullname), ''), nullif(trim(p.firstname), ''), 'Cleaner') as cleaner_name,
+    p.avatar_url,
+    cd.rating,
+    cd.hourly_rate,
+    coalesce(cd.bio, p.bio) as bio,
+    cd.service_categories,
+    cd.status,
+    cd.verified
+  into v_row
+  from public.cleaner_data cd
+  join lateral (
+    select p.*
+    from public.profiles p
+    where p.user_id = cd.user_id
+       or p.id = cd.user_id
+    limit 1
+  ) p on true
+  where cd.booking_slug = v_slug
+    and cd.status = 'active'
+    and cd.verified = true
+    and public.is_profile_discoverable_by_others(p)
+  limit 1;
+
+  if not found then
+    return jsonb_build_object('success', false, 'error', 'not_found');
+  end if;
+
+  return jsonb_build_object(
+    'success', true,
+    'cleaner', jsonb_build_object(
+      'id', v_row.user_id,
+      'name', v_row.cleaner_name,
+      'avatar_url', v_row.avatar_url,
+      'rating', coalesce(v_row.rating, 0),
+      'hourly_rate', coalesce(v_row.hourly_rate, 0),
+      'bio', v_row.bio,
+      'service_categories', coalesce(to_jsonb(v_row.service_categories), '[]'::jsonb)
+    )
+  );
+end;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.get_cleaner_hourly_rate_limits()
+ RETURNS jsonb
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+  SELECT COALESCE(
+    (
+      SELECT value
+      FROM public.platform_config
+      WHERE key = 'cleaner_hourly_rate_limits'
+    ),
+    jsonb_build_object('min', 10, 'max', 100, 'default', 50)
+  );
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.get_cleaner_profile_v1(target_user_id uuid)
  RETURNS jsonb
  LANGUAGE plpgsql
@@ -6821,6 +6921,56 @@ BEGIN
     v_cutoff_time AS latest_start_time,
     (v_same_day_cutoff_at_local AT TIME ZONE p_timezone) AS same_day_cutoff_at;
 END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.get_my_cleaner_booking_link()
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+declare
+  v_user uuid := auth.uid();
+  v_slug text;
+  v_candidate text;
+begin
+  if v_user is null then
+    return jsonb_build_object('success', false, 'error', 'not_authenticated');
+  end if;
+
+  select booking_slug into v_slug
+  from public.cleaner_data
+  where user_id = v_user;
+
+  if not found then
+    return jsonb_build_object('success', false, 'error', 'cleaner_not_found');
+  end if;
+
+  while v_slug is null loop
+    v_candidate := public.generate_cleaner_booking_slug();
+
+    begin
+      update public.cleaner_data
+        set booking_slug = v_candidate
+      where user_id = v_user
+        and booking_slug is null
+      returning booking_slug into v_slug;
+
+      if v_slug is null then
+        select booking_slug into v_slug from public.cleaner_data where user_id = v_user;
+      end if;
+    exception when unique_violation then
+      v_slug := null;
+    end;
+  end loop;
+
+  return jsonb_build_object(
+    'success', true,
+    'slug', v_slug,
+    'url', public.resolve_app_base_url() || '/book/cleaner/' || v_slug
+  );
+end;
 $function$
 
 
@@ -10642,6 +10792,27 @@ BEGIN
 
   RETURN jsonb_build_object('success', true, 'co_cleaner_id', p_co_cleaner_id);
 END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.resolve_app_base_url()
+ RETURNS text
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+declare
+  v_url text;
+begin
+  if to_regclass('public.platform_config') is not null then
+    select nullif(trim(value ->> 'url'), '')
+    into v_url
+    from public.platform_config
+    where key = 'app_url';
+  end if;
+
+  return rtrim(coalesce(v_url, 'https://tryinstaclean.com'), '/');
+end;
 $function$
 
 
@@ -14475,6 +14646,137 @@ end;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.sync_profile_name_from_payout(p_user_id uuid, p_payout_account_name text, p_previous_profile_name text DEFAULT NULL::text, p_payout_type text DEFAULT NULL::text, p_source text DEFAULT 'payout_name_mismatch'::text, p_apply boolean DEFAULT false)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_profile public.profiles%ROWTYPE;
+  v_clean_name text;
+  v_tokens text[];
+  v_token_count integer;
+  v_firstname text;
+  v_middlename text;
+  v_lastname text;
+  v_existing_preferences jsonb;
+  v_patch jsonb;
+BEGIN
+  IF p_user_id IS NULL THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'missing_user_id'
+    );
+  END IF;
+
+  IF auth.uid() IS DISTINCT FROM p_user_id THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'not_allowed'
+    );
+  END IF;
+
+  v_clean_name := nullif(trim(regexp_replace(coalesce(p_payout_account_name, ''), '\s+', ' ', 'g')), '');
+
+  IF v_clean_name IS NULL THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'missing_payout_account_name'
+    );
+  END IF;
+
+  SELECT *
+  INTO v_profile
+  FROM public.profiles
+  WHERE id = p_user_id
+  LIMIT 1;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'profile_not_found'
+    );
+  END IF;
+
+  v_tokens := regexp_split_to_array(v_clean_name, '\s+');
+  v_token_count := coalesce(array_length(v_tokens, 1), 0);
+
+  IF v_token_count = 1 THEN
+    v_firstname := v_tokens[1];
+    v_middlename := NULL;
+    v_lastname := NULL;
+  ELSIF v_token_count = 2 THEN
+    v_firstname := v_tokens[1];
+    v_middlename := NULL;
+    v_lastname := v_tokens[2];
+  ELSE
+    v_firstname := v_tokens[1];
+    v_middlename := array_to_string(v_tokens[2:v_token_count - 1], ' ');
+    v_lastname := v_tokens[v_token_count];
+  END IF;
+
+  v_existing_preferences := coalesce(v_profile.preferences, '{}'::jsonb);
+
+  v_patch := jsonb_build_object(
+    'payout_name_mismatch',
+    jsonb_build_object(
+      'flagged_at', coalesce(
+        v_existing_preferences #>> '{payout_name_mismatch,flagged_at}',
+        now()::text
+      ),
+      'profile_synced_at', CASE WHEN p_apply THEN now()::text ELSE NULL END,
+      'profile_name', coalesce(p_previous_profile_name, v_profile.fullname),
+      'payout_account_name', v_clean_name,
+      'payout_type', p_payout_type,
+      'source', p_source,
+      'requires_review', true,
+      'suggested_profile_name', jsonb_build_object(
+        'firstname', v_firstname,
+        'middlename', v_middlename,
+        'lastname', v_lastname,
+        'fullname', v_clean_name
+      ),
+      'previous_names', jsonb_build_object(
+        'firstname', v_profile.firstname,
+        'middlename', v_profile.middlename,
+        'lastname', v_profile.lastname,
+        'fullname', v_profile.fullname
+      )
+    )
+  );
+
+  IF p_apply THEN
+    UPDATE public.profiles
+    SET
+      firstname = v_firstname,
+      middlename = v_middlename,
+      lastname = v_lastname,
+      preferences = v_existing_preferences || v_patch,
+      updated_at = now()
+    WHERE id = p_user_id;
+  ELSE
+    UPDATE public.profiles
+    SET
+      preferences = v_existing_preferences || v_patch,
+      updated_at = now()
+    WHERE id = p_user_id;
+  END IF;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'applied', p_apply,
+    'suggested', jsonb_build_object(
+      'firstname', v_firstname,
+      'middlename', v_middlename,
+      'lastname', v_lastname,
+      'fullname', v_clean_name
+    )
+  );
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.text(geometry)
  RETURNS text
  LANGUAGE c
@@ -14709,6 +15011,57 @@ BEGIN
     NEW.last_updated = now(); 
     RETURN NEW; 
 END;$function$
+
+
+CREATE OR REPLACE FUNCTION public.update_my_hourly_rate(p_hourly_rate numeric)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_user uuid := auth.uid();
+  v_limits jsonb;
+  v_min numeric;
+  v_max numeric;
+BEGIN
+  IF v_user IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  SELECT value INTO v_limits
+  FROM public.platform_config
+  WHERE key = 'cleaner_hourly_rate_limits';
+
+  v_min := COALESCE((v_limits->>'min')::numeric, 10);
+  v_max := COALESCE((v_limits->>'max')::numeric, 100);
+
+  IF p_hourly_rate IS NULL OR p_hourly_rate < v_min OR p_hourly_rate > v_max THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'invalid_rate',
+      'min', v_min,
+      'max', v_max
+    );
+  END IF;
+
+  UPDATE public.cleaner_data
+  SET hourly_rate = p_hourly_rate,
+      rate_set_at = now(),
+      updated_at = now()
+  WHERE user_id = v_user;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'cleaner_not_found');
+  END IF;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'hourly_rate', p_hourly_rate,
+    'rate_set_at', now()
+  );
+END;
+$function$
 
 
 CREATE OR REPLACE FUNCTION public.update_own_cleaner_location(p_lat double precision, p_lng double precision, p_max_distance_meters integer DEFAULT NULL::integer)
@@ -15224,7 +15577,7 @@ CREATE TRIGGER ensure_single_default_platform_fee_trigger BEFORE INSERT OR UPDAT
 
 CREATE TRIGGER update_platform_fees_updated_at BEFORE UPDATE ON platform_fees FOR EACH ROW EXECUTE FUNCTION update_platform_fees_updated_at();
 
-CREATE TRIGGER trg_profiles_fullname BEFORE INSERT OR UPDATE OF firstname, lastname ON profiles FOR EACH ROW EXECUTE FUNCTION fn_sync_profile_fullname();
+CREATE TRIGGER trg_profiles_fullname BEFORE INSERT OR UPDATE OF firstname, middlename, lastname ON profiles FOR EACH ROW EXECUTE FUNCTION fn_sync_profile_fullname();
 
 
 -- === EVENT TRIGGERS (summary; DDL in schema.sql) ===
