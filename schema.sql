@@ -204,6 +204,7 @@ DECLARE
   v_lng double precision;
   v_duration numeric;
   v_services text[];
+  v_requested_category public.service_category;
   v_eligible boolean := false;
 BEGIN
   IF v_uid IS NULL THEN
@@ -247,17 +248,23 @@ BEGIN
       v_lng := ST_X(v_row.location_coordinates::geometry);
       v_duration := COALESCE(v_row.duration_hours, v_row.duration_final, 2);
       v_services := COALESCE(v_row.extra_task_ids, ARRAY[]::text[]);
+      v_requested_category := (
+        SELECT st.category::public.service_category
+        FROM public.service_types st
+        WHERE st.id = v_row.service_id
+      );
       SELECT EXISTS (
         SELECT 1
         FROM public.get_best_available_cleaners(
-          v_row.scheduled_date,
-          v_row.scheduled_time,
-          v_duration,
-          v_lat,
-          v_lng,
-          50000,
-          v_services,
-          p_booking_id
+          v_row.scheduled_date::date,
+          v_row.scheduled_time::time,
+          v_duration::numeric,
+          v_lat::double precision,
+          v_lng::double precision,
+          50000::integer,
+          v_services::text[],
+          p_booking_id::uuid,
+          v_requested_category::public.service_category
         ) g
         WHERE g.cleaner_id = v_uid
       ) INTO v_eligible;
@@ -3288,131 +3295,7 @@ $$;
 ALTER FUNCTION "public"."get_available_timeslots_old"("p_booking_date" "date", "p_timezone" "text", "p_duration_hours" numeric) OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_best_available_cleaners"("p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer, "p_requested_services" "text"[], "p_exclude_booking_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("cleaner_id" "uuid", "cleaner_name" "text", "avatar_url" "text", "bio" "text", "hourly_rate" numeric, "rating" double precision, "distance_meters" double precision, "final_score" double precision, "company_name" "text", "team_size" integer)
-    LANGUAGE "plpgsql" STABLE
-    AS $$
-DECLARE
-  v_cust_id uuid := auth.uid();
-  v_booking_range tstzrange;
-  v_cust_loc geography := ST_SetSRID(ST_MakePoint(p_lng, p_lat), 4326)::geography;
-BEGIN
-  IF v_cust_id IS NULL
-     AND current_setting('app.system_cleaner_discovery', true) IS DISTINCT FROM '1'
-  THEN
-    RAISE EXCEPTION 'Not authorized';
-  END IF;
-
-  v_booking_range := tstzrange(
-    (p_date + p_time)::timestamptz,
-    (p_date + p_time + (p_duration || ' hours')::interval)::timestamptz,
-    '[)'
-  );
-
-  RETURN QUERY
-  WITH available_cleaners AS (
-    SELECT
-      cd.user_id AS cleaner_user_id,
-      p.fullname AS cleaner_fullname,
-      p.avatar_url AS profile_avatar_url,
-      COALESCE(cd.bio, p.bio) AS profile_bio,
-      cd.hourly_rate AS cleaner_hourly_rate,
-      cd.rating AS cleaner_rating,
-      cd.skills AS cleaner_skills,
-      cd.specialties AS cleaner_specialties,
-      ct.company_name AS team_company_name,
-      public.cleaner_team_co_count(cd.user_id) AS team_co_count,
-      COALESCE(cd.base_location::geography, p.location_wkt) AS effective_location,
-      ST_Distance(
-        COALESCE(cd.base_location::geography, p.location_wkt),
-        v_cust_loc
-      )::float AS dist
-    FROM public.cleaner_data cd
-    JOIN public.profiles p ON p.user_id = cd.user_id
-    LEFT JOIN public.cleaner_teams ct ON ct.lead_cleaner_id = cd.user_id
-    WHERE cd.status = 'active'
-      AND cd.verified = true
-      AND COALESCE(cd.base_location::geography, p.location_wkt) IS NOT NULL
-      AND public.is_profile_discoverable_by_others(p)
-      AND cd.user_id IS DISTINCT FROM COALESCE(
-        v_cust_id,
-        (SELECT b.customer_id FROM public.bookings b WHERE b.id = p_exclude_booking_id LIMIT 1)
-      )
-      AND ST_DWithin(
-        COALESCE(cd.base_location::geography, p.location_wkt),
-        v_cust_loc,
-        LEAST(
-          COALESCE(cd.max_travel_distance_meters, p_max_distance_meters),
-          p_max_distance_meters
-        )
-      )
-      AND NOT EXISTS (
-        SELECT 1
-        FROM public.bookings b
-        WHERE b.cleaner_id = cd.user_id
-          AND b.booking_period && v_booking_range
-          AND b.status != 'cancelled'
-          AND (
-            p_exclude_booking_id IS NULL
-            OR b.id <> p_exclude_booking_id
-          )
-      )
-      AND NOT EXISTS (
-        SELECT 1
-        FROM public.cleaner_availability_exceptions cae
-        WHERE cae.cleaner_id = cd.user_id
-          AND cae.exception_date = p_date
-      )
-  ),
-  scored_cleaners AS (
-    SELECT
-      ac.cleaner_user_id,
-      ac.cleaner_fullname,
-      ac.profile_avatar_url,
-      ac.profile_bio,
-      ac.cleaner_hourly_rate,
-      ac.cleaner_rating,
-      ac.cleaner_skills,
-      ac.cleaner_specialties,
-      ac.team_company_name,
-      ac.team_co_count,
-      ac.dist,
-      CASE
-        WHEN cardinality(COALESCE(p_requested_services, ARRAY[]::text[])) > 0
-        THEN (
-          SELECT count(*)::float / cardinality(p_requested_services)
-          FROM unnest(p_requested_services) s
-          WHERE s = ANY(COALESCE(ac.cleaner_skills, ARRAY[]::text[]))
-             OR s = ANY(COALESCE(ac.cleaner_specialties, ARRAY[]::text[]))
-        ) * 40
-        ELSE 20
-      END AS s_score
-    FROM available_cleaners ac
-  )
-  SELECT
-    sc.cleaner_user_id AS cleaner_id,
-    sc.cleaner_fullname AS cleaner_name,
-    sc.profile_avatar_url AS avatar_url,
-    sc.profile_bio AS bio,
-    sc.cleaner_hourly_rate AS hourly_rate,
-    sc.cleaner_rating::float AS rating,
-    sc.dist::float AS distance_meters,
-    (
-      (GREATEST(0, (1.0 - (sc.dist / p_max_distance_meters))) * 30)
-      + (COALESCE(sc.cleaner_rating, 0) / 5.0 * 30)
-      + sc.s_score
-    )::float AS final_score,
-    sc.team_company_name AS company_name,
-    sc.team_co_count AS team_size
-  FROM scored_cleaners sc
-  ORDER BY final_score DESC, sc.dist ASC;
-END;
-$$;
-
-
-ALTER FUNCTION "public"."get_best_available_cleaners"("p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer, "p_requested_services" "text"[], "p_exclude_booking_id" "uuid") OWNER TO "postgres";
-
-
-CREATE OR REPLACE FUNCTION "public"."get_best_available_cleaners"("p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer, "p_requested_services" "text"[], "p_exclude_booking_id" "uuid" DEFAULT NULL::"uuid", "p_requested_category" "public"."service_category" DEFAULT NULL::"public"."service_category") RETURNS TABLE("cleaner_id" "uuid", "cleaner_name" "text", "avatar_url" "text", "bio" "text", "hourly_rate" numeric, "rating" double precision, "distance_meters" double precision, "final_score" double precision)
+CREATE OR REPLACE FUNCTION "public"."get_best_available_cleaners"("p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer, "p_requested_services" "text"[], "p_exclude_booking_id" "uuid" DEFAULT NULL::"uuid", "p_requested_category" "public"."service_category" DEFAULT NULL::"public"."service_category") RETURNS TABLE("cleaner_id" "uuid", "cleaner_name" "text", "avatar_url" "text", "bio" "text", "hourly_rate" numeric, "rating" double precision, "distance_meters" double precision, "final_score" double precision, "company_name" "text", "team_size" integer, "team_role" "text", "specialties" "text"[])
     LANGUAGE "plpgsql" STABLE
     SET "search_path" TO 'public', 'pg_temp'
     AS $$
@@ -3442,8 +3325,10 @@ BEGIN
       COALESCE(cd.bio, p.bio) AS profile_bio,
       cd.hourly_rate AS cleaner_hourly_rate,
       cd.rating AS cleaner_rating,
-      cd.skills AS cleaner_skills,
       cd.specialties AS cleaner_specialties,
+      tb.company_name AS team_company_name,
+      tb.team_role AS team_role,
+      COALESCE(tb.team_size, 0) AS team_co_count,
       COALESCE(cd.base_location::geography, p.location_wkt) AS effective_location,
       ST_Distance(
         COALESCE(cd.base_location::geography, p.location_wkt),
@@ -3451,12 +3336,18 @@ BEGIN
       )::float AS dist
     FROM public.cleaner_data cd
     JOIN public.profiles p ON p.user_id = cd.user_id
+    LEFT JOIN LATERAL (
+      SELECT b.company_name, b.team_role, b.team_size
+      FROM public.cleaner_team_branding_for(cd.user_id) b
+      LIMIT 1
+    ) tb ON true
     WHERE cd.status = 'active'
       AND cd.verified = true
       AND COALESCE(cd.base_location::geography, p.location_wkt) IS NOT NULL
-      AND (
-        auth.uid() = cd.user_id
-        OR public.is_profile_discoverable_by_others(p)
+      AND public.is_profile_discoverable_by_others(p)
+      AND cd.user_id IS DISTINCT FROM COALESCE(
+        v_cust_id,
+        (SELECT b.customer_id FROM public.bookings b WHERE b.id = p_exclude_booking_id LIMIT 1)
       )
       AND ST_DWithin(
         COALESCE(cd.base_location::geography, p.location_wkt),
@@ -3469,6 +3360,15 @@ BEGIN
       AND (
         p_requested_category IS NULL
         OR p_requested_category = ANY(cd.service_categories)
+      )
+      AND cardinality(COALESCE(cd.specialties, ARRAY[]::text[])) > 0
+      AND (
+        cardinality(COALESCE(p_requested_services, ARRAY[]::text[])) = 0
+        OR EXISTS (
+          SELECT 1
+          FROM unnest(p_requested_services) s
+          WHERE s = ANY(COALESCE(cd.specialties, ARRAY[]::text[]))
+        )
       )
       AND NOT EXISTS (
         SELECT 1
@@ -3490,22 +3390,13 @@ BEGIN
   ),
   scored_cleaners AS (
     SELECT
-      ac.cleaner_user_id,
-      ac.cleaner_fullname,
-      ac.profile_avatar_url,
-      ac.profile_bio,
-      ac.cleaner_hourly_rate,
-      ac.cleaner_rating,
-      ac.cleaner_skills,
-      ac.cleaner_specialties,
-      ac.dist,
+      ac.*,
       CASE
         WHEN cardinality(COALESCE(p_requested_services, ARRAY[]::text[])) > 0
         THEN (
           SELECT count(*)::float / cardinality(p_requested_services)
           FROM unnest(p_requested_services) s
-          WHERE s = ANY(COALESCE(ac.cleaner_skills, ARRAY[]::text[]))
-             OR s = ANY(COALESCE(ac.cleaner_specialties, ARRAY[]::text[]))
+          WHERE s = ANY(COALESCE(ac.cleaner_specialties, ARRAY[]::text[]))
         ) * 40
         ELSE 20
       END AS s_score
@@ -3523,7 +3414,11 @@ BEGIN
       (GREATEST(0, (1.0 - (sc.dist / p_max_distance_meters))) * 30)
       + (COALESCE(sc.cleaner_rating, 0) / 5.0 * 30)
       + sc.s_score
-    )::float AS final_score
+    )::float AS final_score,
+    sc.team_company_name AS company_name,
+    sc.team_co_count AS team_size,
+    sc.team_role AS team_role,
+    COALESCE(sc.cleaner_specialties, ARRAY[]::text[]) AS specialties
   FROM scored_cleaners sc
   ORDER BY final_score DESC, sc.dist ASC;
 END;
@@ -3531,6 +3426,10 @@ $$;
 
 
 ALTER FUNCTION "public"."get_best_available_cleaners"("p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer, "p_requested_services" "text"[], "p_exclude_booking_id" "uuid", "p_requested_category" "public"."service_category") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."get_best_available_cleaners"("p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer, "p_requested_services" "text"[], "p_exclude_booking_id" "uuid", "p_requested_category" "public"."service_category") IS 'Customer cleaner discovery. p_requested_services = specialty slugs (hard filter on cleaner_data.specialties).';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."get_best_available_cleaners_old"("p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer, "p_requested_services" "text"[]) RETURNS TABLE("cleaner_id" "uuid", "cleaner_name" "text", "avatar_url" "text", "bio" "text", "hourly_rate" numeric, "rating" double precision, "distance_meters" double precision, "final_score" double precision)
@@ -5098,6 +4997,26 @@ $$;
 ALTER FUNCTION "public"."inbox_notification_android_channel"("p_type" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."inbox_notification_interruption_level"("p_type" "text") RETURNS "text"
+    LANGUAGE "sql" IMMUTABLE
+    AS $$
+  SELECT CASE
+    WHEN p_type IN (
+      'cleaner_en_route',
+      'cleaner_arrived',
+      'booking_cancelled',
+      'payment_required',
+      'direct_assignment_offer',
+      'direct_assignment_reminder'
+    ) THEN 'time-sensitive'
+    ELSE NULL
+  END;
+$$;
+
+
+ALTER FUNCTION "public"."inbox_notification_interruption_level"("p_type" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."increment_invite_code_usage"("p_code" "text") RETURNS boolean
     LANGUAGE "plpgsql"
     AS $$
@@ -5247,6 +5166,25 @@ $$;
 
 
 ALTER FUNCTION "public"."is_co_cleaner_team_member"("p_user_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."is_location_in_active_service_area"("p_lat" double precision, "p_lng" double precision) RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.service_areas
+    WHERE active = true
+      AND ST_Covers(
+        geom,
+        ST_SetSRID(ST_MakePoint(p_lng, p_lat), 4326)
+      )
+  );
+$$;
+
+
+ALTER FUNCTION "public"."is_location_in_active_service_area"("p_lat" double precision, "p_lng" double precision) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."is_platform_fee_admin"() RETURNS boolean
@@ -5435,14 +5373,19 @@ BEGIN
     AND EXISTS (
       SELECT 1
       FROM public.get_best_available_cleaners(
-        b.scheduled_date,
-        b.scheduled_time,
-        COALESCE(b.duration_hours, b.duration_final, 2),
-        ST_Y(b.location_coordinates::geometry),
-        ST_X(b.location_coordinates::geometry),
-        50000,
-        COALESCE(b.extra_task_ids, ARRAY[]::text[]),
-        b.id
+        b.scheduled_date::date,
+        b.scheduled_time::time,
+        COALESCE(b.duration_hours, b.duration_final, 2)::numeric,
+        ST_Y(b.location_coordinates::geometry)::double precision,
+        ST_X(b.location_coordinates::geometry)::double precision,
+        50000::integer,
+        COALESCE(b.extra_task_ids, ARRAY[]::text[])::text[],
+        b.id::uuid,
+        (
+          SELECT st.category::public.service_category
+          FROM public.service_types st
+          WHERE st.id = b.service_id
+        )
       ) g
       WHERE g.cleaner_id = p_cleaner_id
     );
@@ -6476,11 +6419,13 @@ DECLARE
   v_body text;
   v_type text;
   v_channel text;
+  v_interruption text;
   v_badge integer := 0;
   v_messages jsonb := '[]'::jsonb;
   v_token text;
   v_request_id bigint;
   v_push_data jsonb;
+  v_message jsonb;
 BEGIN
   IF p_user_id IS NULL THEN
     RETURN;
@@ -6495,6 +6440,11 @@ BEGIN
   IF NOT (v_push_data ? 'type') THEN
     v_push_data := v_push_data || jsonb_build_object('type', v_type);
   END IF;
+  IF (v_push_data ? 'booking_id') AND NOT (v_push_data ? 'bookingId') THEN
+    v_push_data := v_push_data || jsonb_build_object('bookingId', v_push_data->>'booking_id');
+  END IF;
+
+  v_interruption := public.inbox_notification_interruption_level(v_type);
 
   SELECT count(*)::integer
   INTO v_badge
@@ -6519,18 +6469,20 @@ BEGIN
     ) t
     WHERE t.token IS NOT NULL
   LOOP
-    v_messages := v_messages || jsonb_build_array(
-      jsonb_build_object(
-        'to', v_token,
-        'title', v_title,
-        'body', v_body,
-        'sound', 'default',
-        'priority', 'high',
-        'channelId', v_channel,
-        'badge', v_badge,
-        'data', v_push_data
-      )
+    v_message := jsonb_build_object(
+      'to', v_token,
+      'title', v_title,
+      'body', v_body,
+      'sound', 'default',
+      'priority', 'high',
+      'channelId', v_channel,
+      'badge', v_badge,
+      'data', v_push_data
     );
+    IF v_interruption IS NOT NULL THEN
+      v_message := v_message || jsonb_build_object('interruptionLevel', v_interruption);
+    END IF;
+    v_messages := v_messages || jsonb_build_array(v_message);
   END LOOP;
 
   IF jsonb_array_length(v_messages) = 0 THEN
@@ -6763,6 +6715,7 @@ DECLARE
   v_lng double precision;
   v_duration numeric;
   v_services text[];
+  v_requested_category public.service_category;
   v_candidate uuid;
   v_notified integer := 0;
 BEGIN
@@ -6812,18 +6765,24 @@ BEGIN
   v_lng := ST_X(v_row.location_coordinates::geometry);
   v_duration := COALESCE(v_row.duration_hours, v_row.duration_final, 2);
   v_services := COALESCE(v_row.extra_task_ids, ARRAY[]::text[]);
+  v_requested_category := (
+    SELECT st.category::public.service_category
+    FROM public.service_types st
+    WHERE st.id = v_row.service_id
+  );
 
   FOR v_candidate IN
     SELECT g.cleaner_id
     FROM public.get_best_available_cleaners(
-      v_row.scheduled_date,
-      v_row.scheduled_time,
-      v_duration,
-      v_lat,
-      v_lng,
-      50000,
-      v_services,
-      p_booking_id
+      v_row.scheduled_date::date,
+      v_row.scheduled_time::time,
+      v_duration::numeric,
+      v_lat::double precision,
+      v_lng::double precision,
+      50000::integer,
+      v_services::text[],
+      p_booking_id::uuid,
+      v_requested_category::public.service_category
     ) g
     ORDER BY g.final_score DESC NULLS LAST, g.distance_meters ASC
     LIMIT 12
@@ -7147,9 +7106,9 @@ $$;
 ALTER FUNCTION "public"."sanitize_cleaner_search_query"("p_search_query" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."search_available_cleaners"("p_lat" double precision, "p_lng" double precision, "p_date" "date", "p_time" time without time zone, "p_duration" double precision, "p_requested_services" "text"[] DEFAULT '{}'::"text"[], "p_max_distance_meters" double precision DEFAULT 50000, "p_exclude_booking_id" "uuid" DEFAULT NULL::"uuid", "p_search_query" "text" DEFAULT NULL::"text") RETURNS TABLE("cleaner_id" "uuid", "cleaner_name" "text", "avatar_url" "text", "rating" double precision, "distance_meters" double precision, "matching_skills_count" integer, "total_skills_count" integer, "company_name" "text", "team_size" integer)
+CREATE OR REPLACE FUNCTION "public"."search_available_cleaners"("p_lat" double precision, "p_lng" double precision, "p_date" "date", "p_time" time without time zone, "p_duration" double precision, "p_requested_services" "text"[] DEFAULT '{}'::"text"[], "p_max_distance_meters" double precision DEFAULT 50000, "p_exclude_booking_id" "uuid" DEFAULT NULL::"uuid", "p_requested_category" "public"."service_category" DEFAULT NULL::"public"."service_category", "p_search_query" "text" DEFAULT NULL::"text") RETURNS TABLE("cleaner_id" "uuid", "cleaner_name" "text", "avatar_url" "text", "rating" double precision, "distance_meters" double precision, "matching_skills_count" integer, "total_skills_count" integer, "company_name" "text", "team_size" integer, "team_role" "text", "specialties" "text"[])
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
-    SET "search_path" TO 'public'
+    SET "search_path" TO 'public', 'pg_temp'
     AS $$
 DECLARE
   v_cust_loc geography := ST_SetSRID(ST_MakePoint(p_lng, p_lat), 4326)::geography;
@@ -7160,7 +7119,9 @@ DECLARE
   );
   v_search text := public.sanitize_cleaner_search_query(p_search_query);
 BEGIN
-  IF auth.uid() IS NULL THEN
+  IF auth.uid() IS NULL
+     AND current_setting('app.system_cleaner_discovery', true) IS DISTINCT FROM '1'
+  THEN
     RAISE EXCEPTION 'Not authorized';
   END IF;
 
@@ -7174,14 +7135,20 @@ BEGIN
     (
       SELECT count(*)::int
       FROM unnest(p_requested_services) s
-      WHERE s = ANY(cd.skills) OR s = ANY(cd.specialties)
+      WHERE s = ANY(COALESCE(cd.specialties, ARRAY[]::text[]))
     ) AS matching_skills_count,
-    COALESCE(array_length(cd.skills, 1), 0) AS total_skills_count,
-    ct.company_name,
-    public.cleaner_team_co_count(cd.user_id) AS team_size
+    COALESCE(array_length(cd.specialties, 1), 0) AS total_skills_count,
+    tb.company_name,
+    COALESCE(tb.team_size, 0) AS team_size,
+    tb.team_role,
+    COALESCE(cd.specialties, ARRAY[]::text[]) AS specialties
   FROM public.cleaner_data cd
-  JOIN public.profiles p ON p.id = cd.user_id
-  LEFT JOIN public.cleaner_teams ct ON ct.lead_cleaner_id = cd.user_id
+  JOIN public.profiles p ON p.user_id = cd.user_id
+  LEFT JOIN LATERAL (
+    SELECT b.company_name, b.team_role, b.team_size
+    FROM public.cleaner_team_branding_for(cd.user_id) b
+    LIMIT 1
+  ) tb ON true
   WHERE cd.status = 'active'
     AND cd.verified = true
     AND public.is_profile_discoverable_by_others(p)
@@ -7190,6 +7157,19 @@ BEGIN
       (SELECT b.customer_id FROM public.bookings b WHERE b.id = p_exclude_booking_id LIMIT 1)
     )
     AND ST_DWithin(cd.base_location::geography, v_cust_loc, p_max_distance_meters)
+    AND (
+      p_requested_category IS NULL
+      OR p_requested_category = ANY(cd.service_categories)
+    )
+    AND cardinality(COALESCE(cd.specialties, ARRAY[]::text[])) > 0
+    AND (
+      cardinality(COALESCE(p_requested_services, ARRAY[]::text[])) = 0
+      OR EXISTS (
+        SELECT 1
+        FROM unnest(p_requested_services) s
+        WHERE s = ANY(COALESCE(cd.specialties, ARRAY[]::text[]))
+      )
+    )
     AND NOT EXISTS (
       SELECT 1
       FROM public.bookings b
@@ -7204,74 +7184,18 @@ BEGIN
     AND (
       v_search IS NULL
       OR p.fullname ILIKE '%' || v_search || '%'
-      OR ct.company_name ILIKE '%' || v_search || '%'
+      OR tb.company_name ILIKE '%' || v_search || '%'
     )
   ORDER BY cd.base_location::geography <-> v_cust_loc ASC;
 END;
 $$;
 
 
-ALTER FUNCTION "public"."search_available_cleaners"("p_lat" double precision, "p_lng" double precision, "p_date" "date", "p_time" time without time zone, "p_duration" double precision, "p_requested_services" "text"[], "p_max_distance_meters" double precision, "p_exclude_booking_id" "uuid", "p_search_query" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."search_available_cleaners"("p_lat" double precision, "p_lng" double precision, "p_date" "date", "p_time" time without time zone, "p_duration" double precision, "p_requested_services" "text"[], "p_max_distance_meters" double precision, "p_exclude_booking_id" "uuid", "p_requested_category" "public"."service_category", "p_search_query" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."search_available_cleaners"("p_lat" double precision, "p_lng" double precision, "p_date" "date", "p_time" time without time zone, "p_duration" double precision, "p_requested_services" "text"[] DEFAULT '{}'::"text"[], "p_max_distance_meters" double precision DEFAULT 50000, "p_exclude_booking_id" "uuid" DEFAULT NULL::"uuid", "p_requested_category" "public"."service_category" DEFAULT NULL::"public"."service_category") RETURNS TABLE("cleaner_id" "uuid", "cleaner_name" "text", "avatar_url" "text", "rating" double precision, "distance_meters" double precision, "matching_skills_count" integer, "total_skills_count" integer)
-    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
-    SET "search_path" TO 'public', 'pg_temp'
-    AS $$
-DECLARE
-  v_cust_loc geography := ST_SetSRID(ST_MakePoint(p_lng, p_lat), 4326)::geography;
-  v_booking_range tstzrange := tstzrange(
-    (p_date + p_time)::timestamptz,
-    (p_date + p_time + (p_duration || ' hours')::interval)::timestamptz,
-    '[)'
-  );
-BEGIN
-  IF auth.uid() IS NULL THEN
-    RAISE EXCEPTION 'Not authorized';
-  END IF;
+COMMENT ON FUNCTION "public"."search_available_cleaners"("p_lat" double precision, "p_lng" double precision, "p_date" "date", "p_time" time without time zone, "p_duration" double precision, "p_requested_services" "text"[], "p_max_distance_meters" double precision, "p_exclude_booking_id" "uuid", "p_requested_category" "public"."service_category", "p_search_query" "text") IS 'Fallback cleaner search. p_requested_services = specialty slugs (hard filter on cleaner_data.specialties).';
 
-  RETURN QUERY
-  SELECT
-    cd.user_id,
-    p.fullname,
-    p.avatar_url,
-    cd.rating::float,
-    (cd.base_location::geography <-> v_cust_loc)::float AS dist_m,
-    (
-      SELECT count(*)::int
-      FROM unnest(p_requested_services) s
-      WHERE s = ANY(cd.skills) OR s = ANY(cd.specialties)
-    ) AS matching_skills_count,
-    COALESCE(array_length(cd.skills, 1), 0) AS total_skills_count
-  FROM public.cleaner_data cd
-  JOIN public.profiles p ON p.id = cd.user_id
-  WHERE cd.status = 'active'
-    AND (
-      auth.uid() = cd.user_id
-      OR public.is_profile_discoverable_by_others(p)
-    )
-    AND ST_DWithin(cd.base_location::geography, v_cust_loc, p_max_distance_meters)
-    AND (
-      p_requested_category IS NULL
-      OR p_requested_category = ANY(cd.service_categories)
-    )
-    AND NOT EXISTS (
-      SELECT 1
-      FROM public.bookings b
-      WHERE b.cleaner_id = cd.user_id
-        AND b.booking_period && v_booking_range
-        AND b.status != 'cancelled'
-        AND (
-          p_exclude_booking_id IS NULL
-          OR b.id <> p_exclude_booking_id
-        )
-    )
-  ORDER BY cd.base_location::geography <-> v_cust_loc ASC;
-END;
-$$;
-
-
-ALTER FUNCTION "public"."search_available_cleaners"("p_lat" double precision, "p_lng" double precision, "p_date" "date", "p_time" time without time zone, "p_duration" double precision, "p_requested_services" "text"[], "p_max_distance_meters" double precision, "p_exclude_booking_id" "uuid", "p_requested_category" "public"."service_category") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."search_available_cleaners_old"("p_lat" double precision, "p_lng" double precision, "p_date" "date", "p_time" time without time zone, "p_duration" double precision, "p_requested_services" "text"[] DEFAULT '{}'::"text"[], "p_max_distance_meters" double precision DEFAULT 50000) RETURNS TABLE("cleaner_id" "uuid", "cleaner_name" "text", "avatar_url" "text", "rating" double precision, "distance_meters" double precision, "matching_skills_count" integer, "total_skills_count" integer)
@@ -9969,6 +9893,19 @@ CREATE TABLE IF NOT EXISTS "public"."roles" (
 ALTER TABLE "public"."roles" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."service_areas" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "name" "text" NOT NULL,
+    "country" "text" DEFAULT 'GH'::"text" NOT NULL,
+    "geom" "public"."geometry"(MultiPolygon,4326) NOT NULL,
+    "active" boolean DEFAULT true NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."service_areas" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."service_categories" (
     "id" integer NOT NULL,
     "name" "text" NOT NULL,
@@ -10028,11 +9965,17 @@ CREATE TABLE IF NOT EXISTS "public"."service_types" (
     "active" boolean DEFAULT true,
     "image_url" "text",
     "features" "text"[] DEFAULT '{}'::"text"[],
-    "last_updated" timestamp with time zone DEFAULT "now"()
+    "last_updated" timestamp with time zone DEFAULT "now"(),
+    "specialty_slug" "text",
+    CONSTRAINT "service_types_specialty_slug_format_check" CHECK ((("specialty_slug" IS NULL) OR ("specialty_slug" ~ '^[a-z][a-z0-9_]{1,63}$'::"text")))
 );
 
 
 ALTER TABLE "public"."service_types" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."service_types"."specialty_slug" IS 'Canonical specialty slug for booking/discovery (e.g. deep_cleaning). Not display text.';
+
 
 
 CREATE SEQUENCE IF NOT EXISTS "public"."service_types_id_seq"
@@ -10709,6 +10652,11 @@ ALTER TABLE ONLY "public"."reviews"
 
 ALTER TABLE ONLY "public"."roles"
     ADD CONSTRAINT "roles_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."service_areas"
+    ADD CONSTRAINT "service_areas_pkey" PRIMARY KEY ("id");
 
 
 
@@ -11394,6 +11342,10 @@ CREATE INDEX "idx_reviews_reviewee_id" ON "public"."reviews" USING "btree" ("rev
 
 
 
+CREATE INDEX "idx_service_areas_geom" ON "public"."service_areas" USING "gist" ("geom");
+
+
+
 CREATE INDEX "idx_service_duration_options_service" ON "public"."service_duration_options" USING "btree" ("service_type_id");
 
 
@@ -11559,6 +11511,10 @@ CREATE UNIQUE INDEX "profiles_user_id_key" ON "public"."profiles" USING "btree" 
 
 
 CREATE UNIQUE INDEX "reviews_booking_id_key" ON "public"."reviews" USING "btree" ("booking_id") WHERE ("booking_id" IS NOT NULL);
+
+
+
+CREATE UNIQUE INDEX "service_types_specialty_slug_key" ON "public"."service_types" USING "btree" ("specialty_slug") WHERE ("specialty_slug" IS NOT NULL);
 
 
 
@@ -12921,6 +12877,9 @@ CREATE POLICY "reviews_select_via_booking" ON "public"."reviews" FOR SELECT TO "
 
 
 ALTER TABLE "public"."roles" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."service_areas" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."service_categories" ENABLE ROW LEVEL SECURITY;
@@ -16359,12 +16318,6 @@ GRANT ALL ON FUNCTION "public"."get_available_timeslots_old"("p_booking_date" "d
 
 
 
-GRANT ALL ON FUNCTION "public"."get_best_available_cleaners"("p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer, "p_requested_services" "text"[], "p_exclude_booking_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_best_available_cleaners"("p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer, "p_requested_services" "text"[], "p_exclude_booking_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_best_available_cleaners"("p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer, "p_requested_services" "text"[], "p_exclude_booking_id" "uuid") TO "service_role";
-
-
-
 REVOKE ALL ON FUNCTION "public"."get_best_available_cleaners"("p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer, "p_requested_services" "text"[], "p_exclude_booking_id" "uuid", "p_requested_category" "public"."service_category") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."get_best_available_cleaners"("p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer, "p_requested_services" "text"[], "p_exclude_booking_id" "uuid", "p_requested_category" "public"."service_category") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."get_best_available_cleaners"("p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer, "p_requested_services" "text"[], "p_exclude_booking_id" "uuid", "p_requested_category" "public"."service_category") TO "service_role";
@@ -16618,6 +16571,12 @@ GRANT ALL ON FUNCTION "public"."inbox_notification_android_channel"("p_type" "te
 
 
 
+GRANT ALL ON FUNCTION "public"."inbox_notification_interruption_level"("p_type" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."inbox_notification_interruption_level"("p_type" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."inbox_notification_interruption_level"("p_type" "text") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."increment_invite_code_usage"("p_code" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."increment_invite_code_usage"("p_code" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."increment_invite_code_usage"("p_code" "text") TO "service_role";
@@ -16710,6 +16669,12 @@ GRANT ALL ON FUNCTION "public"."is_contained_2d"("public"."geometry", "public"."
 GRANT ALL ON FUNCTION "public"."is_contained_2d"("public"."geometry", "public"."box2df") TO "anon";
 GRANT ALL ON FUNCTION "public"."is_contained_2d"("public"."geometry", "public"."box2df") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."is_contained_2d"("public"."geometry", "public"."box2df") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."is_location_in_active_service_area"("p_lat" double precision, "p_lng" double precision) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."is_location_in_active_service_area"("p_lat" double precision, "p_lng" double precision) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."is_location_in_active_service_area"("p_lat" double precision, "p_lng" double precision) TO "service_role";
 
 
 
@@ -17510,15 +17475,9 @@ GRANT ALL ON FUNCTION "public"."sanitize_cleaner_search_query"("p_search_query" 
 
 
 
-GRANT ALL ON FUNCTION "public"."search_available_cleaners"("p_lat" double precision, "p_lng" double precision, "p_date" "date", "p_time" time without time zone, "p_duration" double precision, "p_requested_services" "text"[], "p_max_distance_meters" double precision, "p_exclude_booking_id" "uuid", "p_search_query" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."search_available_cleaners"("p_lat" double precision, "p_lng" double precision, "p_date" "date", "p_time" time without time zone, "p_duration" double precision, "p_requested_services" "text"[], "p_max_distance_meters" double precision, "p_exclude_booking_id" "uuid", "p_search_query" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."search_available_cleaners"("p_lat" double precision, "p_lng" double precision, "p_date" "date", "p_time" time without time zone, "p_duration" double precision, "p_requested_services" "text"[], "p_max_distance_meters" double precision, "p_exclude_booking_id" "uuid", "p_search_query" "text") TO "service_role";
-
-
-
-REVOKE ALL ON FUNCTION "public"."search_available_cleaners"("p_lat" double precision, "p_lng" double precision, "p_date" "date", "p_time" time without time zone, "p_duration" double precision, "p_requested_services" "text"[], "p_max_distance_meters" double precision, "p_exclude_booking_id" "uuid", "p_requested_category" "public"."service_category") FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."search_available_cleaners"("p_lat" double precision, "p_lng" double precision, "p_date" "date", "p_time" time without time zone, "p_duration" double precision, "p_requested_services" "text"[], "p_max_distance_meters" double precision, "p_exclude_booking_id" "uuid", "p_requested_category" "public"."service_category") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."search_available_cleaners"("p_lat" double precision, "p_lng" double precision, "p_date" "date", "p_time" time without time zone, "p_duration" double precision, "p_requested_services" "text"[], "p_max_distance_meters" double precision, "p_exclude_booking_id" "uuid", "p_requested_category" "public"."service_category") TO "service_role";
+REVOKE ALL ON FUNCTION "public"."search_available_cleaners"("p_lat" double precision, "p_lng" double precision, "p_date" "date", "p_time" time without time zone, "p_duration" double precision, "p_requested_services" "text"[], "p_max_distance_meters" double precision, "p_exclude_booking_id" "uuid", "p_requested_category" "public"."service_category", "p_search_query" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."search_available_cleaners"("p_lat" double precision, "p_lng" double precision, "p_date" "date", "p_time" time without time zone, "p_duration" double precision, "p_requested_services" "text"[], "p_max_distance_meters" double precision, "p_exclude_booking_id" "uuid", "p_requested_category" "public"."service_category", "p_search_query" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."search_available_cleaners"("p_lat" double precision, "p_lng" double precision, "p_date" "date", "p_time" time without time zone, "p_duration" double precision, "p_requested_services" "text"[], "p_max_distance_meters" double precision, "p_exclude_booking_id" "uuid", "p_requested_category" "public"."service_category", "p_search_query" "text") TO "service_role";
 
 
 
@@ -21224,6 +21183,12 @@ GRANT ALL ON TABLE "public"."reviews" TO "service_role";
 GRANT ALL ON TABLE "public"."roles" TO "anon";
 GRANT ALL ON TABLE "public"."roles" TO "authenticated";
 GRANT ALL ON TABLE "public"."roles" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."service_areas" TO "anon";
+GRANT ALL ON TABLE "public"."service_areas" TO "authenticated";
+GRANT ALL ON TABLE "public"."service_areas" TO "service_role";
 
 
 
