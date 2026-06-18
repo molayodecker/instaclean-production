@@ -2141,6 +2141,41 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.cleaner_team_branding_for(p_cleaner_id uuid)
+ RETURNS TABLE(company_name text, team_role text, team_size integer)
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+BEGIN
+  RETURN QUERY
+  SELECT
+    ct.company_name,
+    'lead'::text,
+    public.cleaner_team_co_count(p_cleaner_id)
+  FROM public.cleaner_teams ct
+  WHERE ct.lead_cleaner_id = p_cleaner_id
+    AND NULLIF(BTRIM(ct.company_name), '') IS NOT NULL
+  LIMIT 1;
+
+  IF FOUND THEN
+    RETURN;
+  END IF;
+
+  RETURN QUERY
+  SELECT
+    ct.company_name,
+    'member'::text,
+    public.cleaner_team_co_count(r.lead_cleaner_id)
+  FROM public.co_cleaner_relationships r
+  JOIN public.cleaner_teams ct ON ct.lead_cleaner_id = r.lead_cleaner_id
+  WHERE r.co_cleaner_id = p_cleaner_id
+    AND NULLIF(BTRIM(ct.company_name), '') IS NOT NULL
+  LIMIT 1;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.cleaner_team_co_count(p_lead_cleaner_id uuid)
  RETURNS integer
  LANGUAGE sql
@@ -2173,253 +2208,251 @@ END;
 $function$
 
 
-CREATE OR REPLACE FUNCTION public.compute_booking_pricing(p_service_id integer, p_duration_hours_raw numeric, p_scheduled_date date, p_service_timezone text, p_recurrence_interval text DEFAULT NULL::text, p_is_recurring boolean DEFAULT false)
- RETURNS TABLE(pricing_version text, currency text, same_day_surcharge_bps integer, weekend_surcharge_bps integer, recurring_weekly_discount_bps integer, recurring_monthly_discount_bps integer, work_rate_ghs_per_hour numeric, duration_hours numeric, subtotal_labor_major numeric, platform_fee_major numeric, booking_cover_major numeric, core_amount_minor bigint, same_day_surcharge_minor bigint, weekend_surcharge_minor bigint, recurring_discount_minor bigint, final_amount_minor bigint, recurring_amount_minor bigint, first_charge_amount_minor bigint, discount_rate_bps integer, is_same_day boolean, is_weekend boolean)
+CREATE OR REPLACE FUNCTION public.compute_booking_pricing(p_service_id integer, p_duration_hours_raw numeric, p_scheduled_date date, p_service_timezone text, p_recurrence_interval text DEFAULT NULL::text, p_is_recurring boolean DEFAULT false, p_include_booking_cover boolean DEFAULT true)
+ RETURNS TABLE(pricing_version text, currency text, work_rate_ghs_per_hour numeric, duration_hours numeric, subtotal_labor_major numeric, platform_fee_major numeric, booking_cover_major numeric, core_amount_minor integer, same_day_surcharge_bps integer, weekend_surcharge_bps integer, recurring_weekly_discount_bps integer, recurring_monthly_discount_bps integer, same_day_surcharge_minor integer, weekend_surcharge_minor integer, recurring_discount_minor integer, final_amount_minor integer, recurring_amount_minor integer, first_charge_amount_minor integer, discount_rate_bps integer, is_same_day boolean, is_weekend boolean)
  LANGUAGE plpgsql
  STABLE SECURITY DEFINER
  SET search_path TO 'public'
-AS $function$DECLARE
-  v_now timestamptz := now();
-  -- Stage 6 / 7: calendar math uses this IANA zone (default Accra if blank).
-  v_tz text := COALESCE(NULLIF(trim(p_service_timezone), ''), 'Africa/Accra');
-  v_min_dur numeric := 3.5;
-  v_max_dur numeric := 10;
-  v_stepped numeric;
-  v_dur numeric;
-  v_base numeric;
+AS $function$
+DECLARE
+  -- Defaults (match lib/booking-pricing-compute.ts)
+  c_default_platform_fee_bps constant integer := 1500;
+  c_default_booking_cover_minor constant integer := 2100;
+  -- Match clampBookingDurationHours / MIN_DURATION_HOURS in constants/constants.ts
+  c_min_duration_hours constant numeric := 3.5;
+  c_max_duration_hours constant numeric := 10;
+
   v_rate numeric;
-  v_disc_amount numeric;
-  v_st RECORD;
-  v_rule RECORD;
-  v_pf_pct numeric := 15;
-  v_cover numeric := 21;
-  v_subtotal numeric;
-  v_pf numeric;
-  v_core bigint;
-  v_same bigint := 0;
-  v_wknd bigint := 0;
-  v_after_same bigint;
-  v_final bigint;
+  v_service_active boolean;
+  v_discount_pct numeric;
+  v_duration_hours numeric;
+  v_labor_major numeric;
+  v_labor_minor integer;
+
+  v_settings_platform_raw numeric;
+  v_settings_cover_raw numeric;
+  v_platform_bps integer;
+  v_cover_minor integer;
+  v_platform_fee_major numeric;
+  v_cover_major numeric;
+  v_core_minor integer;
+
+  v_pricing_version text;
+  v_currency text;
+  v_same_day_bps integer;
+  v_weekend_bps integer;
+  v_recurring_weekly_bps integer;
+  v_recurring_monthly_bps integer;
+
+  v_service_timezone text;
   v_today date;
-  v_isodow int;
-  v_same_day boolean := false;
-  v_weekend boolean := false;
-  v_bps_same int;
-  v_bps_wknd int;
-  v_bps_rw int;
-  v_bps_rm int;
-  v_disc_rate int;
-  v_recurring bigint;
-  v_first bigint;
-  v_recurring_disc bigint := 0;
-  v_pf_setting numeric;
-  v_cover_setting numeric;
+  v_is_same_day boolean;
+  v_is_weekend boolean;
+  v_same_day_minor integer;
+  v_after_same integer;
+  v_weekend_minor integer;
+  v_final_minor integer;
+
+  v_discount_bps integer;
+  v_recurring_amount_minor integer;
+  v_first_charge_minor integer;
+  v_recurring_discount_minor integer;
 BEGIN
-  -- ---------------------------------------------------------------------------
-  -- Stage 0: validate service id (caller must pass a positive service_types.id).
-  -- ---------------------------------------------------------------------------
-  IF p_service_id IS NULL OR p_service_id <= 0 THEN
-    RAISE EXCEPTION 'Invalid service id';
+  IF p_duration_hours_raw IS NULL OR p_duration_hours_raw <> p_duration_hours_raw THEN
+    RAISE EXCEPTION 'Invalid duration';
   END IF;
 
-  -- ---------------------------------------------------------------------------
-  -- Stage 1: billable duration — match clampBookingDurationHours() in TS.
-  -- Round to nearest 0.5h, then clamp to [3.5, 10] (MIN/MAX_DURATION_HOURS).
-  -- ---------------------------------------------------------------------------
-  v_stepped := round(p_duration_hours_raw::numeric * 2) / 2;
-  v_dur := greatest(v_min_dur, least(v_max_dur, v_stepped));
+  v_duration_hours := round(p_duration_hours_raw * 2) / 2.0;
+  v_duration_hours := greatest(c_min_duration_hours, least(c_max_duration_hours, v_duration_hours));
 
-  -- ---------------------------------------------------------------------------
-  -- Stage 2: base hourly rate from service_types.price.
-  -- Reject inactive or missing services (same as fetchEffectiveHourlyRateGhs).
-  -- ---------------------------------------------------------------------------
-  SELECT s.price, s.active INTO v_st
-  FROM public.service_types s
-  WHERE s.id = p_service_id;
+  SELECT st.price, COALESCE(st.active, true)
+  INTO v_rate, v_service_active
+  FROM public.service_types st
+  WHERE st.id = p_service_id;
 
-  IF NOT FOUND OR v_st.active IS DISTINCT FROM true THEN
+  IF NOT FOUND OR v_service_active IS DISTINCT FROM true THEN
     RAISE EXCEPTION 'Invalid or inactive service';
   END IF;
 
-  v_base := v_st.price::numeric;
-  IF v_base IS NULL OR v_base < 0 THEN
+  IF v_rate IS NULL OR v_rate < 0 THEN
     RAISE EXCEPTION 'Invalid service price';
   END IF;
 
-  -- ---------------------------------------------------------------------------
-  -- Stage 3: optional percentage discount from discounts (active, date window).
-  -- If a row matches: effective rate = round(base * (1 - amount/100), 2) like TS.
-  -- Window: valid_from <= now <= valid_to (both ends required, same as web query).
-  -- ---------------------------------------------------------------------------
-  SELECT d.amount INTO v_disc_amount
+  SELECT d.amount
+  INTO v_discount_pct
   FROM public.discounts d
   WHERE d.active = true
     AND d.service_type_id = p_service_id
-    AND d.valid_from IS NOT NULL
-    AND d.valid_to IS NOT NULL
-    AND d.valid_from <= v_now
-    AND d.valid_to >= v_now
+    AND d.valid_from <= now()
+    AND d.valid_to >= now()
   ORDER BY d.id DESC
   LIMIT 1;
 
-  IF FOUND AND v_disc_amount IS NOT NULL THEN
-    v_rate := round((v_base * (1 - (v_disc_amount::numeric / 100)))::numeric, 2);
-  ELSE
-    v_rate := v_base;
+  IF FOUND AND v_discount_pct IS NOT NULL THEN
+    v_discount_pct := greatest(0, least(100, v_discount_pct));
+    v_rate := round((v_rate * (1 - v_discount_pct / 100.0))::numeric, 2);
   END IF;
 
-  -- ---------------------------------------------------------------------------
-  -- Stage 4: active pricing rule (bps for surcharges + recurring discounts).
-  -- Same source as get_active_pricing_rule: one row with active = true.
-  -- If none: fall back to v1 constants (500/500/700/1200 bps) like FALLBACK_ACTIVE_PRICING_RULE_V1.
-  -- Output columns also expose the bps so clients can build ActivePricingRule.
-  -- ---------------------------------------------------------------------------
   SELECT
-    r.pricing_version,
-    r.currency,
-    r.same_day_surcharge_bps,
-    r.weekend_surcharge_bps,
-    r.recurring_weekly_discount_bps,
-    r.recurring_monthly_discount_bps
-  INTO v_rule
-  FROM public.pricing_rules r
-  WHERE r.is_active = true
-  ORDER BY r.created_at DESC
+    pr.pricing_version,
+    pr.currency,
+    pr.same_day_surcharge_bps,
+    pr.weekend_surcharge_bps,
+    pr.recurring_weekly_discount_bps,
+    pr.recurring_monthly_discount_bps
+  INTO
+    v_pricing_version,
+    v_currency,
+    v_same_day_bps,
+    v_weekend_bps,
+    v_recurring_weekly_bps,
+    v_recurring_monthly_bps
+  FROM public.get_active_pricing_rule() pr
   LIMIT 1;
 
   IF NOT FOUND THEN
-    pricing_version := 'v1';
-    currency := 'GHS';
-    v_bps_same := 500;
-    v_bps_wknd := 500;
-    v_bps_rw := 700;
-    v_bps_rm := 1200;
-  ELSE
-    pricing_version := v_rule.pricing_version;
-    currency := v_rule.currency;
-    v_bps_same := least(10000, greatest(0, coalesce(v_rule.same_day_surcharge_bps, 500)));
-    v_bps_wknd := least(10000, greatest(0, coalesce(v_rule.weekend_surcharge_bps, 500)));
-    v_bps_rw := least(10000, greatest(0, coalesce(v_rule.recurring_weekly_discount_bps, 700)));
-    v_bps_rm := least(10000, greatest(0, coalesce(v_rule.recurring_monthly_discount_bps, 1200)));
+    v_pricing_version := 'v1';
+    v_currency := 'GHS';
+    v_same_day_bps := 500;
+    v_weekend_bps := 500;
+    v_recurring_weekly_bps := 700;
+    v_recurring_monthly_bps := 1200;
   END IF;
 
-  same_day_surcharge_bps := v_bps_same;
-  weekend_surcharge_bps := v_bps_wknd;
-  recurring_weekly_discount_bps := v_bps_rw;
-  recurring_monthly_discount_bps := v_bps_rm;
+  v_pricing_version := COALESCE(v_pricing_version, 'v1');
+  v_currency := COALESCE(v_currency, 'GHS');
+  v_same_day_bps := COALESCE(v_same_day_bps, 500);
+  v_weekend_bps := COALESCE(v_weekend_bps, 500);
+  v_recurring_weekly_bps := COALESCE(v_recurring_weekly_bps, 700);
+  v_recurring_monthly_bps := COALESCE(v_recurring_monthly_bps, 1200);
 
-  -- ---------------------------------------------------------------------------
-  -- Stage 5: booking_settings — platform fee % of labor + booking cover (GHS).
-  -- Keys: platform_fee_percentage (whole percent, default 15), booking_cover_amount (default 21).
-  -- Matches fetchBookingSettingsPricingKv().
-  -- ---------------------------------------------------------------------------
-  SELECT bs.value_numeric INTO v_pf_setting
+  v_same_day_bps := greatest(0, least(10000, v_same_day_bps));
+  v_weekend_bps := greatest(0, least(10000, v_weekend_bps));
+  v_recurring_weekly_bps := greatest(0, least(10000, v_recurring_weekly_bps));
+  v_recurring_monthly_bps := greatest(0, least(10000, v_recurring_monthly_bps));
+
+  SELECT bs.value_numeric
+  INTO v_settings_platform_raw
   FROM public.booking_settings bs
-  WHERE bs.key = 'platform_fee_percentage'
+  WHERE bs.key = 'platform_fee_percentage';
+
+  IF v_settings_platform_raw IS NULL OR v_settings_platform_raw < 0 THEN
+    v_platform_bps := c_default_platform_fee_bps;
+  ELSIF v_settings_platform_raw = 0 THEN
+    v_platform_bps := 0;
+  ELSIF v_settings_platform_raw <= 100 THEN
+    v_platform_bps := round(v_settings_platform_raw * 100)::integer;
+  ELSE
+    v_platform_bps := round(v_settings_platform_raw)::integer;
+  END IF;
+
+  v_platform_bps := greatest(0, least(10000, COALESCE(v_platform_bps, c_default_platform_fee_bps)));
+
+  SELECT bs.value_numeric
+  INTO v_settings_cover_raw
+  FROM public.booking_settings bs
+  WHERE bs.key = 'booking_cover_amount';
+
+  IF v_settings_cover_raw IS NULL OR v_settings_cover_raw < 0 THEN
+    v_cover_minor := c_default_booking_cover_minor;
+  ELSIF v_settings_cover_raw = 0 THEN
+    v_cover_minor := 0;
+  ELSIF v_settings_cover_raw <= 100 THEN
+    v_cover_minor := round(v_settings_cover_raw * 100)::integer;
+  ELSE
+    v_cover_minor := round(v_settings_cover_raw)::integer;
+  END IF;
+
+  v_labor_major := greatest(0, v_rate * v_duration_hours);
+  v_labor_minor := round(greatest(0, v_labor_major) * 100)::integer;
+
+  -- Major GHS: round(labor_minor * bps / 10000) / 100
+  IF v_platform_bps <= 0 OR v_labor_minor <= 0 THEN
+    v_platform_fee_major := 0;
+  ELSE
+    v_platform_fee_major := (round(v_labor_minor * v_platform_bps / 10000.0) / 100.0)::numeric;
+  END IF;
+
+  IF p_include_booking_cover THEN
+    v_cover_major := (greatest(0, v_cover_minor) / 100.0)::numeric;
+  ELSE
+    v_cover_major := 0;
+  END IF;
+
+  v_core_minor := round(
+    greatest(0, v_labor_major + v_platform_fee_major + v_cover_major) * 100
+  )::integer;
+
+  SELECT name
+  INTO v_service_timezone
+  FROM pg_timezone_names
+  WHERE name = COALESCE(NULLIF(trim(p_service_timezone), ''), 'Africa/Accra')
   LIMIT 1;
 
-  SELECT bs.value_numeric INTO v_cover_setting
-  FROM public.booking_settings bs
-  WHERE bs.key = 'booking_cover_amount'
-  LIMIT 1;
+  v_service_timezone := COALESCE(v_service_timezone, 'Africa/Accra');
 
-  IF v_pf_setting IS NOT NULL AND v_pf_setting >= 0 THEN
-    v_pf_pct := least(100::numeric, greatest(0::numeric, v_pf_setting::numeric));
-  END IF;
+  v_today := (now() AT TIME ZONE v_service_timezone)::date;
+  v_is_same_day := p_scheduled_date IS NOT NULL AND p_scheduled_date = v_today;
+  v_is_weekend := p_scheduled_date IS NOT NULL
+    AND EXTRACT(ISODOW FROM p_scheduled_date::timestamp) IN (6, 7);
 
-  IF v_cover_setting IS NOT NULL AND v_cover_setting >= 0 THEN
-    v_cover := v_cover_setting::numeric;
-  END IF;
+  v_same_day_minor := CASE
+    WHEN v_is_same_day THEN round(v_core_minor * v_same_day_bps / 10000.0)::integer
+    ELSE 0
+  END;
 
-  -- ---------------------------------------------------------------------------
-  -- Stage 6: labor subtotal, platform fee (on labor only), core in minor units.
-  -- subtotal_labor = rate * duration; platform_fee = subtotal * (pct/100);
-  -- core_amount_minor = round((subtotal + platform_fee + cover) * 100) — computeCoreAmountMinor.
-  -- ---------------------------------------------------------------------------
-  v_subtotal := greatest(0::numeric, v_rate * v_dur);
-  v_pf := (v_subtotal * least(100::numeric, greatest(0::numeric, v_pf_pct))) / 100::numeric;
-  v_core := round(greatest(0::numeric, v_subtotal + v_pf + v_cover) * 100)::bigint;
+  v_after_same := v_core_minor + v_same_day_minor;
 
-  -- ---------------------------------------------------------------------------
-  -- Stage 7: same-day vs weekend in the service timezone (applyRuleSurchargesMinor).
-  -- "Today" in zone: compare p_scheduled_date to (now() rendered in v_tz)::date.
-  -- Weekday: ISO DOW 1–7 Mon–Sun at local civil date for noon UTC on p_scheduled_date
-  -- (matches date-fns getIsoWeekdayInServiceTz anchor).
-  -- Same-day surcharge: bps on core. Weekend: bps on (core + same_day_surcharge_minor).
-  -- ---------------------------------------------------------------------------
-  v_today := (timezone(v_tz, v_now))::date;
-  v_same_day := (p_scheduled_date = v_today);
+  v_weekend_minor := CASE
+    WHEN v_is_weekend AND p_scheduled_date IS NOT NULL THEN
+      round(v_after_same * v_weekend_bps / 10000.0)::integer
+    ELSE 0
+  END;
 
-  v_isodow := EXTRACT(
-    ISODOW FROM (
-      ((p_scheduled_date::timestamp + interval '12 hours') AT TIME ZONE 'UTC') AT TIME ZONE v_tz
-    )
-  )::int;
+  v_final_minor := v_core_minor + v_same_day_minor + v_weekend_minor;
 
-  v_weekend := (v_isodow IN (6, 7));
+  v_discount_bps := NULL;
+  v_recurring_amount_minor := NULL;
+  v_first_charge_minor := NULL;
+  v_recurring_discount_minor := 0;
 
-  IF v_same_day THEN
-    v_same := round((v_core::numeric * v_bps_same::numeric) / 10000.0)::bigint;
-  ELSE
-    v_same := 0;
-  END IF;
-
-  v_after_same := v_core + v_same;
-
-  IF v_weekend THEN
-    v_wknd := round((v_after_same::numeric * v_bps_wknd::numeric) / 10000.0)::bigint;
-  ELSE
-    v_wknd := 0;
-  END IF;
-
-  v_final := v_core + v_same + v_wknd;
-
-  -- ---------------------------------------------------------------------------
-  -- Stage 8: recurring subscription (optional).
-  -- If p_is_recurring and interval set: discount bps on core from rule — monthly uses
-  -- recurring_monthly_discount_bps; weekly and bi-weekly use recurring_weekly_discount_bps.
-  -- recurring_amount_minor = round(core * (10000 - bps) / 10000).
-  -- first_charge_amount_minor = final_amount after surcharges (first visit pays full).
-  -- recurring_discount_minor = max(0, core - recurring_amount_minor).
-  -- ---------------------------------------------------------------------------
   IF p_is_recurring AND p_recurrence_interval IS NOT NULL THEN
-    IF lower(trim(p_recurrence_interval)) = 'monthly' THEN
-      v_disc_rate := v_bps_rm;
-    ELSE
-      v_disc_rate := v_bps_rw;
-    END IF;
-    v_disc_rate := least(10000, greatest(0, v_disc_rate));
-    v_recurring := round((v_core::numeric * (10000 - v_disc_rate)::numeric) / 10000.0)::bigint;
-    v_first := v_final;
-    v_recurring_disc := greatest(0::bigint, v_core - v_recurring);
-  ELSE
-    v_disc_rate := NULL;
-    v_recurring := NULL;
-    v_first := NULL;
-    v_recurring_disc := 0;
+    v_discount_bps := CASE
+      WHEN p_recurrence_interval = 'monthly' THEN v_recurring_monthly_bps
+      ELSE v_recurring_weekly_bps
+    END;
+    v_discount_bps := greatest(0, least(10000, COALESCE(v_discount_bps, 0)));
+
+    v_recurring_amount_minor := round(v_core_minor * (10000 - v_discount_bps) / 10000.0)::integer;
+    v_first_charge_minor := v_final_minor;
+    v_recurring_discount_minor := greatest(0, v_core_minor - v_recurring_amount_minor);
   END IF;
 
-  -- ---------------------------------------------------------------------------
-  -- Stage 9: fill RETURNS TABLE (one row).
-  -- ---------------------------------------------------------------------------
-  work_rate_ghs_per_hour := v_rate;
-  duration_hours := v_dur;
-  subtotal_labor_major := v_subtotal;
-  platform_fee_major := v_pf;
-  booking_cover_major := v_cover;
-  core_amount_minor := v_core;
-  same_day_surcharge_minor := v_same;
-  weekend_surcharge_minor := v_wknd;
-  recurring_discount_minor := v_recurring_disc;
-  final_amount_minor := v_final;
-  recurring_amount_minor := v_recurring;
-  first_charge_amount_minor := v_first;
-  discount_rate_bps := v_disc_rate;
-  is_same_day := v_same_day;
-  is_weekend := v_weekend;
-
-  RETURN NEXT;
-END;$function$
+  RETURN QUERY
+  SELECT
+    v_pricing_version,
+    v_currency,
+    v_rate,
+    v_duration_hours,
+    v_labor_major,
+    v_platform_fee_major,
+    v_cover_major,
+    v_core_minor,
+    v_same_day_bps,
+    v_weekend_bps,
+    v_recurring_weekly_bps,
+    v_recurring_monthly_bps,
+    v_same_day_minor,
+    v_weekend_minor,
+    v_recurring_discount_minor,
+    v_final_minor,
+    v_recurring_amount_minor,
+    v_first_charge_minor,
+    v_discount_bps,
+    v_is_same_day,
+    v_is_weekend;
+END;
+$function$
 
 
 CREATE OR REPLACE FUNCTION public.compute_booking_scheduled_at_utc()
@@ -6555,7 +6588,7 @@ CREATE OR REPLACE FUNCTION public.get_cleaner_by_booking_slug(p_slug text)
  RETURNS jsonb
  LANGUAGE plpgsql
  STABLE SECURITY DEFINER
- SET search_path TO 'public'
+ SET search_path TO 'public', 'pg_temp'
 AS $function$
 DECLARE
   v_slug text := lower(trim(coalesce(p_slug, '')));
@@ -6575,7 +6608,8 @@ BEGIN
     cd.service_categories,
     cd.status,
     cd.verified,
-    ct.company_name
+    tb.company_name,
+    tb.team_role
   INTO v_row
   FROM public.cleaner_data cd
   JOIN LATERAL (
@@ -6585,7 +6619,11 @@ BEGIN
        OR p.id = cd.user_id
     LIMIT 1
   ) p ON true
-  LEFT JOIN public.cleaner_teams ct ON ct.lead_cleaner_id = cd.user_id
+  LEFT JOIN LATERAL (
+    SELECT b.company_name, b.team_role
+    FROM public.cleaner_team_branding_for(cd.user_id) b
+    LIMIT 1
+  ) tb ON true
   WHERE cd.booking_slug = v_slug
     AND cd.status = 'active'
     AND cd.verified = true
@@ -6606,7 +6644,8 @@ BEGIN
       'hourly_rate', coalesce(v_row.hourly_rate, 0),
       'bio', v_row.bio,
       'service_categories', coalesce(to_jsonb(v_row.service_categories), '[]'::jsonb),
-      'company_name', v_row.company_name
+      'company_name', v_row.company_name,
+      'team_role', v_row.team_role
     )
   );
 END;
@@ -6634,11 +6673,12 @@ CREATE OR REPLACE FUNCTION public.get_cleaner_profile_v1(target_user_id uuid)
  RETURNS jsonb
  LANGUAGE plpgsql
  SECURITY DEFINER
- SET search_path TO 'public'
+ SET search_path TO 'public', 'pg_temp'
 AS $function$
 DECLARE
   v_profile public.profiles%ROWTYPE;
   v_user_id uuid;
+  v_team jsonb;
   result jsonb;
 BEGIN
   SELECT *
@@ -6652,7 +6692,8 @@ BEGIN
     RETURN jsonb_build_object(
       'profile', NULL,
       'cleaner_data', NULL,
-      'verification', NULL
+      'verification', NULL,
+      'team', NULL
     );
   END IF;
 
@@ -6662,13 +6703,21 @@ BEGIN
     RETURN jsonb_build_object(
       'profile', NULL,
       'cleaner_data', NULL,
-      'verification', NULL
+      'verification', NULL,
+      'team', NULL
     );
   END IF;
 
-  -- Callers may pass profiles.id or profiles.user_id; normalize once and use
-  -- the auth user id for every related-table lookup below.
   v_user_id := COALESCE(v_profile.user_id, v_profile.id);
+
+  SELECT jsonb_build_object(
+    'company_name', b.company_name,
+    'team_role', b.team_role,
+    'team_size', b.team_size
+  )
+  INTO v_team
+  FROM public.cleaner_team_branding_for(v_user_id) b
+  LIMIT 1;
 
   SELECT jsonb_build_object(
     'profile', to_jsonb(v_profile),
@@ -6706,7 +6755,8 @@ BEGIN
           WHERE cv.id = v_user_id AND cv.police_report_url IS NOT NULL
         )
       )
-    )
+    ),
+    'team', v_team
   )
   INTO result;
 
