@@ -15083,6 +15083,17 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.touch_message_delivery_attempt_updated_at()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+  NEW.updated_at := now();
+  RETURN NEW;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.touch_payout_methods_updated_at()
  RETURNS trigger
  LANGUAGE plpgsql
@@ -16025,6 +16036,8 @@ CREATE TRIGGER tr_on_cleaner_created AFTER INSERT ON cleaner_data FOR EACH ROW E
 CREATE TRIGGER cleaner_teams_set_normalized_trg BEFORE INSERT OR UPDATE OF company_name ON cleaner_teams FOR EACH ROW EXECUTE FUNCTION cleaner_teams_set_normalized();
 
 CREATE TRIGGER geo_reverse_cache_set_updated_at BEFORE UPDATE ON geo_reverse_cache FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE TRIGGER trg_message_delivery_attempts_updated_at BEFORE UPDATE ON message_delivery_attempts FOR EACH ROW EXECUTE FUNCTION touch_message_delivery_attempt_updated_at();
 
 CREATE TRIGGER trigger_notify_new_message AFTER INSERT ON messages FOR EACH ROW EXECUTE FUNCTION notify_new_message_trigger();
 
