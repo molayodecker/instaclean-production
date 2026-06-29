@@ -5926,6 +5926,16 @@ CREATE OR REPLACE FUNCTION "public"."get_booking_payment_snapshot"("p_booking_id
   FROM public.bookings b
   WHERE b.id = p_booking_id
     AND b.customer_id = auth.uid()
+    AND (
+      b.subscription_id IS NOT NULL
+      OR (
+        NOT (b.cleaner_id IS NULL AND b.cleaner_assigned_at IS NOT NULL)
+        AND NOT (
+          b.cleaner_hold_expires_at IS NOT NULL
+          AND b.cleaner_hold_expires_at < now()
+        )
+      )
+    )
   LIMIT 1;
 $$;
 
@@ -6847,6 +6857,18 @@ BEGIN
 
   IF lower(COALESCE(v_row.payment_status, '')) NOT IN ('pending', 'failed') THEN
     RETURN;
+  END IF;
+
+  -- One-off bookings: require a live cleaner hold before exposing a payable snapshot.
+  IF v_row.subscription_id IS NULL THEN
+    IF v_row.cleaner_id IS NULL AND v_row.cleaner_assigned_at IS NOT NULL THEN
+      RETURN;
+    END IF;
+
+    IF v_row.cleaner_hold_expires_at IS NOT NULL
+       AND v_row.cleaner_hold_expires_at < now() THEN
+      RETURN;
+    END IF;
   END IF;
 
   IF v_row.subscription_id IS NOT NULL THEN
