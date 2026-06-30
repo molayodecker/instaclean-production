@@ -2927,7 +2927,7 @@ $$;
 ALTER FUNCTION "public"."complete_subscription_paystack_plan"("p_subscription_id" "uuid", "p_customer_id" "uuid", "p_generation_token" "uuid", "p_plan_code" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."compute_booking_pricing"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_recurrence_interval" "text" DEFAULT NULL::"text", "p_is_recurring" boolean DEFAULT false, "p_include_booking_cover" boolean DEFAULT true, "p_supplies_option" "text" DEFAULT 'customer_provided'::"text", "p_cleaner_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("pricing_version" "text", "currency" "text", "work_rate_ghs_per_hour" numeric, "duration_hours" numeric, "subtotal_labor_major" numeric, "platform_fee_major" numeric, "booking_cover_major" numeric, "supplies_option" "text", "supplies_allowance_minor" integer, "core_amount_minor" integer, "same_day_surcharge_bps" integer, "weekend_surcharge_bps" integer, "recurring_weekly_discount_bps" integer, "recurring_monthly_discount_bps" integer, "same_day_surcharge_minor" integer, "weekend_surcharge_minor" integer, "recurring_discount_minor" integer, "final_amount_minor" integer, "recurring_amount_minor" integer, "first_charge_amount_minor" integer, "discount_rate_bps" integer, "is_same_day" boolean, "is_weekend" boolean, "minimum_duration_hours" numeric, "cleaner_earnings_minor" integer)
+CREATE OR REPLACE FUNCTION "public"."compute_booking_pricing"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_recurrence_interval" "text" DEFAULT NULL::"text", "p_is_recurring" boolean DEFAULT false, "p_include_booking_cover" boolean DEFAULT true, "p_supplies_option" "text" DEFAULT 'customer_provided'::"text", "p_cleaner_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("pricing_version" "text", "currency" "text", "work_rate_ghs_per_hour" numeric, "duration_hours" numeric, "subtotal_labor_major" numeric, "platform_fee_major" numeric, "booking_cover_major" numeric, "supplies_option" "text", "supplies_allowance_minor" integer, "core_amount_minor" integer, "same_day_surcharge_bps" integer, "weekend_surcharge_bps" integer, "recurring_weekly_discount_bps" integer, "recurring_monthly_discount_bps" integer, "same_day_surcharge_minor" integer, "weekend_surcharge_minor" integer, "recurring_discount_minor" integer, "final_amount_minor" integer, "recurring_amount_minor" integer, "first_charge_amount_minor" integer, "discount_rate_bps" integer, "is_same_day" boolean, "is_weekend" boolean, "minimum_duration_hours" numeric, "cleaner_earnings_minor" integer, "catalog_discount_pct" numeric, "catalog_discount_minor" integer)
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
@@ -2978,6 +2978,8 @@ DECLARE
   v_first_charge_minor integer;
   v_recurring_discount_minor integer;
   v_cleaner_earnings_minor integer;
+  v_rate_before_discount numeric;
+  v_catalog_discount_minor integer := 0;
 BEGIN
   IF p_duration_hours_raw IS NULL OR p_duration_hours_raw <> p_duration_hours_raw THEN
     RAISE EXCEPTION 'Invalid duration';
@@ -3049,22 +3051,30 @@ BEGIN
     v_using_cleaner_rate := true;
   END IF;
 
-  -- Catalog discount applies only when using service_types.price (no cleaner selected).
-  IF NOT v_using_cleaner_rate THEN
-    SELECT d.amount
-    INTO v_discount_pct
-    FROM public.discounts d
-    WHERE d.active = true
-      AND d.service_type_id = p_service_id
-      AND d.valid_from <= now()
-      AND d.valid_to >= now()
-    ORDER BY d.id DESC
-    LIMIT 1;
+  v_rate_before_discount := v_rate;
+  v_discount_pct := NULL;
 
-    IF FOUND AND v_discount_pct IS NOT NULL THEN
-      v_discount_pct := greatest(0, least(100, v_discount_pct));
-      v_rate := round((v_rate * (1 - v_discount_pct / 100.0))::numeric, 2);
-    END IF;
+  SELECT d.amount
+  INTO v_discount_pct
+  FROM public.discounts d
+  WHERE d.active = true
+    AND d.service_type_id = p_service_id
+    AND d.valid_from IS NOT NULL
+    AND d.valid_to IS NOT NULL
+    AND d.valid_from <= CURRENT_DATE
+    AND d.valid_to >= CURRENT_DATE
+  ORDER BY d.id DESC
+  LIMIT 1;
+
+  IF FOUND AND v_discount_pct IS NOT NULL THEN
+    v_discount_pct := greatest(0, least(100, v_discount_pct));
+    v_rate := round((v_rate * (1 - v_discount_pct / 100.0))::numeric, 2);
+    v_catalog_discount_minor := round(
+      greatest(0, (v_rate_before_discount - v_rate) * v_duration_hours * 100)
+    )::integer;
+  ELSE
+    v_discount_pct := NULL;
+    v_catalog_discount_minor := 0;
   END IF;
 
   SELECT
@@ -3249,7 +3259,9 @@ BEGIN
     v_is_same_day,
     v_is_weekend,
     v_min_duration_hours,
-    v_cleaner_earnings_minor;
+    v_cleaner_earnings_minor,
+    v_discount_pct,
+    v_catalog_discount_minor;
 END;
 $$;
 
@@ -3257,7 +3269,7 @@ $$;
 ALTER FUNCTION "public"."compute_booking_pricing"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_recurrence_interval" "text", "p_is_recurring" boolean, "p_include_booking_cover" boolean, "p_supplies_option" "text", "p_cleaner_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."compute_booking_pricing_with_promotion"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_cleaner_id" "uuid" DEFAULT NULL::"uuid", "p_channel" "text" DEFAULT NULL::"text", "p_recurrence_interval" "text" DEFAULT NULL::"text", "p_is_recurring" boolean DEFAULT false, "p_include_booking_cover" boolean DEFAULT true, "p_supplies_option" "text" DEFAULT 'customer_provided'::"text", "p_customer_id" "uuid" DEFAULT NULL::"uuid", "p_promotion_slug" "text" DEFAULT NULL::"text", "p_lat" double precision DEFAULT NULL::double precision, "p_lng" double precision DEFAULT NULL::double precision, "p_extra_task_ids" "text"[] DEFAULT NULL::"text"[], "p_booking_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("pricing_version" "text", "currency" "text", "work_rate_ghs_per_hour" numeric, "duration_hours" numeric, "subtotal_labor_major" numeric, "platform_fee_major" numeric, "booking_cover_major" numeric, "supplies_option" "text", "supplies_allowance_minor" integer, "core_amount_minor" integer, "same_day_surcharge_bps" integer, "weekend_surcharge_bps" integer, "recurring_weekly_discount_bps" integer, "recurring_monthly_discount_bps" integer, "same_day_surcharge_minor" integer, "weekend_surcharge_minor" integer, "recurring_discount_minor" integer, "final_amount_minor" integer, "recurring_amount_minor" integer, "first_charge_amount_minor" integer, "discount_rate_bps" integer, "is_same_day" boolean, "is_weekend" boolean, "minimum_duration_hours" numeric, "cleaner_earnings_minor" integer, "promotion_id" "uuid", "promotion_slug" "text", "promotion_discount_minor" integer)
+CREATE OR REPLACE FUNCTION "public"."compute_booking_pricing_with_promotion"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_cleaner_id" "uuid" DEFAULT NULL::"uuid", "p_channel" "text" DEFAULT NULL::"text", "p_recurrence_interval" "text" DEFAULT NULL::"text", "p_is_recurring" boolean DEFAULT false, "p_include_booking_cover" boolean DEFAULT true, "p_supplies_option" "text" DEFAULT 'customer_provided'::"text", "p_customer_id" "uuid" DEFAULT NULL::"uuid", "p_promotion_slug" "text" DEFAULT NULL::"text", "p_lat" double precision DEFAULT NULL::double precision, "p_lng" double precision DEFAULT NULL::double precision, "p_extra_task_ids" "text"[] DEFAULT NULL::"text"[], "p_booking_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("pricing_version" "text", "currency" "text", "work_rate_ghs_per_hour" numeric, "duration_hours" numeric, "subtotal_labor_major" numeric, "platform_fee_major" numeric, "booking_cover_major" numeric, "supplies_option" "text", "supplies_allowance_minor" integer, "core_amount_minor" integer, "same_day_surcharge_bps" integer, "weekend_surcharge_bps" integer, "recurring_weekly_discount_bps" integer, "recurring_monthly_discount_bps" integer, "same_day_surcharge_minor" integer, "weekend_surcharge_minor" integer, "recurring_discount_minor" integer, "final_amount_minor" integer, "recurring_amount_minor" integer, "first_charge_amount_minor" integer, "discount_rate_bps" integer, "is_same_day" boolean, "is_weekend" boolean, "minimum_duration_hours" numeric, "cleaner_earnings_minor" integer, "catalog_discount_pct" numeric, "catalog_discount_minor" integer, "promotion_id" "uuid", "promotion_slug" "text", "promotion_discount_minor" integer)
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
@@ -3305,6 +3317,7 @@ BEGIN
       v_base.first_charge_amount_minor, v_base.discount_rate_bps,
       v_base.is_same_day, v_base.is_weekend, v_base.minimum_duration_hours,
       v_base.cleaner_earnings_minor,
+      v_base.catalog_discount_pct, v_base.catalog_discount_minor,
       NULL::uuid, NULL::text, 0;
     RETURN;
   END IF;
@@ -3330,6 +3343,7 @@ BEGIN
       v_base.first_charge_amount_minor, v_base.discount_rate_bps,
       v_base.is_same_day, v_base.is_weekend, v_base.minimum_duration_hours,
       v_base.cleaner_earnings_minor,
+      v_base.catalog_discount_pct, v_base.catalog_discount_minor,
       NULL::uuid, NULL::text, 0;
     RETURN;
   END IF;
@@ -3359,6 +3373,7 @@ BEGIN
       v_base.first_charge_amount_minor, v_base.discount_rate_bps,
       v_base.is_same_day, v_base.is_weekend, v_base.minimum_duration_hours,
       v_base.cleaner_earnings_minor,
+      v_base.catalog_discount_pct, v_base.catalog_discount_minor,
       NULL::uuid, NULL::text, 0;
     RETURN;
   END IF;
@@ -3380,6 +3395,7 @@ BEGIN
       v_base.first_charge_amount_minor, v_base.discount_rate_bps,
       v_base.is_same_day, v_base.is_weekend, v_base.minimum_duration_hours,
       v_base.cleaner_earnings_minor,
+      v_base.catalog_discount_pct, v_base.catalog_discount_minor,
       NULL::uuid, NULL::text, 0;
     RETURN;
   END IF;
@@ -3414,6 +3430,7 @@ BEGIN
     v_final, v_base.recurring_amount_minor, v_base.first_charge_amount_minor,
     v_base.discount_rate_bps, v_base.is_same_day, v_base.is_weekend, v_base.minimum_duration_hours,
     v_cleaner_earnings_minor,
+    v_base.catalog_discount_pct, v_base.catalog_discount_minor,
     v_promo.id, v_promo.slug, v_discount;
 END;
 $$;
@@ -14072,11 +14089,27 @@ CREATE TABLE IF NOT EXISTS "public"."service_categories" (
     "name" "text" NOT NULL,
     "icon" "text",
     "default_discount" integer,
-    "slug" "text"
+    "slug" "text",
+    "icon_scale" numeric,
+    "description" "text",
+    "image_url" "text",
+    CONSTRAINT "service_categories_icon_scale_range" CHECK ((("icon_scale" IS NULL) OR (("icon_scale" >= 0.75) AND ("icon_scale" <= 1.5))))
 );
 
 
 ALTER TABLE "public"."service_categories" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."service_categories"."icon_scale" IS 'Optional icon scale multiplier for category rows. NULL inherits from linked service_types.';
+
+
+
+COMMENT ON COLUMN "public"."service_categories"."description" IS 'Short marketing blurb for category rows (Book Now picker). NULL inherits from linked service_types.';
+
+
+
+COMMENT ON COLUMN "public"."service_categories"."image_url" IS 'Remote icon URL for category rows (Book Now picker, services grid). Not inherited from service_types.';
+
 
 
 CREATE SEQUENCE IF NOT EXISTS "public"."service_categories_id_seq"
@@ -14131,7 +14164,10 @@ CREATE TABLE IF NOT EXISTS "public"."service_types" (
     "minimum_duration_hours" numeric DEFAULT 2 NOT NULL,
     "maximum_duration_hours" numeric DEFAULT 10 NOT NULL,
     "duration_increment_hours" numeric DEFAULT 0.5 NOT NULL,
+    "icon_scale" numeric DEFAULT 1.0 NOT NULL,
+    "description" "text",
     CONSTRAINT "service_types_duration_increment_hours_check" CHECK ((("duration_increment_hours" >= 0.5) AND ("mod"("duration_increment_hours", 0.5) = (0)::numeric))),
+    CONSTRAINT "service_types_icon_scale_range" CHECK ((("icon_scale" >= 0.75) AND ("icon_scale" <= 1.5))),
     CONSTRAINT "service_types_maximum_duration_hours_check" CHECK (("maximum_duration_hours" >= "minimum_duration_hours")),
     CONSTRAINT "service_types_maximum_duration_step_check" CHECK (("mod"("maximum_duration_hours", 0.5) = (0)::numeric)),
     CONSTRAINT "service_types_minimum_duration_hours_check" CHECK (("minimum_duration_hours" >= 0.5)),
@@ -14156,6 +14192,14 @@ COMMENT ON COLUMN "public"."service_types"."maximum_duration_hours" IS 'Maximum 
 
 
 COMMENT ON COLUMN "public"."service_types"."duration_increment_hours" IS 'Billable duration rounding increment in hours (e.g. 0.5 for half-hour steps).';
+
+
+
+COMMENT ON COLUMN "public"."service_types"."icon_scale" IS 'Icon scale multiplier for service type icons (1.0 = default for the screen context).';
+
+
+
+COMMENT ON COLUMN "public"."service_types"."description" IS 'Short marketing description for service type list and intro screens.';
 
 
 
@@ -18943,6 +18987,7 @@ GRANT ALL ON FUNCTION "public"."complete_subscription_paystack_plan"("p_subscrip
 
 
 
+REVOKE ALL ON FUNCTION "public"."compute_booking_pricing"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_recurrence_interval" "text", "p_is_recurring" boolean, "p_include_booking_cover" boolean, "p_supplies_option" "text", "p_cleaner_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."compute_booking_pricing"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_recurrence_interval" "text", "p_is_recurring" boolean, "p_include_booking_cover" boolean, "p_supplies_option" "text", "p_cleaner_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."compute_booking_pricing"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_recurrence_interval" "text", "p_is_recurring" boolean, "p_include_booking_cover" boolean, "p_supplies_option" "text", "p_cleaner_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."compute_booking_pricing"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_recurrence_interval" "text", "p_is_recurring" boolean, "p_include_booking_cover" boolean, "p_supplies_option" "text", "p_cleaner_id" "uuid") TO "service_role";

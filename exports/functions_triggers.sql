@@ -3386,7 +3386,7 @@ $function$
 
 
 CREATE OR REPLACE FUNCTION public.compute_booking_pricing(p_service_id integer, p_duration_hours_raw numeric, p_scheduled_date date, p_service_timezone text, p_recurrence_interval text DEFAULT NULL::text, p_is_recurring boolean DEFAULT false, p_include_booking_cover boolean DEFAULT true, p_supplies_option text DEFAULT 'customer_provided'::text, p_cleaner_id uuid DEFAULT NULL::uuid)
- RETURNS TABLE(pricing_version text, currency text, work_rate_ghs_per_hour numeric, duration_hours numeric, subtotal_labor_major numeric, platform_fee_major numeric, booking_cover_major numeric, supplies_option text, supplies_allowance_minor integer, core_amount_minor integer, same_day_surcharge_bps integer, weekend_surcharge_bps integer, recurring_weekly_discount_bps integer, recurring_monthly_discount_bps integer, same_day_surcharge_minor integer, weekend_surcharge_minor integer, recurring_discount_minor integer, final_amount_minor integer, recurring_amount_minor integer, first_charge_amount_minor integer, discount_rate_bps integer, is_same_day boolean, is_weekend boolean, minimum_duration_hours numeric, cleaner_earnings_minor integer)
+ RETURNS TABLE(pricing_version text, currency text, work_rate_ghs_per_hour numeric, duration_hours numeric, subtotal_labor_major numeric, platform_fee_major numeric, booking_cover_major numeric, supplies_option text, supplies_allowance_minor integer, core_amount_minor integer, same_day_surcharge_bps integer, weekend_surcharge_bps integer, recurring_weekly_discount_bps integer, recurring_monthly_discount_bps integer, same_day_surcharge_minor integer, weekend_surcharge_minor integer, recurring_discount_minor integer, final_amount_minor integer, recurring_amount_minor integer, first_charge_amount_minor integer, discount_rate_bps integer, is_same_day boolean, is_weekend boolean, minimum_duration_hours numeric, cleaner_earnings_minor integer, catalog_discount_pct numeric, catalog_discount_minor integer)
  LANGUAGE plpgsql
  STABLE SECURITY DEFINER
  SET search_path TO 'public'
@@ -3438,6 +3438,8 @@ DECLARE
   v_first_charge_minor integer;
   v_recurring_discount_minor integer;
   v_cleaner_earnings_minor integer;
+  v_rate_before_discount numeric;
+  v_catalog_discount_minor integer := 0;
 BEGIN
   IF p_duration_hours_raw IS NULL OR p_duration_hours_raw <> p_duration_hours_raw THEN
     RAISE EXCEPTION 'Invalid duration';
@@ -3509,22 +3511,30 @@ BEGIN
     v_using_cleaner_rate := true;
   END IF;
 
-  -- Catalog discount applies only when using service_types.price (no cleaner selected).
-  IF NOT v_using_cleaner_rate THEN
-    SELECT d.amount
-    INTO v_discount_pct
-    FROM public.discounts d
-    WHERE d.active = true
-      AND d.service_type_id = p_service_id
-      AND d.valid_from <= now()
-      AND d.valid_to >= now()
-    ORDER BY d.id DESC
-    LIMIT 1;
+  v_rate_before_discount := v_rate;
+  v_discount_pct := NULL;
 
-    IF FOUND AND v_discount_pct IS NOT NULL THEN
-      v_discount_pct := greatest(0, least(100, v_discount_pct));
-      v_rate := round((v_rate * (1 - v_discount_pct / 100.0))::numeric, 2);
-    END IF;
+  SELECT d.amount
+  INTO v_discount_pct
+  FROM public.discounts d
+  WHERE d.active = true
+    AND d.service_type_id = p_service_id
+    AND d.valid_from IS NOT NULL
+    AND d.valid_to IS NOT NULL
+    AND d.valid_from <= CURRENT_DATE
+    AND d.valid_to >= CURRENT_DATE
+  ORDER BY d.id DESC
+  LIMIT 1;
+
+  IF FOUND AND v_discount_pct IS NOT NULL THEN
+    v_discount_pct := greatest(0, least(100, v_discount_pct));
+    v_rate := round((v_rate * (1 - v_discount_pct / 100.0))::numeric, 2);
+    v_catalog_discount_minor := round(
+      greatest(0, (v_rate_before_discount - v_rate) * v_duration_hours * 100)
+    )::integer;
+  ELSE
+    v_discount_pct := NULL;
+    v_catalog_discount_minor := 0;
   END IF;
 
   SELECT
@@ -3709,13 +3719,15 @@ BEGIN
     v_is_same_day,
     v_is_weekend,
     v_min_duration_hours,
-    v_cleaner_earnings_minor;
+    v_cleaner_earnings_minor,
+    v_discount_pct,
+    v_catalog_discount_minor;
 END;
 $function$
 
 
 CREATE OR REPLACE FUNCTION public.compute_booking_pricing_with_promotion(p_service_id integer, p_duration_hours_raw numeric, p_scheduled_date date, p_service_timezone text, p_cleaner_id uuid DEFAULT NULL::uuid, p_channel text DEFAULT NULL::text, p_recurrence_interval text DEFAULT NULL::text, p_is_recurring boolean DEFAULT false, p_include_booking_cover boolean DEFAULT true, p_supplies_option text DEFAULT 'customer_provided'::text, p_customer_id uuid DEFAULT NULL::uuid, p_promotion_slug text DEFAULT NULL::text, p_lat double precision DEFAULT NULL::double precision, p_lng double precision DEFAULT NULL::double precision, p_extra_task_ids text[] DEFAULT NULL::text[], p_booking_id uuid DEFAULT NULL::uuid)
- RETURNS TABLE(pricing_version text, currency text, work_rate_ghs_per_hour numeric, duration_hours numeric, subtotal_labor_major numeric, platform_fee_major numeric, booking_cover_major numeric, supplies_option text, supplies_allowance_minor integer, core_amount_minor integer, same_day_surcharge_bps integer, weekend_surcharge_bps integer, recurring_weekly_discount_bps integer, recurring_monthly_discount_bps integer, same_day_surcharge_minor integer, weekend_surcharge_minor integer, recurring_discount_minor integer, final_amount_minor integer, recurring_amount_minor integer, first_charge_amount_minor integer, discount_rate_bps integer, is_same_day boolean, is_weekend boolean, minimum_duration_hours numeric, cleaner_earnings_minor integer, promotion_id uuid, promotion_slug text, promotion_discount_minor integer)
+ RETURNS TABLE(pricing_version text, currency text, work_rate_ghs_per_hour numeric, duration_hours numeric, subtotal_labor_major numeric, platform_fee_major numeric, booking_cover_major numeric, supplies_option text, supplies_allowance_minor integer, core_amount_minor integer, same_day_surcharge_bps integer, weekend_surcharge_bps integer, recurring_weekly_discount_bps integer, recurring_monthly_discount_bps integer, same_day_surcharge_minor integer, weekend_surcharge_minor integer, recurring_discount_minor integer, final_amount_minor integer, recurring_amount_minor integer, first_charge_amount_minor integer, discount_rate_bps integer, is_same_day boolean, is_weekend boolean, minimum_duration_hours numeric, cleaner_earnings_minor integer, catalog_discount_pct numeric, catalog_discount_minor integer, promotion_id uuid, promotion_slug text, promotion_discount_minor integer)
  LANGUAGE plpgsql
  STABLE SECURITY DEFINER
  SET search_path TO 'public'
@@ -3764,6 +3776,7 @@ BEGIN
       v_base.first_charge_amount_minor, v_base.discount_rate_bps,
       v_base.is_same_day, v_base.is_weekend, v_base.minimum_duration_hours,
       v_base.cleaner_earnings_minor,
+      v_base.catalog_discount_pct, v_base.catalog_discount_minor,
       NULL::uuid, NULL::text, 0;
     RETURN;
   END IF;
@@ -3789,6 +3802,7 @@ BEGIN
       v_base.first_charge_amount_minor, v_base.discount_rate_bps,
       v_base.is_same_day, v_base.is_weekend, v_base.minimum_duration_hours,
       v_base.cleaner_earnings_minor,
+      v_base.catalog_discount_pct, v_base.catalog_discount_minor,
       NULL::uuid, NULL::text, 0;
     RETURN;
   END IF;
@@ -3818,6 +3832,7 @@ BEGIN
       v_base.first_charge_amount_minor, v_base.discount_rate_bps,
       v_base.is_same_day, v_base.is_weekend, v_base.minimum_duration_hours,
       v_base.cleaner_earnings_minor,
+      v_base.catalog_discount_pct, v_base.catalog_discount_minor,
       NULL::uuid, NULL::text, 0;
     RETURN;
   END IF;
@@ -3839,6 +3854,7 @@ BEGIN
       v_base.first_charge_amount_minor, v_base.discount_rate_bps,
       v_base.is_same_day, v_base.is_weekend, v_base.minimum_duration_hours,
       v_base.cleaner_earnings_minor,
+      v_base.catalog_discount_pct, v_base.catalog_discount_minor,
       NULL::uuid, NULL::text, 0;
     RETURN;
   END IF;
@@ -3873,6 +3889,7 @@ BEGIN
     v_final, v_base.recurring_amount_minor, v_base.first_charge_amount_minor,
     v_base.discount_rate_bps, v_base.is_same_day, v_base.is_weekend, v_base.minimum_duration_hours,
     v_cleaner_earnings_minor,
+    v_base.catalog_discount_pct, v_base.catalog_discount_minor,
     v_promo.id, v_promo.slug, v_discount;
 END;
 $function$
