@@ -11791,14 +11791,34 @@ BEGIN
     DELETE FROM public.profiles WHERE id = p_secondary;
   END IF;
 
-  -- Contact fields on primary public.users mirror
-  UPDATE public.users p SET
-    email = COALESCE(p.email, s.email),
-    phone = COALESCE(p.phone, s.phone),
+  -- Contact fields on primary public.users mirror.
+  -- Release secondary unique email/phone before copy (split email+phone accounts).
+  IF NULLIF(trim(v_primary.email), '') IS NULL
+     AND NULLIF(trim(v_secondary.email), '') IS NOT NULL THEN
+    UPDATE public.users
+    SET
+      email = 'merge-temp-' || id::text || '@phone.tryinstaclean.local',
+      updated_at = now(),
+      last_updated = now()
+    WHERE id = p_secondary;
+  END IF;
+
+  IF v_primary.phone IS NULL AND v_secondary.phone IS NOT NULL THEN
+    UPDATE public.users
+    SET
+      phone = NULL,
+      updated_at = now(),
+      last_updated = now()
+    WHERE id = p_secondary;
+  END IF;
+
+  UPDATE public.users
+  SET
+    email = COALESCE(NULLIF(trim(email), ''), NULLIF(trim(v_secondary.email), '')),
+    phone = COALESCE(phone, v_secondary.phone),
     updated_at = now(),
     last_updated = now()
-  FROM public.users s
-  WHERE p.id = p_primary AND s.id = p_secondary;
+  WHERE id = p_primary;
 
   DELETE FROM public.users WHERE id = p_secondary;
 
