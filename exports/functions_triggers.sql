@@ -1300,6 +1300,27 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.admin_cash_payout_recorder_is_allowed(p_user_id uuid)
+ RETURNS boolean
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+  SELECT
+    p_user_id IS NOT NULL
+    AND EXISTS (SELECT 1 FROM public.users u WHERE u.id = p_user_id)
+    AND (
+      public.is_admin(p_user_id)
+      OR EXISTS (
+        SELECT 1
+        FROM public.reviewer_permissions rp
+        WHERE rp.user_id = p_user_id
+          AND rp.permission_key = 'payout_logs'
+      )
+    );
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.admin_soft_delete_user(p_user_id uuid, p_reason text DEFAULT 'Deleted by admin'::text)
  RETURNS void
  LANGUAGE plpgsql
@@ -15237,6 +15258,165 @@ BEGIN
   UPDATE public.cleaner_data
   SET rating = v_new_rating, review_count = v_review_count
   WHERE user_id = p_cleaner_id;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.record_admin_cash_payout(p_cleaner_id uuid, p_amount_subunit integer, p_recorded_by uuid, p_booking_id uuid DEFAULT NULL::uuid, p_notes text DEFAULT NULL::text)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+DECLARE
+  v_wallet_id uuid;
+  v_balance integer;
+  v_booking public.bookings%ROWTYPE;
+  v_max_earnings integer;
+  v_tx_id uuid;
+  v_payout_id uuid;
+  v_description text;
+  v_currency character varying(3);
+BEGIN
+  IF p_cleaner_id IS NULL OR p_recorded_by IS NULL THEN
+    RAISE EXCEPTION 'missing_required_fields';
+  END IF;
+
+  IF NOT EXISTS (SELECT 1 FROM public.users u WHERE u.id = p_recorded_by) THEN
+    RAISE EXCEPTION 'recorded_by_not_found';
+  END IF;
+
+  IF NOT public.admin_cash_payout_recorder_is_allowed(p_recorded_by) THEN
+    RAISE EXCEPTION 'recorded_by_not_authorized';
+  END IF;
+
+  IF p_amount_subunit IS NULL OR p_amount_subunit <= 0 THEN
+    RAISE EXCEPTION 'invalid_amount';
+  END IF;
+
+  IF p_booking_id IS NOT NULL THEN
+    SELECT * INTO v_booking
+    FROM public.bookings
+    WHERE id = p_booking_id
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'booking_not_found';
+    END IF;
+
+    IF EXISTS (
+      SELECT 1
+      FROM public.admin_cash_payouts acp
+      WHERE acp.booking_id = p_booking_id
+    ) THEN
+      RAISE EXCEPTION 'cash_payout_already_recorded';
+    END IF;
+
+    IF v_booking.cleaner_id IS DISTINCT FROM p_cleaner_id THEN
+      RAISE EXCEPTION 'booking_cleaner_mismatch';
+    END IF;
+
+    IF v_booking.status IS DISTINCT FROM 'completed' THEN
+      RAISE EXCEPTION 'booking_not_completed';
+    END IF;
+
+    IF lower(coalesce(v_booking.payment_status::text, '')) <> 'paid' THEN
+      RAISE EXCEPTION 'booking_not_paid';
+    END IF;
+
+    v_max_earnings := COALESCE(
+      NULLIF(v_booking.cleaner_earnings_minor, 0),
+      public.cleaner_earnings_subunit_from_booking(
+        v_booking.final_amount_minor,
+        v_booking.total_price,
+        v_booking.platform_fee,
+        v_booking.booking_cover,
+        v_booking.booking_cover_amount,
+        v_booking.core_amount_minor
+      )
+    );
+
+    IF COALESCE(v_max_earnings, 0) <= 0 THEN
+      RAISE EXCEPTION 'booking_has_no_cleaner_earnings';
+    END IF;
+
+    IF p_amount_subunit > v_max_earnings THEN
+      RAISE EXCEPTION 'amount_exceeds_booking_earnings';
+    END IF;
+  END IF;
+
+  SELECT w.id, COALESCE(w.balance_subunit, 0), COALESCE(w.currency, 'GHS')
+  INTO v_wallet_id, v_balance, v_currency
+  FROM public.wallets w
+  WHERE w.user_id = p_cleaner_id
+  FOR UPDATE;
+
+  IF v_wallet_id IS NULL THEN
+    RAISE EXCEPTION 'wallet_not_found';
+  END IF;
+
+  IF v_currency IS DISTINCT FROM 'GHS' THEN
+    RAISE EXCEPTION 'unsupported_currency';
+  END IF;
+
+  IF v_balance < p_amount_subunit THEN
+    RAISE EXCEPTION 'insufficient_balance';
+  END IF;
+
+  UPDATE public.wallets
+  SET
+    balance_subunit = v_balance - p_amount_subunit,
+    updated_at = NOW()
+  WHERE id = v_wallet_id;
+
+  v_description := 'Admin cash payout';
+  IF p_booking_id IS NOT NULL THEN
+    v_description := v_description || ' (Booking ' || left(p_booking_id::text, 8) || ')';
+  END IF;
+  IF p_notes IS NOT NULL AND length(trim(p_notes)) > 0 THEN
+    v_description := v_description || ' — ' || left(trim(p_notes), 120);
+  END IF;
+
+  INSERT INTO public.wallet_transactions (
+    wallet_id,
+    booking_id,
+    amount_subunit,
+    type,
+    description
+  ) VALUES (
+    v_wallet_id,
+    p_booking_id,
+    p_amount_subunit,
+    'debit',
+    v_description
+  )
+  RETURNING id INTO v_tx_id;
+
+  INSERT INTO public.admin_cash_payouts (
+    cleaner_id,
+    booking_id,
+    amount_subunit,
+    currency,
+    notes,
+    recorded_by,
+    wallet_transaction_id
+  ) VALUES (
+    p_cleaner_id,
+    p_booking_id,
+    p_amount_subunit,
+    v_currency,
+    NULLIF(trim(p_notes), ''),
+    p_recorded_by,
+    v_tx_id
+  )
+  RETURNING id INTO v_payout_id;
+
+  RETURN jsonb_build_object(
+    'payout_id', v_payout_id,
+    'wallet_transaction_id', v_tx_id,
+    'new_balance_subunit', v_balance - p_amount_subunit,
+    'amount_subunit', p_amount_subunit
+  );
 END;
 $function$
 
