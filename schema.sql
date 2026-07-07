@@ -139,7 +139,8 @@ CREATE TYPE "public"."notification_type" AS ENUM (
     'direct_assignment_offer',
     'direct_assignment_reminder',
     'cleaner_assignment_broadcast',
-    'cleaner_accepted_assignment'
+    'cleaner_accepted_assignment',
+    'booking_rescheduled'
 );
 
 
@@ -1993,10 +1994,19 @@ COMMENT ON FUNCTION "public"."booking_service_end_at"("p_scheduled_at_utc" times
 
 CREATE OR REPLACE FUNCTION "public"."bookings_guard_payment_status"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
-    SET "search_path" TO 'public'
+    SET "search_path" TO 'public', 'pg_temp'
     AS $$
 BEGIN
   IF OLD.payment_status IS NOT DISTINCT FROM NEW.payment_status THEN
+    RETURN NEW;
+  END IF;
+
+  -- Used only by confirm_zero_amount_booking() to mark paid for promo-covered zero totals.
+  IF coalesce(nullif(current_setting('app.confirm_zero_amount', true), ''), '') = '1' THEN
+    RETURN NEW;
+  END IF;
+
+  IF auth.role() = 'service_role' THEN
     RETURN NEW;
   END IF;
 
@@ -4685,6 +4695,122 @@ COMMENT ON FUNCTION "public"."compute_next_recurrence_date"("p_current_date" "da
 
 
 
+CREATE OR REPLACE FUNCTION "public"."confirm_zero_amount_booking"("p_booking_id" "uuid") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_row public.bookings%ROWTYPE;
+  v_amount integer;
+  v_req jsonb;
+  v_ref text;
+  v_promo jsonb;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  IF p_booking_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'missing_booking_id');
+  END IF;
+
+  SELECT *
+  INTO v_row
+  FROM public.bookings
+  WHERE id = p_booking_id
+    AND customer_id = v_uid
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'booking_not_found');
+  END IF;
+
+  IF lower(COALESCE(v_row.payment_status, '')) = 'paid' THEN
+    RETURN jsonb_build_object(
+      'success', true,
+      'already_paid', true,
+      'booking_id', p_booking_id,
+      'reference', v_row.reference
+    );
+  END IF;
+
+  IF v_row.status IS DISTINCT FROM 'pending'::public.booking_status
+     AND v_row.status IS DISTINCT FROM 'confirmed'::public.booking_status THEN
+    RETURN jsonb_build_object('success', false, 'error', 'booking_not_payable');
+  END IF;
+
+  IF lower(COALESCE(v_row.payment_status, '')) NOT IN ('pending', 'failed') THEN
+    RETURN jsonb_build_object('success', false, 'error', 'booking_not_payable');
+  END IF;
+
+  IF v_row.subscription_id IS NULL THEN
+    IF v_row.cleaner_id IS NULL AND v_row.cleaner_assigned_at IS NOT NULL THEN
+      RETURN jsonb_build_object('success', false, 'error', 'cleaner_hold_released');
+    END IF;
+
+    IF v_row.cleaner_hold_expires_at IS NOT NULL
+       AND v_row.cleaner_hold_expires_at < now() THEN
+      RETURN jsonb_build_object('success', false, 'error', 'cleaner_hold_expired');
+    END IF;
+  END IF;
+
+  v_amount := public.booking_final_amount_minor(v_row.final_amount_minor, v_row.total_price);
+  IF v_amount <> 0 THEN
+    RETURN jsonb_build_object('success', false, 'error', 'booking_has_payable_amount');
+  END IF;
+
+  IF v_row.promotion_id IS NULL OR COALESCE(v_row.promotion_discount_minor, 0) <= 0 THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_promo_zero_amount');
+  END IF;
+
+  v_req := public.customer_risk_booking_verification_requirement_core(v_uid, p_booking_id);
+  IF COALESCE((v_req->>'can_proceed_to_payment')::boolean, false) IS NOT TRUE THEN
+    RETURN jsonb_build_object('success', false, 'error', 'verification_required');
+  END IF;
+
+  v_ref := 'PROMO-' || replace(p_booking_id::text, '-', '');
+
+  PERFORM set_config('app.confirm_zero_amount', '1', true);
+
+  UPDATE public.bookings
+  SET
+    payment_status = 'paid',
+    payment_method = 'promotion',
+    status = 'confirmed',
+    reference = COALESCE(NULLIF(btrim(reference), ''), v_ref),
+    cleaner_hold_expires_at = NULL,
+    updated_at = now()
+  WHERE id = p_booking_id
+    AND customer_id = v_uid
+  RETURNING reference INTO v_ref;
+
+  PERFORM set_config('app.confirm_zero_amount', '', true);
+
+  v_promo := public.finalize_promotion_redemption(p_booking_id);
+  IF COALESCE(v_promo->>'success', 'false') <> 'true' THEN
+    RAISE EXCEPTION 'promotion_finalize_failed'
+      USING ERRCODE = 'P0001';
+  END IF;
+
+  PERFORM public.broadcast_unassigned_paid_bookings();
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'booking_id', p_booking_id,
+    'reference', v_ref
+  );
+EXCEPTION
+  WHEN OTHERS THEN
+    PERFORM set_config('app.confirm_zero_amount', '', true);
+    RAISE;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."confirm_zero_amount_booking"("p_booking_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."count_unread_messages_for_user"("p_user_id" "uuid") RETURNS integer
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -6468,8 +6594,9 @@ BEGIN
     FROM public.bookings b
     WHERE b.id = p_exclude_booking_id
       AND b.customer_id = p_customer_id
-      AND b.status IN ('pending', 'confirmed')
-      AND COALESCE(b.payment_status, 'pending') NOT IN ('paid', 'success')
+      AND b.subscription_id IS NULL
+      AND b.status IN ('pending', 'confirmed', 'scheduled')
+      AND lower(coalesce(b.payment_status::text, 'pending')) IN ('pending', 'paid', 'success')
     LIMIT 1;
 
     IF v_safe_exclude_booking_id IS NULL THEN
@@ -6632,7 +6759,7 @@ $$;
 ALTER FUNCTION "public"."get_available_cleaners_for_booking"("p_customer_id" "uuid", "p_booking_date" "date", "p_start_time" time without time zone, "p_duration_hours" numeric, "p_latitude" double precision, "p_longitude" double precision, "p_max_distance_meters" integer, "p_requested_category" "public"."service_category", "p_requested_specialty_slugs" "text"[], "p_exclude_booking_id" "uuid", "p_selected_cleaner_id" "uuid", "p_search_query" "text") OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."get_available_cleaners_for_booking"("p_customer_id" "uuid", "p_booking_date" "date", "p_start_time" time without time zone, "p_duration_hours" numeric, "p_latitude" double precision, "p_longitude" double precision, "p_max_distance_meters" integer, "p_requested_category" "public"."service_category", "p_requested_specialty_slugs" "text"[], "p_exclude_booking_id" "uuid", "p_selected_cleaner_id" "uuid", "p_search_query" "text") IS 'Single authoritative cleaner availability RPC for booking browse and review verification.';
+COMMENT ON FUNCTION "public"."get_available_cleaners_for_booking"("p_customer_id" "uuid", "p_booking_date" "date", "p_start_time" time without time zone, "p_duration_hours" numeric, "p_latitude" double precision, "p_longitude" double precision, "p_max_distance_meters" integer, "p_requested_category" "public"."service_category", "p_requested_specialty_slugs" "text"[], "p_exclude_booking_id" "uuid", "p_selected_cleaner_id" "uuid", "p_search_query" "text") IS 'Single authoritative cleaner availability RPC for booking browse and review verification. p_exclude_booking_id may reference the customer''s own one-off pending or paid booking being edited/rescheduled.';
 
 
 
@@ -8994,33 +9121,33 @@ ALTER FUNCTION "public"."get_welcome_offer_eligibility"("p_customer_id" "uuid", 
 CREATE OR REPLACE FUNCTION "public"."guard_booking_payment_status_writes"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     AS $$
-begin
-  -- Service-role calls (Paystack webhook, admin scripts) bypass entirely.
-  if auth.role() = 'service_role' then
-    return new;
-  end if;
+BEGIN
+  IF auth.role() = 'service_role' THEN
+    RETURN NEW;
+  END IF;
 
-  -- Non-service-role callers cannot transition payment_status to a privileged value.
-  if new.payment_status is distinct from old.payment_status
-     and new.payment_status in ('paid', 'refunded') then
-    raise exception
+  -- Used only by confirm_zero_amount_booking() to mark paid for promo-covered zero totals.
+  IF coalesce(nullif(current_setting('app.confirm_zero_amount', true), ''), '') = '1' THEN
+    RETURN NEW;
+  END IF;
+
+  IF NEW.payment_status IS DISTINCT FROM OLD.payment_status
+     AND NEW.payment_status IN ('paid', 'refunded') THEN
+    RAISE EXCEPTION
       'payment_status transitions to % are server-only (use the Paystack webhook)',
-      new.payment_status
-      using errcode = '42501'; -- insufficient_privilege
-  end if;
+      NEW.payment_status
+      USING ERRCODE = '42501';
+  END IF;
 
-  -- Once a booking is paid, the column is locked for non-service-role callers.
-  -- This prevents a customer from "unpaying" their own booking by writing
-  -- `payment_status = 'failed'` after the webhook has confirmed the charge.
-  if old.payment_status = 'paid'
-     and new.payment_status is distinct from old.payment_status then
-    raise exception
+  IF OLD.payment_status = 'paid'
+     AND NEW.payment_status IS DISTINCT FROM OLD.payment_status THEN
+    RAISE EXCEPTION
       'cannot change payment_status of a paid booking from client'
-      using errcode = '42501';
-  end if;
+      USING ERRCODE = '42501';
+  END IF;
 
-  return new;
-end;
+  RETURN NEW;
+END;
 $$;
 
 
@@ -9183,6 +9310,7 @@ CREATE OR REPLACE FUNCTION "public"."inbox_notification_android_channel"("p_type
     WHEN 'payment_received' THEN 'new_booking'
     WHEN 'booking_confirmed' THEN 'new_booking'
     WHEN 'booking_cancelled' THEN 'booking_cancellations'
+    WHEN 'booking_rescheduled' THEN 'booking_updates'
     WHEN 'unassigned_booking_escalated' THEN 'booking_cancellations'
     WHEN 'new_message' THEN 'messages'
     WHEN 'cleaner_en_route' THEN 'cleaner_milestones'
@@ -9203,6 +9331,7 @@ CREATE OR REPLACE FUNCTION "public"."inbox_notification_interruption_level"("p_t
       'cleaner_en_route',
       'cleaner_arrived',
       'booking_cancelled',
+      'booking_rescheduled',
       'payment_required',
       'direct_assignment_offer',
       'direct_assignment_reminder'
@@ -9213,6 +9342,10 @@ $$;
 
 
 ALTER FUNCTION "public"."inbox_notification_interruption_level"("p_type" "text") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."inbox_notification_interruption_level"("p_type" "text") IS 'Expo iOS interruptionLevel for inbox-triggered pushes; booking_rescheduled included for paid schedule changes.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."increment_invite_code_usage"("p_code" "text") RETURNS boolean
@@ -21733,6 +21866,13 @@ GRANT ALL ON FUNCTION "public"."compute_ghana_phone_variants"("raw_phone" "text"
 
 REVOKE ALL ON FUNCTION "public"."compute_next_recurrence_date"("p_current_date" "date", "p_recurrence_interval" "text", "p_recurrence_anchor_date" "date") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."compute_next_recurrence_date"("p_current_date" "date", "p_recurrence_interval" "text", "p_recurrence_anchor_date" "date") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."confirm_zero_amount_booking"("p_booking_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."confirm_zero_amount_booking"("p_booking_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."confirm_zero_amount_booking"("p_booking_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."confirm_zero_amount_booking"("p_booking_id" "uuid") TO "service_role";
 
 
 
