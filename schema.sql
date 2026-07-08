@@ -38,6 +38,13 @@ CREATE EXTENSION IF NOT EXISTS "btree_gist" WITH SCHEMA "public";
 
 
 
+CREATE EXTENSION IF NOT EXISTS "citext" WITH SCHEMA "public";
+
+
+
+
+
+
 CREATE EXTENSION IF NOT EXISTS "pg_stat_statements" WITH SCHEMA "extensions";
 
 
@@ -250,7 +257,7 @@ ALTER FUNCTION "public"."_booking_job_photo_type_allowed"("p_status" "public"."b
 
 CREATE OR REPLACE FUNCTION "public"."_customer_has_prior_booking"("p_customer_id" "uuid", "p_exclude_booking_id" "uuid" DEFAULT NULL::"uuid") RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
-    SET "search_path" TO 'public'
+    SET "search_path" TO 'public', 'pg_temp'
     AS $$
   SELECT EXISTS (
     SELECT 1
@@ -372,12 +379,34 @@ CREATE TABLE IF NOT EXISTS "public"."promotions" (
     "channel" "text" DEFAULT 'all'::"text" NOT NULL,
     "banner_text" "text",
     "review_hint" "text",
+    "requires_new_customer" boolean DEFAULT false NOT NULL,
+    "max_redemptions" integer,
+    "max_redemptions_per_user" integer DEFAULT 1 NOT NULL,
+    "allow_recurring" boolean DEFAULT false NOT NULL,
     CONSTRAINT "promotions_channel_check" CHECK (("channel" = ANY (ARRAY['all'::"text", 'mobile'::"text", 'web'::"text"]))),
+    CONSTRAINT "promotions_max_redemptions_per_user_one" CHECK (("max_redemptions_per_user" = 1)),
+    CONSTRAINT "promotions_max_redemptions_positive" CHECK ((("max_redemptions" IS NULL) OR ("max_redemptions" > 0))),
     CONSTRAINT "promotions_type_check" CHECK (("type" = ANY (ARRAY['free_hours'::"text", 'fixed_credit_minor'::"text", 'percent_off'::"text"])))
 );
 
 
 ALTER TABLE "public"."promotions" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."promotions"."requires_new_customer" IS 'When true, only customers without prior completed/pending bookings may redeem.';
+
+
+
+COMMENT ON COLUMN "public"."promotions"."max_redemptions" IS 'Optional global cap across all users (reserved + redeemed rows).';
+
+
+
+COMMENT ON COLUMN "public"."promotions"."max_redemptions_per_user" IS 'Per-user cap; must stay 1 while promotion_redemptions enforces one row per (user_id, promotion_id).';
+
+
+
+COMMENT ON COLUMN "public"."promotions"."allow_recurring" IS 'When true, promotion may apply to recurring subscription bookings.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."_load_active_promotion"("p_promotion_slug" "text") RETURNS "public"."promotions"
@@ -395,6 +424,144 @@ $$;
 
 
 ALTER FUNCTION "public"."_load_active_promotion"("p_promotion_slug" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."_promotion_code_redemption_count"("p_promotion_code_id" "uuid", "p_exclude_booking_id" "uuid" DEFAULT NULL::"uuid") RETURNS integer
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+  SELECT count(*)::integer
+  FROM public.bookings b
+  WHERE b.promotion_code_id = p_promotion_code_id
+    AND (p_exclude_booking_id IS NULL OR b.id <> p_exclude_booking_id)
+    AND lower(coalesce(b.payment_status, 'pending')) IN ('pending', 'paid')
+    AND b.status IS DISTINCT FROM 'cancelled';
+$$;
+
+
+ALTER FUNCTION "public"."_promotion_code_redemption_count"("p_promotion_code_id" "uuid", "p_exclude_booking_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."_promotion_eligibility_core"("p_customer_id" "uuid", "p_promotion_slug" "text", "p_channel" "text", "p_service_id" integer DEFAULT NULL::integer, "p_lat" double precision DEFAULT NULL::double precision, "p_lng" double precision DEFAULT NULL::double precision, "p_extra_task_ids" "text"[] DEFAULT NULL::"text"[], "p_is_recurring" boolean DEFAULT false, "p_booking_id" "uuid" DEFAULT NULL::"uuid", "p_promotion_code_id" "uuid" DEFAULT NULL::"uuid") RETURNS "jsonb"
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+DECLARE
+  v_promo public.promotions;
+  v_global_count integer;
+  v_code_max integer;
+BEGIN
+  IF p_channel IS NULL
+     OR btrim(p_channel) = ''
+     OR p_channel NOT IN ('mobile', 'web') THEN
+    RAISE EXCEPTION 'Invalid promotion channel: %', p_channel;
+  END IF;
+
+  SELECT * INTO v_promo FROM public._load_active_promotion(p_promotion_slug);
+
+  IF v_promo.id IS NULL THEN
+    RETURN jsonb_build_object('eligible', false, 'reason', 'promotion_inactive');
+  END IF;
+
+  IF v_promo.channel NOT IN (p_channel, 'all') THEN
+    RETURN jsonb_build_object('eligible', false, 'reason', 'promotion_inactive');
+  END IF;
+
+  IF COALESCE(v_promo.max_redemptions_per_user, 1) <> 1 THEN
+    RETURN jsonb_build_object('eligible', false, 'reason', 'unsupported_redemption_limit');
+  END IF;
+
+  IF p_is_recurring AND NOT COALESCE(v_promo.allow_recurring, false) THEN
+    RETURN jsonb_build_object('eligible', false, 'reason', 'recurring_not_eligible');
+  END IF;
+
+  IF COALESCE(v_promo.requires_new_customer, false)
+     AND public._customer_has_prior_booking(p_customer_id, p_booking_id) THEN
+    RETURN jsonb_build_object('eligible', false, 'reason', 'existing_customer');
+  END IF;
+
+  IF public._welcome_promotion_has_active_claim(p_customer_id, v_promo.id, p_booking_id) THEN
+    RETURN jsonb_build_object('eligible', false, 'reason', 'already_used');
+  END IF;
+
+  IF v_promo.max_redemptions IS NOT NULL THEN
+    v_global_count := public._promotion_global_redemption_count(v_promo.id);
+    IF v_global_count >= v_promo.max_redemptions THEN
+      RETURN jsonb_build_object('eligible', false, 'reason', 'promotion_exhausted');
+    END IF;
+  END IF;
+
+  IF p_promotion_code_id IS NOT NULL THEN
+    SELECT pc.max_redemptions
+    INTO v_code_max
+    FROM public.promotion_codes pc
+    WHERE pc.id = p_promotion_code_id
+      AND pc.active IS TRUE;
+
+    IF NOT FOUND THEN
+      RETURN jsonb_build_object('eligible', false, 'reason', 'invalid_code');
+    END IF;
+
+    IF v_code_max IS NOT NULL THEN
+      IF public._promotion_code_redemption_count(p_promotion_code_id, p_booking_id)
+         >= v_code_max THEN
+        RETURN jsonb_build_object('eligible', false, 'reason', 'code_exhausted');
+      END IF;
+    END IF;
+  END IF;
+
+  IF p_service_id IS NOT NULL
+     AND NOT public._promotion_service_eligible(v_promo.eligible_service_ids, p_service_id) THEN
+    RETURN jsonb_build_object('eligible', false, 'reason', 'not_eligible_service');
+  END IF;
+
+  IF v_promo.requires_service_area
+     AND p_lat IS NOT NULL
+     AND p_lng IS NOT NULL
+     AND NOT public.is_location_in_active_service_area(p_lat, p_lng) THEN
+    RETURN jsonb_build_object('eligible', false, 'reason', 'outside_service_area');
+  END IF;
+
+  IF v_promo.exclude_extra_tasks
+     AND p_extra_task_ids IS NOT NULL
+     AND cardinality(p_extra_task_ids) > 0 THEN
+    RETURN jsonb_build_object(
+      'eligible', true,
+      'reason', 'extra_tasks_billed_separately',
+      'promotion_id', v_promo.id,
+      'promotion_slug', v_promo.slug,
+      'headline', v_promo.headline,
+      'review_hint', v_promo.review_hint
+    );
+  END IF;
+
+  RETURN jsonb_build_object(
+    'eligible', true,
+    'reason', NULL,
+    'promotion_id', v_promo.id,
+    'promotion_slug', v_promo.slug,
+    'headline', v_promo.headline,
+    'review_hint', v_promo.review_hint
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."_promotion_eligibility_core"("p_customer_id" "uuid", "p_promotion_slug" "text", "p_channel" "text", "p_service_id" integer, "p_lat" double precision, "p_lng" double precision, "p_extra_task_ids" "text"[], "p_is_recurring" boolean, "p_booking_id" "uuid", "p_promotion_code_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."_promotion_global_redemption_count"("p_promotion_id" "uuid") RETURNS integer
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+  SELECT count(*)::integer
+  FROM public.promotion_redemptions r
+  WHERE r.promotion_id = p_promotion_id
+    AND r.status IN ('reserved', 'redeemed');
+$$;
+
+
+ALTER FUNCTION "public"."_promotion_global_redemption_count"("p_promotion_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."_promotion_service_eligible"("p_eligible_service_ids" integer[], "p_service_id" integer) RETURNS boolean
@@ -1832,6 +1999,45 @@ $$;
 ALTER FUNCTION "public"."booking_broadcast_grace_ends_at"("p_scheduled_at_utc" timestamp with time zone, "p_duration_hours" numeric, "p_duration_final" numeric) OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."booking_cleaner_access_window_open"("p_status" "public"."booking_status", "p_scheduled_at_utc" timestamp with time zone, "p_scheduled_date" "date", "p_timezone_name" "text") RETURNS boolean
+    LANGUAGE "sql" STABLE
+    AS $$
+  SELECT CASE
+    WHEN p_status NOT IN ('confirmed', 'scheduled', 'en_route', 'arrived', 'in_progress') THEN false
+    WHEN p_scheduled_date IS NULL THEN false
+    WHEN p_scheduled_date <>
+      (now() AT TIME ZONE COALESCE(NULLIF(trim(p_timezone_name), ''), 'Africa/Accra'))::date THEN false
+    WHEN p_status IN ('confirmed', 'scheduled')
+      AND p_scheduled_at_utc IS NOT NULL
+      AND p_scheduled_at_utc <= now() THEN false
+    ELSE true
+  END;
+$$;
+
+
+ALTER FUNCTION "public"."booking_cleaner_access_window_open"("p_status" "public"."booking_status", "p_scheduled_at_utc" timestamp with time zone, "p_scheduled_date" "date", "p_timezone_name" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."booking_cleaner_contact_window_open"("p_status" "public"."booking_status", "p_scheduled_at_utc" timestamp with time zone, "p_scheduled_date" "date", "p_timezone_name" "text") RETURNS boolean
+    LANGUAGE "sql" STABLE
+    AS $$
+  SELECT CASE
+    WHEN p_status NOT IN ('confirmed', 'scheduled', 'en_route', 'arrived', 'in_progress') THEN false
+    WHEN p_status IN ('confirmed', 'scheduled')
+      AND p_scheduled_at_utc IS NOT NULL
+      AND p_scheduled_at_utc <= now() THEN false
+    WHEN p_status IN ('en_route', 'arrived', 'in_progress')
+      AND p_scheduled_date IS NOT NULL
+      AND p_scheduled_date <>
+        (now() AT TIME ZONE COALESCE(NULLIF(trim(p_timezone_name), ''), 'Africa/Accra'))::date THEN false
+    ELSE true
+  END;
+$$;
+
+
+ALTER FUNCTION "public"."booking_cleaner_contact_window_open"("p_status" "public"."booking_status", "p_scheduled_at_utc" timestamp with time zone, "p_scheduled_date" "date", "p_timezone_name" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."booking_cover_major_from_booking"("p_cover_amount" numeric) RETURNS numeric
     LANGUAGE "plpgsql" IMMUTABLE
     AS $$
@@ -2476,6 +2682,39 @@ $$;
 
 
 ALTER FUNCTION "public"."capture_booking_payment_split_snapshot"("p_booking_id" "uuid", "p_amount_minor" integer) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."claim_booking_review_request"("p_booking_id" "uuid") RETURNS timestamp with time zone
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_claimed_at timestamptz := now();
+BEGIN
+  UPDATE public.bookings
+  SET review_request_sent_at = v_claimed_at
+  WHERE id = p_booking_id
+    AND review_request_sent_at IS NULL
+    AND payment_status = 'paid'
+    AND status = 'completed'
+    AND cleaner_id IS NOT NULL
+    AND completed_at IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1
+      FROM public.reviews r
+      WHERE r.booking_id = p_booking_id
+    );
+
+  IF FOUND THEN
+    RETURN v_claimed_at;
+  END IF;
+
+  RETURN NULL;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."claim_booking_review_request"("p_booking_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."claim_job"("p_job_id" "uuid", "p_cleaner_id" "uuid") RETURNS "jsonb"
@@ -3307,6 +3546,33 @@ $$;
 
 
 ALTER FUNCTION "public"."cleanup_expired_welcome_promotion_reservations"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."cleanup_orphaned_pending_subscription"("p_subscription_id" "uuid") RETURNS boolean
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+DECLARE
+  v_uid uuid := auth.uid();
+BEGIN
+  IF v_uid IS NULL OR p_subscription_id IS NULL THEN
+    RETURN false;
+  END IF;
+
+  DELETE FROM public.subscriptions s
+  WHERE s.id = p_subscription_id
+    AND s.customer_id = v_uid
+    AND lower(coalesce(s.status, '')) = 'pending'
+    AND NOT EXISTS (
+      SELECT 1 FROM public.bookings b WHERE b.subscription_id = s.id
+    );
+
+  RETURN FOUND;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."cleanup_orphaned_pending_subscription"("p_subscription_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."complete_cleaner_booking"("p_booking_id" "uuid") RETURNS "jsonb"
@@ -4208,9 +4474,9 @@ COMMENT ON FUNCTION "public"."compute_booking_pricing"("p_service_id" integer, "
 
 
 
-CREATE OR REPLACE FUNCTION "public"."compute_booking_pricing_with_promotion"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_cleaner_id" "uuid" DEFAULT NULL::"uuid", "p_channel" "text" DEFAULT NULL::"text", "p_recurrence_interval" "text" DEFAULT NULL::"text", "p_is_recurring" boolean DEFAULT false, "p_include_booking_cover" boolean DEFAULT true, "p_supplies_option" "text" DEFAULT 'customer_provided'::"text", "p_customer_id" "uuid" DEFAULT NULL::"uuid", "p_promotion_slug" "text" DEFAULT NULL::"text", "p_lat" double precision DEFAULT NULL::double precision, "p_lng" double precision DEFAULT NULL::double precision, "p_extra_task_ids" "text"[] DEFAULT NULL::"text"[], "p_booking_id" "uuid" DEFAULT NULL::"uuid", "p_service_duration_option_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("pricing_version" "text", "currency" "text", "work_rate_ghs_per_hour" numeric, "duration_hours" numeric, "subtotal_labor_major" numeric, "platform_fee_major" numeric, "booking_cover_major" numeric, "supplies_option" "text", "supplies_allowance_minor" integer, "core_amount_minor" integer, "same_day_surcharge_bps" integer, "weekend_surcharge_bps" integer, "recurring_weekly_discount_bps" integer, "recurring_monthly_discount_bps" integer, "same_day_surcharge_minor" integer, "weekend_surcharge_minor" integer, "recurring_discount_minor" integer, "final_amount_minor" integer, "recurring_amount_minor" integer, "first_charge_amount_minor" integer, "discount_rate_bps" integer, "is_same_day" boolean, "is_weekend" boolean, "minimum_duration_hours" numeric, "cleaner_earnings_minor" integer, "catalog_discount_pct" numeric, "catalog_discount_minor" integer, "promotion_id" "uuid", "promotion_slug" "text", "promotion_discount_minor" integer)
+CREATE OR REPLACE FUNCTION "public"."compute_booking_pricing_with_promotion"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_cleaner_id" "uuid" DEFAULT NULL::"uuid", "p_channel" "text" DEFAULT NULL::"text", "p_recurrence_interval" "text" DEFAULT NULL::"text", "p_is_recurring" boolean DEFAULT false, "p_include_booking_cover" boolean DEFAULT true, "p_supplies_option" "text" DEFAULT 'customer_provided'::"text", "p_customer_id" "uuid" DEFAULT NULL::"uuid", "p_promotion_slug" "text" DEFAULT NULL::"text", "p_lat" double precision DEFAULT NULL::double precision, "p_lng" double precision DEFAULT NULL::double precision, "p_extra_task_ids" "text"[] DEFAULT NULL::"text"[], "p_booking_id" "uuid" DEFAULT NULL::"uuid", "p_service_duration_option_id" "uuid" DEFAULT NULL::"uuid", "p_promotion_code" "text" DEFAULT NULL::"text") RETURNS TABLE("pricing_version" "text", "currency" "text", "work_rate_ghs_per_hour" numeric, "duration_hours" numeric, "subtotal_labor_major" numeric, "platform_fee_major" numeric, "booking_cover_major" numeric, "supplies_option" "text", "supplies_allowance_minor" integer, "core_amount_minor" integer, "same_day_surcharge_bps" integer, "weekend_surcharge_bps" integer, "recurring_weekly_discount_bps" integer, "recurring_monthly_discount_bps" integer, "same_day_surcharge_minor" integer, "weekend_surcharge_minor" integer, "recurring_discount_minor" integer, "final_amount_minor" integer, "recurring_amount_minor" integer, "first_charge_amount_minor" integer, "discount_rate_bps" integer, "is_same_day" boolean, "is_weekend" boolean, "minimum_duration_hours" numeric, "cleaner_earnings_minor" integer, "catalog_discount_pct" numeric, "catalog_discount_minor" integer, "promotion_id" "uuid", "promotion_slug" "text", "promotion_discount_minor" integer)
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
-    SET "search_path" TO 'public'
+    SET "search_path" TO 'public', 'pg_temp'
     AS $$
 DECLARE
   v_base record;
@@ -4223,8 +4489,12 @@ DECLARE
   v_labor_minor integer;
   v_discount integer := 0;
   v_final integer;
+  v_first_charge integer;
   v_cleaner_earnings_minor integer;
   v_caller uuid := auth.uid();
+  v_resolved_slug text;
+  v_code_row public.promotion_codes%ROWTYPE;
+  v_use_code boolean := false;
 BEGIN
   SELECT *
   INTO v_base
@@ -4244,8 +4514,39 @@ BEGIN
   LIMIT 1;
 
   v_labor_minor := round(greatest(0, v_base.subtotal_labor_major) * 100)::integer;
+  v_resolved_slug := NULLIF(btrim(p_promotion_slug), '');
 
-  IF p_promotion_slug IS NULL OR btrim(p_promotion_slug) = '' THEN
+  IF p_promotion_code IS NOT NULL AND btrim(p_promotion_code) <> '' THEN
+    SELECT pc.*
+    INTO v_code_row
+    FROM public.promotion_codes pc
+    WHERE pc.code = btrim(p_promotion_code)::citext
+      AND pc.active IS TRUE
+    LIMIT 1;
+
+    IF v_code_row.id IS NULL THEN
+      RETURN QUERY
+      SELECT
+        v_base.pricing_version, v_base.currency, v_base.work_rate_ghs_per_hour,
+        v_base.duration_hours, v_base.subtotal_labor_major, v_base.platform_fee_major,
+        v_base.booking_cover_major, v_base.supplies_option, v_base.supplies_allowance_minor, v_base.core_amount_minor, v_base.same_day_surcharge_bps,
+        v_base.weekend_surcharge_bps, v_base.recurring_weekly_discount_bps,
+        v_base.recurring_monthly_discount_bps, v_base.same_day_surcharge_minor,
+        v_base.weekend_surcharge_minor, v_base.recurring_discount_minor,
+        v_base.final_amount_minor, v_base.recurring_amount_minor,
+        v_base.first_charge_amount_minor, v_base.discount_rate_bps,
+        v_base.is_same_day, v_base.is_weekend, v_base.minimum_duration_hours,
+        v_base.cleaner_earnings_minor,
+        v_base.catalog_discount_pct, v_base.catalog_discount_minor,
+        NULL::uuid, NULL::text, 0;
+      RETURN;
+    END IF;
+
+    SELECT p.slug INTO v_resolved_slug FROM public.promotions p WHERE p.id = v_code_row.promotion_id;
+    v_use_code := true;
+  END IF;
+
+  IF v_resolved_slug IS NULL THEN
     RETURN QUERY
     SELECT
       v_base.pricing_version, v_base.currency, v_base.work_rate_ghs_per_hour,
@@ -4270,8 +4571,10 @@ BEGIN
   END IF;
 
   IF p_customer_id IS NULL
-     OR p_is_recurring
-     OR (v_caller IS NOT NULL AND v_caller <> p_customer_id) THEN
+     OR v_caller IS NULL
+     OR v_caller <> p_customer_id
+     OR (NOT COALESCE((SELECT allow_recurring FROM public.promotions WHERE slug = v_resolved_slug LIMIT 1), false)
+         AND p_is_recurring) THEN
     RETURN QUERY
     SELECT
       v_base.pricing_version, v_base.currency, v_base.work_rate_ghs_per_hour,
@@ -4289,17 +4592,32 @@ BEGIN
     RETURN;
   END IF;
 
-  v_eligibility := public.get_welcome_offer_eligibility(
-    p_customer_id,
-    p_promotion_slug,
-    p_channel,
-    p_service_id,
-    p_lat,
-    p_lng,
-    p_extra_task_ids,
-    p_is_recurring,
-    p_booking_id
-  );
+  IF v_use_code THEN
+    v_eligibility := public._promotion_eligibility_core(
+      p_customer_id,
+      v_resolved_slug,
+      p_channel,
+      p_service_id,
+      p_lat,
+      p_lng,
+      p_extra_task_ids,
+      p_is_recurring,
+      p_booking_id,
+      v_code_row.id
+    );
+  ELSE
+    v_eligibility := public.get_welcome_offer_eligibility(
+      p_customer_id,
+      v_resolved_slug,
+      p_channel,
+      p_service_id,
+      p_lat,
+      p_lng,
+      p_extra_task_ids,
+      p_is_recurring,
+      p_booking_id
+    );
+  END IF;
 
   IF COALESCE((v_eligibility ->> 'eligible')::boolean, false) IS NOT TRUE THEN
     RETURN QUERY
@@ -4319,10 +4637,9 @@ BEGIN
     RETURN;
   END IF;
 
-  SELECT * INTO v_promo FROM public._load_active_promotion(p_promotion_slug);
+  SELECT * INTO v_promo FROM public._load_active_promotion(v_resolved_slug);
 
   IF v_promo.id IS NULL
-     OR v_promo.type <> 'free_hours'
      OR v_promo.channel NOT IN (p_channel, 'all') THEN
     RETURN QUERY
     SELECT
@@ -4341,22 +4658,45 @@ BEGIN
     RETURN;
   END IF;
 
-  v_extra_hours := public._extra_task_hours_total(p_extra_task_ids);
-  v_base_promo_hours := greatest(0, v_base.duration_hours - v_extra_hours);
+  IF v_promo.type = 'free_hours' THEN
+    v_extra_hours := public._extra_task_hours_total(p_extra_task_ids);
+    v_base_promo_hours := greatest(0, v_base.duration_hours - v_extra_hours);
 
-  v_free_hours := least(
-    v_promo.value::numeric,
-    COALESCE(v_promo.max_duration_hours, v_promo.value::numeric),
-    v_base_promo_hours
-  );
+    v_free_hours := least(
+      v_promo.value::numeric,
+      COALESCE(v_promo.max_duration_hours, v_promo.value::numeric),
+      v_base_promo_hours
+    );
 
-  v_promo_labor_minor := round(
-    greatest(0, v_free_hours * v_base.work_rate_ghs_per_hour * 100)
-  )::integer;
+    v_promo_labor_minor := round(
+      greatest(0, v_free_hours * v_base.work_rate_ghs_per_hour * 100)
+    )::integer;
 
-  v_discount := least(v_promo_labor_minor, v_labor_minor);
+    v_discount := least(v_promo_labor_minor, v_labor_minor);
+  ELSIF v_promo.type = 'percent_off' THEN
+    IF v_promo.value IS NULL OR v_promo.value <= 0 OR v_promo.value > 100 THEN
+      v_discount := 0;
+    ELSE
+      v_discount := least(
+        round(v_base.final_amount_minor * v_promo.value / 100.0)::integer,
+        v_base.final_amount_minor
+      );
+    END IF;
+  ELSIF v_promo.type = 'fixed_credit_minor' THEN
+    v_discount := least(
+      greatest(0, round(v_promo.value)::integer),
+      v_base.final_amount_minor
+    );
+  ELSE
+    v_discount := 0;
+  END IF;
+
   v_final := greatest(0, v_base.final_amount_minor - v_discount);
-
+  v_first_charge := greatest(
+    0,
+    coalesce(v_base.first_charge_amount_minor, v_base.final_amount_minor) - v_discount
+  );
+  -- Platform-funded: cleaner economics stay at base pricing.
   v_cleaner_earnings_minor := v_base.cleaner_earnings_minor;
 
   RETURN QUERY
@@ -4367,7 +4707,7 @@ BEGIN
     v_base.weekend_surcharge_bps, v_base.recurring_weekly_discount_bps,
     v_base.recurring_monthly_discount_bps, v_base.same_day_surcharge_minor,
     v_base.weekend_surcharge_minor, v_base.recurring_discount_minor,
-    v_final, v_base.recurring_amount_minor, v_base.first_charge_amount_minor,
+    v_final, v_base.recurring_amount_minor, v_first_charge,
     v_base.discount_rate_bps, v_base.is_same_day, v_base.is_weekend, v_base.minimum_duration_hours,
     v_cleaner_earnings_minor,
     v_base.catalog_discount_pct, v_base.catalog_discount_minor,
@@ -4376,7 +4716,7 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."compute_booking_pricing_with_promotion"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_cleaner_id" "uuid", "p_channel" "text", "p_recurrence_interval" "text", "p_is_recurring" boolean, "p_include_booking_cover" boolean, "p_supplies_option" "text", "p_customer_id" "uuid", "p_promotion_slug" "text", "p_lat" double precision, "p_lng" double precision, "p_extra_task_ids" "text"[], "p_booking_id" "uuid", "p_service_duration_option_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."compute_booking_pricing_with_promotion"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_cleaner_id" "uuid", "p_channel" "text", "p_recurrence_interval" "text", "p_is_recurring" boolean, "p_include_booking_cover" boolean, "p_supplies_option" "text", "p_customer_id" "uuid", "p_promotion_slug" "text", "p_lat" double precision, "p_lng" double precision, "p_extra_task_ids" "text"[], "p_booking_id" "uuid", "p_service_duration_option_id" "uuid", "p_promotion_code" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."compute_booking_scheduled_at_utc"() RETURNS "trigger"
@@ -7371,15 +7711,16 @@ $$;
 ALTER FUNCTION "public"."get_best_available_cleaners_old"("p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer, "p_requested_services" "text"[]) OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."get_booking_contact_phone"("p_booking_id" "uuid") RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."get_booking_contact_phone"("p_booking_id" "uuid", "p_contact_role" "text" DEFAULT 'customer'::"text") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
-    SET "search_path" TO 'public'
+    SET "search_path" TO 'public', 'pg_temp'
     AS $$
 DECLARE
   v_uid uuid := auth.uid();
   v_row public.bookings%ROWTYPE;
   v_contact_user_id uuid;
   v_phone text;
+  v_role text := lower(coalesce(btrim(p_contact_role), 'customer'));
 BEGIN
   IF v_uid IS NULL THEN
     RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
@@ -7387,6 +7728,10 @@ BEGIN
 
   IF p_booking_id IS NULL THEN
     RETURN jsonb_build_object('success', false, 'error', 'missing_booking_id');
+  END IF;
+
+  IF v_role NOT IN ('customer', 'site') THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_contact_role');
   END IF;
 
   SELECT * INTO v_row
@@ -7397,32 +7742,51 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'error', 'not_found');
   END IF;
 
-  IF v_row.status NOT IN ('confirmed', 'scheduled', 'en_route', 'arrived', 'in_progress') THEN
+  IF NOT public.booking_cleaner_contact_window_open(
+    v_row.status,
+    v_row.scheduled_at_utc,
+    v_row.scheduled_date,
+    v_row.timezone_name
+  ) THEN
     RETURN jsonb_build_object('success', false, 'error', 'booking_not_active');
   END IF;
 
-  IF v_row.status IN ('confirmed', 'scheduled')
-    AND v_row.scheduled_at_utc IS NOT NULL
-    AND v_row.scheduled_at_utc <= now() THEN
+  IF lower(coalesce(v_row.payment_status::text, '')) NOT IN ('paid', 'success') THEN
     RETURN jsonb_build_object('success', false, 'error', 'booking_not_active');
   END IF;
 
-  IF v_row.status IN ('en_route', 'arrived', 'in_progress')
-    AND v_row.scheduled_date IS NOT NULL
-    AND v_row.scheduled_date <>
-      (now() AT TIME ZONE COALESCE(NULLIF(trim(v_row.timezone_name), ''), 'Africa/Accra'))::date THEN
-    RETURN jsonb_build_object('success', false, 'error', 'booking_not_active');
+  IF v_role = 'site' THEN
+    IF v_uid IS DISTINCT FROM v_row.cleaner_id THEN
+      RETURN jsonb_build_object('success', false, 'error', 'not_authorized');
+    END IF;
+
+    IF COALESCE(v_row.booking_for_self, true) = true THEN
+      RETURN jsonb_build_object('success', false, 'error', 'site_contact_unavailable');
+    END IF;
+
+    v_phone := NULLIF(btrim(v_row.site_contact_phone), '');
+
+    IF v_phone IS NULL THEN
+      RETURN jsonb_build_object('success', false, 'error', 'phone_unavailable');
+    END IF;
+
+    RETURN jsonb_build_object(
+      'success', true,
+      'phone', v_phone,
+      'contact_role', 'site'
+    );
   END IF;
 
   IF v_uid = v_row.customer_id AND v_row.cleaner_id IS NOT NULL THEN
     v_contact_user_id := v_row.cleaner_id;
   ELSIF v_uid = v_row.cleaner_id AND v_row.customer_id IS NOT NULL THEN
     v_contact_user_id := v_row.customer_id;
-    IF v_row.customer_contact_phone IS NOT NULL AND trim(v_row.customer_contact_phone) <> '' THEN
+    IF v_row.customer_contact_phone IS NOT NULL AND btrim(v_row.customer_contact_phone) <> '' THEN
       RETURN jsonb_build_object(
         'success', true,
-        'phone', trim(v_row.customer_contact_phone),
-        'contact_user_id', v_contact_user_id
+        'phone', btrim(v_row.customer_contact_phone),
+        'contact_user_id', v_contact_user_id,
+        'contact_role', 'customer'
       );
     END IF;
   ELSE
@@ -7433,20 +7797,21 @@ BEGIN
   FROM public.users
   WHERE id = v_contact_user_id;
 
-  IF v_phone IS NULL OR trim(v_phone) = '' THEN
+  IF v_phone IS NULL OR btrim(v_phone) = '' THEN
     RETURN jsonb_build_object('success', false, 'error', 'phone_unavailable');
   END IF;
 
   RETURN jsonb_build_object(
     'success', true,
-    'phone', trim(v_phone),
-    'contact_user_id', v_contact_user_id
+    'phone', btrim(v_phone),
+    'contact_user_id', v_contact_user_id,
+    'contact_role', 'customer'
   );
 END;
 $$;
 
 
-ALTER FUNCTION "public"."get_booking_contact_phone"("p_booking_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."get_booking_contact_phone"("p_booking_id" "uuid", "p_contact_role" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."get_booking_payment_snapshot"("p_booking_id" "uuid") RETURNS TABLE("booking_id" "uuid", "final_amount_minor" integer, "currency" "text", "payment_status" "text", "status" "public"."booking_status", "booking_cover" boolean, "booking_cover_amount" numeric, "platform_fee" numeric, "work_rate_ghs_per_hour" numeric, "pricing_version" "text", "promotion_id" "uuid", "promotion_slug" "text", "promotion_discount_minor" integer)
@@ -7670,6 +8035,104 @@ $$;
 
 
 ALTER FUNCTION "public"."get_cleaner_availability_by_id_old"("p_cleaner_id" "uuid", "p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_timezone" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."get_cleaner_booking_access_context"("p_booking_id" "uuid") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_row public.bookings%ROWTYPE;
+  v_unlocked boolean := false;
+  v_paid boolean := false;
+  v_customer_phone text;
+  v_site_phone text;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  IF p_booking_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'missing_booking_id');
+  END IF;
+
+  SELECT * INTO v_row
+  FROM public.bookings
+  WHERE id = p_booking_id;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_found');
+  END IF;
+
+  IF v_row.cleaner_id IS DISTINCT FROM v_uid THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authorized');
+  END IF;
+
+  v_paid := lower(coalesce(v_row.payment_status::text, '')) IN ('paid', 'success');
+
+  v_unlocked := v_paid
+    AND public.booking_cleaner_access_window_open(
+      v_row.status,
+      v_row.scheduled_at_utc,
+      v_row.scheduled_date,
+      v_row.timezone_name
+    );
+
+  IF NOT v_unlocked THEN
+    RETURN jsonb_build_object(
+      'success', true,
+      'unlocked', false,
+      'message', CASE
+        WHEN NOT v_paid THEN 'payment_required'
+        ELSE 'access_locked_until_job_day'
+      END
+    );
+  END IF;
+
+  SELECT NULLIF(btrim(u.phone), '') INTO v_customer_phone
+  FROM public.users u
+  WHERE u.id = v_row.customer_id;
+
+  IF NULLIF(btrim(v_row.customer_contact_phone), '') IS NOT NULL THEN
+    v_customer_phone := btrim(v_row.customer_contact_phone);
+  END IF;
+
+  v_site_phone := NULL;
+  IF COALESCE(v_row.booking_for_self, true) = false THEN
+    v_site_phone := NULLIF(btrim(v_row.site_contact_phone), '');
+  END IF;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'unlocked', true,
+    'booking_for_self', COALESCE(v_row.booking_for_self, true),
+    'on_site_contact_name', CASE
+      WHEN COALESCE(v_row.booking_for_self, true) = false
+        THEN NULLIF(btrim(v_row.site_contact_name), '')
+      ELSE NULL
+    END,
+    'on_site_contact_relationship', CASE
+      WHEN COALESCE(v_row.booking_for_self, true) = false
+        THEN NULLIF(btrim(v_row.site_contact_relationship), '')
+      ELSE NULL
+    END,
+    'on_site_contact_phone_available', v_site_phone IS NOT NULL,
+    'property_type', NULLIF(btrim(v_row.property_type), ''),
+    'occupant_present', v_row.occupant_present,
+    'requires_key_or_access_code', COALESCE(v_row.requires_key_or_access_code, false),
+    'access_instructions', CASE
+      WHEN COALESCE(v_row.requires_key_or_access_code, false)
+        THEN NULLIF(btrim(v_row.access_instructions), '')
+      ELSE NULL
+    END,
+    'customer_contact_available', v_customer_phone IS NOT NULL
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."get_cleaner_booking_access_context"("p_booking_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."get_cleaner_booking_location_fields"("p_booking_ids" "uuid"[]) RETURNS TABLE("booking_id" "uuid", "display_location" "text", "full_address_available" boolean, "navigation_available" boolean, "address" "text", "location_coordinates" "public"."geometry", "coordinates_accuracy" "text")
@@ -11221,6 +11684,10 @@ CREATE OR REPLACE FUNCTION "public"."promotion_admin_row_to_jsonb"("p_row" "publ
     'active', p_row.active,
     'valid_from', p_row.valid_from,
     'valid_to', p_row.valid_to,
+    'requires_new_customer', p_row.requires_new_customer,
+    'max_redemptions', p_row.max_redemptions,
+    'max_redemptions_per_user', p_row.max_redemptions_per_user,
+    'allow_recurring', p_row.allow_recurring,
     'updated_at', p_row.updated_at,
     'created_at', p_row.created_at
   );
@@ -11230,7 +11697,7 @@ $$;
 ALTER FUNCTION "public"."promotion_admin_row_to_jsonb"("p_row" "public"."promotions") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."promotion_row_audit_snapshot"("p_slug" "text", "p_headline" "text", "p_terms_markdown" "text", "p_type" "text", "p_value" numeric, "p_max_duration_hours" numeric, "p_eligible_service_ids" integer[], "p_exclude_extra_tasks" boolean, "p_requires_service_area" boolean, "p_active" boolean, "p_valid_from" timestamp with time zone, "p_valid_to" timestamp with time zone) RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."promotion_row_audit_snapshot"("p_slug" "text", "p_headline" "text", "p_terms_markdown" "text", "p_type" "text", "p_value" numeric, "p_max_duration_hours" numeric, "p_eligible_service_ids" integer[], "p_exclude_extra_tasks" boolean, "p_requires_service_area" boolean, "p_active" boolean, "p_valid_from" timestamp with time zone, "p_valid_to" timestamp with time zone, "p_requires_new_customer" boolean DEFAULT false, "p_max_redemptions" integer DEFAULT NULL::integer, "p_max_redemptions_per_user" integer DEFAULT 1, "p_allow_recurring" boolean DEFAULT false) RETURNS "jsonb"
     LANGUAGE "sql" STABLE
     SET "search_path" TO 'public', 'pg_temp'
     AS $$
@@ -11246,12 +11713,16 @@ CREATE OR REPLACE FUNCTION "public"."promotion_row_audit_snapshot"("p_slug" "tex
     'requires_service_area', p_requires_service_area,
     'active', p_active,
     'valid_from', p_valid_from,
-    'valid_to', p_valid_to
+    'valid_to', p_valid_to,
+    'requires_new_customer', p_requires_new_customer,
+    'max_redemptions', p_max_redemptions,
+    'max_redemptions_per_user', p_max_redemptions_per_user,
+    'allow_recurring', p_allow_recurring
   );
 $$;
 
 
-ALTER FUNCTION "public"."promotion_row_audit_snapshot"("p_slug" "text", "p_headline" "text", "p_terms_markdown" "text", "p_type" "text", "p_value" numeric, "p_max_duration_hours" numeric, "p_eligible_service_ids" integer[], "p_exclude_extra_tasks" boolean, "p_requires_service_area" boolean, "p_active" boolean, "p_valid_from" timestamp with time zone, "p_valid_to" timestamp with time zone) OWNER TO "postgres";
+ALTER FUNCTION "public"."promotion_row_audit_snapshot"("p_slug" "text", "p_headline" "text", "p_terms_markdown" "text", "p_type" "text", "p_value" numeric, "p_max_duration_hours" numeric, "p_eligible_service_ids" integer[], "p_exclude_extra_tasks" boolean, "p_requires_service_area" boolean, "p_active" boolean, "p_valid_from" timestamp with time zone, "p_valid_to" timestamp with time zone, "p_requires_new_customer" boolean, "p_max_redemptions" integer, "p_max_redemptions_per_user" integer, "p_allow_recurring" boolean) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."psk_transaction"("p_booking_id" "uuid", "p_user_id" "uuid", "p_reference" "text", "p_paystack_id" bigint, "p_amount" numeric, "p_fee_amount" numeric, "p_total_captured" numeric, "p_currency" "text", "p_metadata" "jsonb") RETURNS "public"."psk_transaction"
@@ -12663,6 +13134,173 @@ $$;
 ALTER FUNCTION "public"."remove_co_cleaner_from_team"("p_co_cleaner_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."reserve_promotion_for_booking"("p_booking_id" "uuid") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+DECLARE
+  v_caller uuid := auth.uid();
+  v_booking record;
+  v_promo public.promotions%ROWTYPE;
+  v_code public.promotion_codes%ROWTYPE;
+  v_global_count integer;
+  v_code_count integer;
+  v_existing record;
+BEGIN
+  IF v_caller IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  SELECT
+    b.id,
+    b.customer_id,
+    b.promotion_id,
+    b.promotion_discount_minor,
+    b.promotion_code_id,
+    b.cleaner_hold_expires_at
+  INTO v_booking
+  FROM public.bookings b
+  WHERE b.id = p_booking_id;
+
+  IF NOT FOUND OR v_booking.customer_id <> v_caller THEN
+    RETURN jsonb_build_object('success', false, 'error', 'forbidden');
+  END IF;
+
+  IF v_booking.promotion_id IS NULL OR COALESCE(v_booking.promotion_discount_minor, 0) <= 0 THEN
+    RETURN jsonb_build_object('success', true, 'skipped', true);
+  END IF;
+
+  SELECT * INTO v_promo
+  FROM public.promotions p
+  WHERE p.id = v_booking.promotion_id
+  FOR UPDATE;
+
+  IF NOT FOUND OR v_promo.active IS NOT TRUE THEN
+    RETURN jsonb_build_object('success', false, 'error', 'promotion_inactive');
+  END IF;
+
+  IF COALESCE(v_promo.max_redemptions_per_user, 1) <> 1 THEN
+    RETURN jsonb_build_object('success', false, 'error', 'unsupported_redemption_limit');
+  END IF;
+
+  IF v_booking.promotion_code_id IS NOT NULL THEN
+    SELECT * INTO v_code
+    FROM public.promotion_codes pc
+    WHERE pc.id = v_booking.promotion_code_id
+    FOR UPDATE;
+
+    IF NOT FOUND OR v_code.active IS NOT TRUE THEN
+      RETURN jsonb_build_object('success', false, 'error', 'invalid_code');
+    END IF;
+
+    IF v_code.promotion_id <> v_promo.id THEN
+      RETURN jsonb_build_object('success', false, 'error', 'code_promotion_mismatch');
+    END IF;
+  END IF;
+
+  PERFORM public.cleanup_expired_welcome_promotion_reservations();
+
+  SELECT r.status, r.booking_id, r.expires_at
+  INTO v_existing
+  FROM public.promotion_redemptions r
+  WHERE r.user_id = v_booking.customer_id
+    AND r.promotion_id = v_booking.promotion_id;
+
+  IF FOUND THEN
+    IF v_existing.status = 'redeemed' THEN
+      RETURN jsonb_build_object('success', false, 'error', 'already_claimed');
+    END IF;
+
+    IF v_existing.status = 'reserved'
+       AND v_existing.booking_id IS DISTINCT FROM p_booking_id
+       AND (v_existing.expires_at IS NULL OR v_existing.expires_at > now()) THEN
+      RETURN jsonb_build_object('success', false, 'error', 'already_claimed');
+    END IF;
+
+    IF v_existing.status = 'reserved'
+       AND v_existing.booking_id = p_booking_id
+       AND (v_existing.expires_at IS NULL OR v_existing.expires_at > now()) THEN
+      RETURN jsonb_build_object('success', true, 'already_reserved', true);
+    END IF;
+  END IF;
+
+  IF v_promo.max_redemptions IS NOT NULL THEN
+    v_global_count := public._promotion_global_redemption_count(v_promo.id);
+    IF v_global_count >= v_promo.max_redemptions THEN
+      RETURN jsonb_build_object('success', false, 'error', 'promotion_exhausted');
+    END IF;
+  END IF;
+
+  IF v_booking.promotion_code_id IS NOT NULL AND v_code.max_redemptions IS NOT NULL THEN
+    v_code_count := public._promotion_code_redemption_count(
+      v_booking.promotion_code_id,
+      p_booking_id
+    );
+    IF v_code_count >= v_code.max_redemptions THEN
+      RETURN jsonb_build_object('success', false, 'error', 'code_exhausted');
+    END IF;
+  END IF;
+
+  IF FOUND THEN
+    IF v_existing.status IN ('released', 'reserved') THEN
+      UPDATE public.promotion_redemptions
+      SET
+        status = 'reserved',
+        booking_id = p_booking_id,
+        discount_minor = v_booking.promotion_discount_minor,
+        reserved_at = now(),
+        expires_at = COALESCE(v_booking.cleaner_hold_expires_at, now() + interval '48 hours')
+      WHERE user_id = v_booking.customer_id
+        AND promotion_id = v_booking.promotion_id
+        AND (
+          status = 'released'
+          OR (
+            status = 'reserved'
+            AND expires_at IS NOT NULL
+            AND expires_at <= now()
+          )
+        );
+
+      IF FOUND THEN
+        RETURN jsonb_build_object('success', true);
+      END IF;
+
+      RETURN jsonb_build_object('success', false, 'error', 'already_claimed');
+    END IF;
+  END IF;
+
+  BEGIN
+    INSERT INTO public.promotion_redemptions (
+      user_id,
+      promotion_id,
+      booking_id,
+      discount_minor,
+      status,
+      reserved_at,
+      expires_at
+    )
+    VALUES (
+      v_booking.customer_id,
+      v_booking.promotion_id,
+      v_booking.id,
+      v_booking.promotion_discount_minor,
+      'reserved',
+      now(),
+      COALESCE(v_booking.cleaner_hold_expires_at, now() + interval '48 hours')
+    );
+
+    RETURN jsonb_build_object('success', true);
+  EXCEPTION
+    WHEN unique_violation THEN
+      RETURN jsonb_build_object('success', false, 'error', 'already_claimed');
+  END;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."reserve_promotion_for_booking"("p_booking_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."reserve_welcome_promotion_for_booking"("p_booking_id" "uuid") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -13280,6 +13918,24 @@ ALTER FUNCTION "public"."service_schedule_timestamptz"("p_schedule_date" "date",
 
 COMMENT ON FUNCTION "public"."service_schedule_timestamptz"("p_schedule_date" "date", "p_schedule_time" time without time zone, "p_timezone" "text") IS 'Convert a civil date+time in the service timezone to timestamptz.';
 
+
+
+CREATE OR REPLACE FUNCTION "public"."set_booking_completed_at"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF NEW.status = 'completed'
+    AND (OLD.status IS DISTINCT FROM 'completed')
+  THEN
+    NEW.completed_at := COALESCE(NEW.completed_at, now());
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."set_booking_completed_at"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."set_booking_timezone"() RETURNS "trigger"
@@ -14487,7 +15143,7 @@ $$;
 ALTER FUNCTION "public"."update_platform_fees_updated_at"() OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."update_promotion_config_admin"("p_promotion_id" "uuid", "p_expected_updated_at" timestamp with time zone, "p_headline" "text", "p_terms_markdown" "text", "p_type" "text", "p_value" numeric, "p_max_duration_hours" numeric, "p_eligible_service_ids" integer[], "p_exclude_extra_tasks" boolean, "p_requires_service_area" boolean, "p_active" boolean, "p_valid_from" timestamp with time zone, "p_valid_to" timestamp with time zone, "p_changed_by" "uuid", "p_changed_by_email" "text") RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."update_promotion_config_admin"("p_promotion_id" "uuid", "p_expected_updated_at" timestamp with time zone, "p_headline" "text", "p_terms_markdown" "text", "p_type" "text", "p_value" numeric, "p_max_duration_hours" numeric, "p_eligible_service_ids" integer[], "p_exclude_extra_tasks" boolean, "p_requires_service_area" boolean, "p_active" boolean, "p_valid_from" timestamp with time zone, "p_valid_to" timestamp with time zone, "p_changed_by" "uuid", "p_changed_by_email" "text", "p_requires_new_customer" boolean DEFAULT false, "p_max_redemptions" integer DEFAULT NULL::integer, "p_max_redemptions_per_user" integer DEFAULT 1, "p_allow_recurring" boolean DEFAULT false) RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public', 'pg_temp'
     AS $$
@@ -14497,6 +15153,9 @@ DECLARE
   v_type text := btrim(coalesce(p_type, ''));
   v_terms_markdown text := NULLIF(btrim(coalesce(p_terms_markdown, '')), '');
   v_active boolean := coalesce(p_active, false);
+  v_requires_new_customer boolean := coalesce(p_requires_new_customer, false);
+  v_max_redemptions_per_user integer := coalesce(p_max_redemptions_per_user, 1);
+  v_allow_recurring boolean := coalesce(p_allow_recurring, false);
   v_audit_action text;
   v_row public.promotions%ROWTYPE;
   v_candidate public.promotions%ROWTYPE;
@@ -14521,18 +15180,31 @@ BEGIN
     RAISE EXCEPTION 'headline_required' USING ERRCODE = '22023';
   END IF;
 
-  IF v_type <> 'free_hours' THEN
+  IF v_type NOT IN ('free_hours', 'percent_off', 'fixed_credit_minor') THEN
     RAISE EXCEPTION 'unsupported_promotion_type' USING ERRCODE = '22023';
   END IF;
 
-  IF p_value IS NULL OR p_value <= 0 THEN
-    RAISE EXCEPTION 'invalid_free_hours_value' USING ERRCODE = '22023';
+  IF v_type = 'free_hours' THEN
+    IF p_value IS NULL OR p_value <= 0 THEN
+      RAISE EXCEPTION 'invalid_free_hours_value' USING ERRCODE = '22023';
+    END IF;
+    IF p_max_duration_hours IS NULL
+       OR p_max_duration_hours <= 0
+       OR p_max_duration_hours > p_value THEN
+      RAISE EXCEPTION 'invalid_max_duration_hours' USING ERRCODE = '22023';
+    END IF;
+  ELSIF v_type = 'percent_off' THEN
+    IF p_value IS NULL OR p_value <= 0 OR p_value > 100 THEN
+      RAISE EXCEPTION 'invalid_percent_off_value' USING ERRCODE = '22023';
+    END IF;
+  ELSIF v_type = 'fixed_credit_minor' THEN
+    IF p_value IS NULL OR p_value <= 0 THEN
+      RAISE EXCEPTION 'invalid_fixed_credit_value' USING ERRCODE = '22023';
+    END IF;
   END IF;
 
-  IF p_max_duration_hours IS NULL
-     OR p_max_duration_hours <= 0
-     OR p_max_duration_hours > p_value THEN
-    RAISE EXCEPTION 'invalid_max_duration_hours' USING ERRCODE = '22023';
+  IF v_max_redemptions_per_user <> 1 THEN
+    RAISE EXCEPTION 'max_redemptions_per_user_must_be_one' USING ERRCODE = '22023';
   END IF;
 
   IF p_valid_from IS NULL THEN
@@ -14589,7 +15261,11 @@ BEGIN
     v_row.requires_service_area,
     v_row.active,
     v_row.valid_from,
-    v_row.valid_to
+    v_row.valid_to,
+    v_row.requires_new_customer,
+    v_row.max_redemptions,
+    v_row.max_redemptions_per_user,
+    v_row.allow_recurring
   );
 
   v_next := public.promotion_row_audit_snapshot(
@@ -14604,7 +15280,11 @@ BEGIN
     coalesce(p_requires_service_area, false),
     v_active,
     p_valid_from,
-    p_valid_to
+    p_valid_to,
+    v_requires_new_customer,
+    p_max_redemptions,
+    v_max_redemptions_per_user,
+    v_allow_recurring
   );
 
   IF v_previous = v_next THEN
@@ -14633,6 +15313,10 @@ BEGIN
   v_candidate.valid_from := p_valid_from;
   v_candidate.valid_to := p_valid_to;
   v_candidate.updated_at := v_now;
+  v_candidate.requires_new_customer := v_requires_new_customer;
+  v_candidate.max_redemptions := p_max_redemptions;
+  v_candidate.max_redemptions_per_user := v_max_redemptions_per_user;
+  v_candidate.allow_recurring := v_allow_recurring;
 
   UPDATE public.promotions
   SET
@@ -14647,7 +15331,11 @@ BEGIN
     active = v_candidate.active,
     valid_from = v_candidate.valid_from,
     valid_to = v_candidate.valid_to,
-    updated_at = v_candidate.updated_at
+    updated_at = v_candidate.updated_at,
+    requires_new_customer = v_candidate.requires_new_customer,
+    max_redemptions = v_candidate.max_redemptions,
+    max_redemptions_per_user = v_candidate.max_redemptions_per_user,
+    allow_recurring = v_candidate.allow_recurring
   WHERE id = p_promotion_id
   RETURNING * INTO v_updated;
 
@@ -14675,7 +15363,7 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."update_promotion_config_admin"("p_promotion_id" "uuid", "p_expected_updated_at" timestamp with time zone, "p_headline" "text", "p_terms_markdown" "text", "p_type" "text", "p_value" numeric, "p_max_duration_hours" numeric, "p_eligible_service_ids" integer[], "p_exclude_extra_tasks" boolean, "p_requires_service_area" boolean, "p_active" boolean, "p_valid_from" timestamp with time zone, "p_valid_to" timestamp with time zone, "p_changed_by" "uuid", "p_changed_by_email" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."update_promotion_config_admin"("p_promotion_id" "uuid", "p_expected_updated_at" timestamp with time zone, "p_headline" "text", "p_terms_markdown" "text", "p_type" "text", "p_value" numeric, "p_max_duration_hours" numeric, "p_eligible_service_ids" integer[], "p_exclude_extra_tasks" boolean, "p_requires_service_area" boolean, "p_active" boolean, "p_valid_from" timestamp with time zone, "p_valid_to" timestamp with time zone, "p_changed_by" "uuid", "p_changed_by_email" "text", "p_requires_new_customer" boolean, "p_max_redemptions" integer, "p_max_redemptions_per_user" integer, "p_allow_recurring" boolean) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."upsert_cleaner_team_name"("p_company_name" "text") RETURNS "jsonb"
@@ -15033,6 +15721,69 @@ $_$;
 ALTER FUNCTION "public"."validate_booking_timeslot_24h_debug"("p_start_time_24h" "text", "p_duration_hours" numeric, "p_booking_date" "date", "p_timezone" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."validate_promotion_code"("p_code" "text", "p_customer_id" "uuid", "p_channel" "text", "p_service_id" integer DEFAULT NULL::integer, "p_lat" double precision DEFAULT NULL::double precision, "p_lng" double precision DEFAULT NULL::double precision, "p_extra_task_ids" "text"[] DEFAULT NULL::"text"[], "p_is_recurring" boolean DEFAULT false, "p_booking_id" "uuid" DEFAULT NULL::"uuid") RETURNS "jsonb"
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+DECLARE
+  v_caller uuid := auth.uid();
+  v_code_row public.promotion_codes%ROWTYPE;
+  v_promo public.promotions;
+  v_eligibility jsonb;
+BEGIN
+  IF v_caller IS NULL OR v_caller <> p_customer_id THEN
+    RETURN jsonb_build_object('eligible', false, 'reason', 'not_authenticated');
+  END IF;
+
+  IF p_code IS NULL OR btrim(p_code) = '' THEN
+    RETURN jsonb_build_object('eligible', false, 'reason', 'invalid_code');
+  END IF;
+
+  SELECT pc.*
+  INTO v_code_row
+  FROM public.promotion_codes pc
+  WHERE pc.code = btrim(p_code)::citext
+    AND pc.active IS TRUE
+  LIMIT 1;
+
+  IF v_code_row.id IS NULL THEN
+    RETURN jsonb_build_object('eligible', false, 'reason', 'invalid_code');
+  END IF;
+
+  SELECT * INTO v_promo FROM public.promotions p WHERE p.id = v_code_row.promotion_id;
+
+  IF v_promo.id IS NULL OR v_promo.active IS NOT TRUE THEN
+    RETURN jsonb_build_object('eligible', false, 'reason', 'promotion_inactive');
+  END IF;
+
+  v_eligibility := public._promotion_eligibility_core(
+    p_customer_id,
+    v_promo.slug,
+    p_channel,
+    p_service_id,
+    p_lat,
+    p_lng,
+    p_extra_task_ids,
+    p_is_recurring,
+    p_booking_id,
+    v_code_row.id
+  );
+
+  IF COALESCE((v_eligibility ->> 'eligible')::boolean, false) IS NOT TRUE THEN
+    RETURN v_eligibility;
+  END IF;
+
+  RETURN v_eligibility || jsonb_build_object(
+    'promotion_code_id', v_code_row.id,
+    'code', v_code_row.code::text
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."validate_promotion_code"("p_code" "text", "p_customer_id" "uuid", "p_channel" "text", "p_service_id" integer, "p_lat" double precision, "p_lng" double precision, "p_extra_task_ids" "text"[], "p_is_recurring" boolean, "p_booking_id" "uuid") OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."account_merges" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "primary_user_id" "uuid" NOT NULL,
@@ -15318,6 +16069,10 @@ CREATE TABLE IF NOT EXISTS "public"."bookings" (
     "occupant_present" boolean,
     "requires_key_or_access_code" boolean DEFAULT false NOT NULL,
     "ops_assignment_escalation_notice_sent_at" timestamp with time zone,
+    "review_request_sent_at" timestamp with time zone,
+    "completed_at" timestamp with time zone,
+    "promotion_code_id" "uuid",
+    "access_instructions" "text",
     CONSTRAINT "bookings_assignment_phase_check" CHECK ((("assignment_phase" IS NULL) OR ("assignment_phase" = ANY (ARRAY['exclusive'::"text", 'broadcast'::"text", 'accepted'::"text"])))),
     CONSTRAINT "bookings_cancellation_tier_check" CHECK ((("cancellation_tier" IS NULL) OR ("cancellation_tier" = ANY (ARRAY['full_refund'::"text", 'partial_refund'::"text", 'no_refund'::"text"])))),
     CONSTRAINT "bookings_cancelled_by_role_check" CHECK ((("cancelled_by_role" IS NULL) OR ("cancelled_by_role" = ANY (ARRAY['customer'::"text", 'cleaner'::"text", 'admin'::"text", 'platform'::"text"])))),
@@ -15434,6 +16189,18 @@ COMMENT ON COLUMN "public"."bookings"."property_type" IS 'Risk context: resident
 
 
 COMMENT ON COLUMN "public"."bookings"."ops_assignment_escalation_notice_sent_at" IS 'When booking-ops-reminders delivered Slack/email/SMS for assignment_escalated_at (no cleaner accepted).';
+
+
+
+COMMENT ON COLUMN "public"."bookings"."review_request_sent_at" IS 'When the customer-facing review_request notification was sent after job completion.';
+
+
+
+COMMENT ON COLUMN "public"."bookings"."completed_at" IS 'When the booking first transitioned to completed status.';
+
+
+
+COMMENT ON COLUMN "public"."bookings"."access_instructions" IS 'Gate code, lockbox, or concierge notes when requires_key_or_access_code is true. Not stored in special_instructions.';
 
 
 
@@ -16654,6 +17421,21 @@ CREATE TABLE IF NOT EXISTS "public"."pricing_rules" (
 ALTER TABLE "public"."pricing_rules" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."promotion_codes" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "promotion_id" "uuid" NOT NULL,
+    "code" "public"."citext" NOT NULL,
+    "active" boolean DEFAULT true NOT NULL,
+    "max_redemptions" integer,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "promotion_codes_code_not_blank" CHECK (("length"("btrim"(("code")::"text")) > 0)),
+    CONSTRAINT "promotion_codes_max_redemptions_positive" CHECK ((("max_redemptions" IS NULL) OR ("max_redemptions" > 0)))
+);
+
+
+ALTER TABLE "public"."promotion_codes" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."promotion_config_audit" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "promotion_id" "uuid" NOT NULL,
@@ -17656,6 +18438,16 @@ ALTER TABLE ONLY "public"."profiles"
 
 
 
+ALTER TABLE ONLY "public"."promotion_codes"
+    ADD CONSTRAINT "promotion_codes_code_unique" UNIQUE ("code");
+
+
+
+ALTER TABLE ONLY "public"."promotion_codes"
+    ADD CONSTRAINT "promotion_codes_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."promotion_config_audit"
     ADD CONSTRAINT "promotion_config_audit_pkey" PRIMARY KEY ("id");
 
@@ -17899,6 +18691,14 @@ CREATE INDEX "bookings_ops_confirmed_reminder_idx" ON "public"."bookings" USING 
 
 
 CREATE INDEX "bookings_ops_new_booking_notice_idx" ON "public"."bookings" USING "btree" ("created_at") WHERE ("ops_new_booking_notice_sent_at" IS NULL);
+
+
+
+CREATE INDEX "bookings_promotion_code_id_idx" ON "public"."bookings" USING "btree" ("promotion_code_id") WHERE ("promotion_code_id" IS NOT NULL);
+
+
+
+CREATE INDEX "bookings_review_request_pending_idx" ON "public"."bookings" USING "btree" ("completed_at") WHERE (("review_request_sent_at" IS NULL) AND ("payment_status" = 'paid'::"text") AND ("status" = 'completed'::"public"."booking_status") AND ("cleaner_id" IS NOT NULL) AND ("completed_at" IS NOT NULL));
 
 
 
@@ -18642,6 +19442,10 @@ CREATE UNIQUE INDEX "profiles_user_id_key" ON "public"."profiles" USING "btree" 
 
 
 
+CREATE INDEX "promotion_codes_promotion_id_idx" ON "public"."promotion_codes" USING "btree" ("promotion_id");
+
+
+
 CREATE INDEX "promotion_config_audit_changed_by_idx" ON "public"."promotion_config_audit" USING "btree" ("changed_by") WHERE ("changed_by" IS NOT NULL);
 
 
@@ -18770,6 +19574,10 @@ CREATE OR REPLACE TRIGGER "trg_bookings_guard_payment_status" BEFORE UPDATE OF "
 
 
 
+CREATE OR REPLACE TRIGGER "trg_bookings_set_completed_at" BEFORE UPDATE OF "status" ON "public"."bookings" FOR EACH ROW EXECUTE FUNCTION "public"."set_booking_completed_at"();
+
+
+
 CREATE OR REPLACE TRIGGER "trg_credit_cleaner_wallet_on_completion" AFTER UPDATE OF "status" ON "public"."bookings" FOR EACH ROW WHEN ((("new"."status" = 'completed'::"public"."booking_status") AND ("old"."status" IS DISTINCT FROM 'completed'::"public"."booking_status"))) EXECUTE FUNCTION "public"."handle_job_completion"();
 
 
@@ -18895,6 +19703,11 @@ ALTER TABLE ONLY "public"."bookings"
 
 ALTER TABLE ONLY "public"."bookings"
     ADD CONSTRAINT "bookings_direct_assigned_cleaner_id_fkey" FOREIGN KEY ("direct_assigned_cleaner_id") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."bookings"
+    ADD CONSTRAINT "bookings_promotion_code_id_fkey" FOREIGN KEY ("promotion_code_id") REFERENCES "public"."promotion_codes"("id") ON DELETE SET NULL;
 
 
 
@@ -19210,6 +20023,11 @@ ALTER TABLE ONLY "public"."profiles"
 
 ALTER TABLE ONLY "public"."profiles"
     ADD CONSTRAINT "profiles_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "public"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."promotion_codes"
+    ADD CONSTRAINT "promotion_codes_promotion_id_fkey" FOREIGN KEY ("promotion_id") REFERENCES "public"."promotions"("id") ON DELETE CASCADE;
 
 
 
@@ -20182,6 +21000,9 @@ ALTER TABLE "public"."pricing_rules" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."profiles" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."promotion_codes" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."promotion_config_audit" ENABLE ROW LEVEL SECURITY;
 
 
@@ -20421,6 +21242,34 @@ GRANT ALL ON FUNCTION "public"."box3d_out"("public"."box3d") TO "service_role";
 
 
 
+GRANT ALL ON FUNCTION "public"."citextin"("cstring") TO "postgres";
+GRANT ALL ON FUNCTION "public"."citextin"("cstring") TO "anon";
+GRANT ALL ON FUNCTION "public"."citextin"("cstring") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."citextin"("cstring") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."citextout"("public"."citext") TO "postgres";
+GRANT ALL ON FUNCTION "public"."citextout"("public"."citext") TO "anon";
+GRANT ALL ON FUNCTION "public"."citextout"("public"."citext") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."citextout"("public"."citext") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."citextrecv"("internal") TO "postgres";
+GRANT ALL ON FUNCTION "public"."citextrecv"("internal") TO "anon";
+GRANT ALL ON FUNCTION "public"."citextrecv"("internal") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."citextrecv"("internal") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."citextsend"("public"."citext") TO "postgres";
+GRANT ALL ON FUNCTION "public"."citextsend"("public"."citext") TO "anon";
+GRANT ALL ON FUNCTION "public"."citextsend"("public"."citext") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."citextsend"("public"."citext") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."gbtreekey16_in"("cstring") TO "postgres";
 GRANT ALL ON FUNCTION "public"."gbtreekey16_in"("cstring") TO "anon";
 GRANT ALL ON FUNCTION "public"."gbtreekey16_in"("cstring") TO "authenticated";
@@ -20631,6 +21480,13 @@ GRANT ALL ON FUNCTION "public"."spheroid_out"("public"."spheroid") TO "service_r
 
 
 
+GRANT ALL ON FUNCTION "public"."citext"(boolean) TO "postgres";
+GRANT ALL ON FUNCTION "public"."citext"(boolean) TO "anon";
+GRANT ALL ON FUNCTION "public"."citext"(boolean) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."citext"(boolean) TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."box3d"("public"."box2d") TO "postgres";
 GRANT ALL ON FUNCTION "public"."box3d"("public"."box2d") TO "anon";
 GRANT ALL ON FUNCTION "public"."box3d"("public"."box2d") TO "authenticated";
@@ -20663,6 +21519,13 @@ GRANT ALL ON FUNCTION "public"."geometry"("public"."box3d") TO "postgres";
 GRANT ALL ON FUNCTION "public"."geometry"("public"."box3d") TO "anon";
 GRANT ALL ON FUNCTION "public"."geometry"("public"."box3d") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."geometry"("public"."box3d") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."citext"(character) TO "postgres";
+GRANT ALL ON FUNCTION "public"."citext"(character) TO "anon";
+GRANT ALL ON FUNCTION "public"."citext"(character) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."citext"(character) TO "service_role";
 
 
 
@@ -20782,6 +21645,13 @@ GRANT ALL ON FUNCTION "public"."text"("public"."geometry") TO "postgres";
 GRANT ALL ON FUNCTION "public"."text"("public"."geometry") TO "anon";
 GRANT ALL ON FUNCTION "public"."text"("public"."geometry") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."text"("public"."geometry") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."citext"("inet") TO "postgres";
+GRANT ALL ON FUNCTION "public"."citext"("inet") TO "anon";
+GRANT ALL ON FUNCTION "public"."citext"("inet") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."citext"("inet") TO "service_role";
 
 
 
@@ -21083,6 +21953,27 @@ GRANT ALL ON FUNCTION "public"."_postgis_stats"("tbl" "regclass", "att_name" "te
 GRANT ALL ON FUNCTION "public"."_postgis_stats"("tbl" "regclass", "att_name" "text", "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."_postgis_stats"("tbl" "regclass", "att_name" "text", "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."_postgis_stats"("tbl" "regclass", "att_name" "text", "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."_promotion_code_redemption_count"("p_promotion_code_id" "uuid", "p_exclude_booking_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."_promotion_code_redemption_count"("p_promotion_code_id" "uuid", "p_exclude_booking_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."_promotion_code_redemption_count"("p_promotion_code_id" "uuid", "p_exclude_booking_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."_promotion_code_redemption_count"("p_promotion_code_id" "uuid", "p_exclude_booking_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."_promotion_eligibility_core"("p_customer_id" "uuid", "p_promotion_slug" "text", "p_channel" "text", "p_service_id" integer, "p_lat" double precision, "p_lng" double precision, "p_extra_task_ids" "text"[], "p_is_recurring" boolean, "p_booking_id" "uuid", "p_promotion_code_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."_promotion_eligibility_core"("p_customer_id" "uuid", "p_promotion_slug" "text", "p_channel" "text", "p_service_id" integer, "p_lat" double precision, "p_lng" double precision, "p_extra_task_ids" "text"[], "p_is_recurring" boolean, "p_booking_id" "uuid", "p_promotion_code_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."_promotion_eligibility_core"("p_customer_id" "uuid", "p_promotion_slug" "text", "p_channel" "text", "p_service_id" integer, "p_lat" double precision, "p_lng" double precision, "p_extra_task_ids" "text"[], "p_is_recurring" boolean, "p_booking_id" "uuid", "p_promotion_code_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."_promotion_eligibility_core"("p_customer_id" "uuid", "p_promotion_slug" "text", "p_channel" "text", "p_service_id" integer, "p_lat" double precision, "p_lng" double precision, "p_extra_task_ids" "text"[], "p_is_recurring" boolean, "p_booking_id" "uuid", "p_promotion_code_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."_promotion_global_redemption_count"("p_promotion_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."_promotion_global_redemption_count"("p_promotion_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."_promotion_global_redemption_count"("p_promotion_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."_promotion_global_redemption_count"("p_promotion_id" "uuid") TO "service_role";
 
 
 
@@ -21508,6 +22399,20 @@ GRANT ALL ON FUNCTION "public"."booking_broadcast_grace_ends_at"("p_scheduled_at
 
 
 
+REVOKE ALL ON FUNCTION "public"."booking_cleaner_access_window_open"("p_status" "public"."booking_status", "p_scheduled_at_utc" timestamp with time zone, "p_scheduled_date" "date", "p_timezone_name" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."booking_cleaner_access_window_open"("p_status" "public"."booking_status", "p_scheduled_at_utc" timestamp with time zone, "p_scheduled_date" "date", "p_timezone_name" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."booking_cleaner_access_window_open"("p_status" "public"."booking_status", "p_scheduled_at_utc" timestamp with time zone, "p_scheduled_date" "date", "p_timezone_name" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."booking_cleaner_access_window_open"("p_status" "public"."booking_status", "p_scheduled_at_utc" timestamp with time zone, "p_scheduled_date" "date", "p_timezone_name" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."booking_cleaner_contact_window_open"("p_status" "public"."booking_status", "p_scheduled_at_utc" timestamp with time zone, "p_scheduled_date" "date", "p_timezone_name" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."booking_cleaner_contact_window_open"("p_status" "public"."booking_status", "p_scheduled_at_utc" timestamp with time zone, "p_scheduled_date" "date", "p_timezone_name" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."booking_cleaner_contact_window_open"("p_status" "public"."booking_status", "p_scheduled_at_utc" timestamp with time zone, "p_scheduled_date" "date", "p_timezone_name" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."booking_cleaner_contact_window_open"("p_status" "public"."booking_status", "p_scheduled_at_utc" timestamp with time zone, "p_scheduled_date" "date", "p_timezone_name" "text") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."booking_cover_major_from_booking"("p_cover_amount" numeric) TO "anon";
 GRANT ALL ON FUNCTION "public"."booking_cover_major_from_booking"("p_cover_amount" numeric) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."booking_cover_major_from_booking"("p_cover_amount" numeric) TO "service_role";
@@ -21638,6 +22543,125 @@ GRANT ALL ON FUNCTION "public"."checkauthtrigger"() TO "postgres";
 GRANT ALL ON FUNCTION "public"."checkauthtrigger"() TO "anon";
 GRANT ALL ON FUNCTION "public"."checkauthtrigger"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."checkauthtrigger"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."citext_cmp"("public"."citext", "public"."citext") TO "postgres";
+GRANT ALL ON FUNCTION "public"."citext_cmp"("public"."citext", "public"."citext") TO "anon";
+GRANT ALL ON FUNCTION "public"."citext_cmp"("public"."citext", "public"."citext") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."citext_cmp"("public"."citext", "public"."citext") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."citext_eq"("public"."citext", "public"."citext") TO "postgres";
+GRANT ALL ON FUNCTION "public"."citext_eq"("public"."citext", "public"."citext") TO "anon";
+GRANT ALL ON FUNCTION "public"."citext_eq"("public"."citext", "public"."citext") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."citext_eq"("public"."citext", "public"."citext") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."citext_ge"("public"."citext", "public"."citext") TO "postgres";
+GRANT ALL ON FUNCTION "public"."citext_ge"("public"."citext", "public"."citext") TO "anon";
+GRANT ALL ON FUNCTION "public"."citext_ge"("public"."citext", "public"."citext") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."citext_ge"("public"."citext", "public"."citext") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."citext_gt"("public"."citext", "public"."citext") TO "postgres";
+GRANT ALL ON FUNCTION "public"."citext_gt"("public"."citext", "public"."citext") TO "anon";
+GRANT ALL ON FUNCTION "public"."citext_gt"("public"."citext", "public"."citext") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."citext_gt"("public"."citext", "public"."citext") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."citext_hash"("public"."citext") TO "postgres";
+GRANT ALL ON FUNCTION "public"."citext_hash"("public"."citext") TO "anon";
+GRANT ALL ON FUNCTION "public"."citext_hash"("public"."citext") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."citext_hash"("public"."citext") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."citext_hash_extended"("public"."citext", bigint) TO "postgres";
+GRANT ALL ON FUNCTION "public"."citext_hash_extended"("public"."citext", bigint) TO "anon";
+GRANT ALL ON FUNCTION "public"."citext_hash_extended"("public"."citext", bigint) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."citext_hash_extended"("public"."citext", bigint) TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."citext_larger"("public"."citext", "public"."citext") TO "postgres";
+GRANT ALL ON FUNCTION "public"."citext_larger"("public"."citext", "public"."citext") TO "anon";
+GRANT ALL ON FUNCTION "public"."citext_larger"("public"."citext", "public"."citext") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."citext_larger"("public"."citext", "public"."citext") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."citext_le"("public"."citext", "public"."citext") TO "postgres";
+GRANT ALL ON FUNCTION "public"."citext_le"("public"."citext", "public"."citext") TO "anon";
+GRANT ALL ON FUNCTION "public"."citext_le"("public"."citext", "public"."citext") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."citext_le"("public"."citext", "public"."citext") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."citext_lt"("public"."citext", "public"."citext") TO "postgres";
+GRANT ALL ON FUNCTION "public"."citext_lt"("public"."citext", "public"."citext") TO "anon";
+GRANT ALL ON FUNCTION "public"."citext_lt"("public"."citext", "public"."citext") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."citext_lt"("public"."citext", "public"."citext") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."citext_ne"("public"."citext", "public"."citext") TO "postgres";
+GRANT ALL ON FUNCTION "public"."citext_ne"("public"."citext", "public"."citext") TO "anon";
+GRANT ALL ON FUNCTION "public"."citext_ne"("public"."citext", "public"."citext") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."citext_ne"("public"."citext", "public"."citext") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."citext_pattern_cmp"("public"."citext", "public"."citext") TO "postgres";
+GRANT ALL ON FUNCTION "public"."citext_pattern_cmp"("public"."citext", "public"."citext") TO "anon";
+GRANT ALL ON FUNCTION "public"."citext_pattern_cmp"("public"."citext", "public"."citext") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."citext_pattern_cmp"("public"."citext", "public"."citext") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."citext_pattern_ge"("public"."citext", "public"."citext") TO "postgres";
+GRANT ALL ON FUNCTION "public"."citext_pattern_ge"("public"."citext", "public"."citext") TO "anon";
+GRANT ALL ON FUNCTION "public"."citext_pattern_ge"("public"."citext", "public"."citext") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."citext_pattern_ge"("public"."citext", "public"."citext") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."citext_pattern_gt"("public"."citext", "public"."citext") TO "postgres";
+GRANT ALL ON FUNCTION "public"."citext_pattern_gt"("public"."citext", "public"."citext") TO "anon";
+GRANT ALL ON FUNCTION "public"."citext_pattern_gt"("public"."citext", "public"."citext") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."citext_pattern_gt"("public"."citext", "public"."citext") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."citext_pattern_le"("public"."citext", "public"."citext") TO "postgres";
+GRANT ALL ON FUNCTION "public"."citext_pattern_le"("public"."citext", "public"."citext") TO "anon";
+GRANT ALL ON FUNCTION "public"."citext_pattern_le"("public"."citext", "public"."citext") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."citext_pattern_le"("public"."citext", "public"."citext") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."citext_pattern_lt"("public"."citext", "public"."citext") TO "postgres";
+GRANT ALL ON FUNCTION "public"."citext_pattern_lt"("public"."citext", "public"."citext") TO "anon";
+GRANT ALL ON FUNCTION "public"."citext_pattern_lt"("public"."citext", "public"."citext") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."citext_pattern_lt"("public"."citext", "public"."citext") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."citext_smaller"("public"."citext", "public"."citext") TO "postgres";
+GRANT ALL ON FUNCTION "public"."citext_smaller"("public"."citext", "public"."citext") TO "anon";
+GRANT ALL ON FUNCTION "public"."citext_smaller"("public"."citext", "public"."citext") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."citext_smaller"("public"."citext", "public"."citext") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."claim_booking_review_request"("p_booking_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."claim_booking_review_request"("p_booking_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."claim_booking_review_request"("p_booking_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."claim_booking_review_request"("p_booking_id" "uuid") TO "service_role";
 
 
 
@@ -21805,6 +22829,12 @@ GRANT ALL ON FUNCTION "public"."cleanup_expired_welcome_promotion_reservations"(
 
 
 
+REVOKE ALL ON FUNCTION "public"."cleanup_orphaned_pending_subscription"("p_subscription_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."cleanup_orphaned_pending_subscription"("p_subscription_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."cleanup_orphaned_pending_subscription"("p_subscription_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."complete_cleaner_booking"("p_booking_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."complete_cleaner_booking"("p_booking_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."complete_cleaner_booking"("p_booking_id" "uuid") TO "service_role";
@@ -21834,9 +22864,9 @@ GRANT ALL ON FUNCTION "public"."compute_booking_pricing"("p_service_id" integer,
 
 
 
-GRANT ALL ON FUNCTION "public"."compute_booking_pricing_with_promotion"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_cleaner_id" "uuid", "p_channel" "text", "p_recurrence_interval" "text", "p_is_recurring" boolean, "p_include_booking_cover" boolean, "p_supplies_option" "text", "p_customer_id" "uuid", "p_promotion_slug" "text", "p_lat" double precision, "p_lng" double precision, "p_extra_task_ids" "text"[], "p_booking_id" "uuid", "p_service_duration_option_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."compute_booking_pricing_with_promotion"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_cleaner_id" "uuid", "p_channel" "text", "p_recurrence_interval" "text", "p_is_recurring" boolean, "p_include_booking_cover" boolean, "p_supplies_option" "text", "p_customer_id" "uuid", "p_promotion_slug" "text", "p_lat" double precision, "p_lng" double precision, "p_extra_task_ids" "text"[], "p_booking_id" "uuid", "p_service_duration_option_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."compute_booking_pricing_with_promotion"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_cleaner_id" "uuid", "p_channel" "text", "p_recurrence_interval" "text", "p_is_recurring" boolean, "p_include_booking_cover" boolean, "p_supplies_option" "text", "p_customer_id" "uuid", "p_promotion_slug" "text", "p_lat" double precision, "p_lng" double precision, "p_extra_task_ids" "text"[], "p_booking_id" "uuid", "p_service_duration_option_id" "uuid") TO "service_role";
+REVOKE ALL ON FUNCTION "public"."compute_booking_pricing_with_promotion"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_cleaner_id" "uuid", "p_channel" "text", "p_recurrence_interval" "text", "p_is_recurring" boolean, "p_include_booking_cover" boolean, "p_supplies_option" "text", "p_customer_id" "uuid", "p_promotion_slug" "text", "p_lat" double precision, "p_lng" double precision, "p_extra_task_ids" "text"[], "p_booking_id" "uuid", "p_service_duration_option_id" "uuid", "p_promotion_code" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."compute_booking_pricing_with_promotion"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_cleaner_id" "uuid", "p_channel" "text", "p_recurrence_interval" "text", "p_is_recurring" boolean, "p_include_booking_cover" boolean, "p_supplies_option" "text", "p_customer_id" "uuid", "p_promotion_slug" "text", "p_lat" double precision, "p_lng" double precision, "p_extra_task_ids" "text"[], "p_booking_id" "uuid", "p_service_duration_option_id" "uuid", "p_promotion_code" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."compute_booking_pricing_with_promotion"("p_service_id" integer, "p_duration_hours_raw" numeric, "p_scheduled_date" "date", "p_service_timezone" "text", "p_cleaner_id" "uuid", "p_channel" "text", "p_recurrence_interval" "text", "p_is_recurring" boolean, "p_include_booking_cover" boolean, "p_supplies_option" "text", "p_customer_id" "uuid", "p_promotion_slug" "text", "p_lat" double precision, "p_lng" double precision, "p_extra_task_ids" "text"[], "p_booking_id" "uuid", "p_service_duration_option_id" "uuid", "p_promotion_code" "text") TO "service_role";
 
 
 
@@ -24094,10 +25124,10 @@ GRANT ALL ON FUNCTION "public"."get_best_available_cleaners_old"("p_date" "date"
 
 
 
-REVOKE ALL ON FUNCTION "public"."get_booking_contact_phone"("p_booking_id" "uuid") FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."get_booking_contact_phone"("p_booking_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."get_booking_contact_phone"("p_booking_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_booking_contact_phone"("p_booking_id" "uuid") TO "service_role";
+REVOKE ALL ON FUNCTION "public"."get_booking_contact_phone"("p_booking_id" "uuid", "p_contact_role" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."get_booking_contact_phone"("p_booking_id" "uuid", "p_contact_role" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_booking_contact_phone"("p_booking_id" "uuid", "p_contact_role" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_booking_contact_phone"("p_booking_id" "uuid", "p_contact_role" "text") TO "service_role";
 
 
 
@@ -24124,6 +25154,13 @@ GRANT ALL ON FUNCTION "public"."get_cleaner_availability_by_id"("p_cleaner_id" "
 GRANT ALL ON FUNCTION "public"."get_cleaner_availability_by_id_old"("p_cleaner_id" "uuid", "p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_timezone" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."get_cleaner_availability_by_id_old"("p_cleaner_id" "uuid", "p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_timezone" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."get_cleaner_availability_by_id_old"("p_cleaner_id" "uuid", "p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_timezone" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."get_cleaner_booking_access_context"("p_booking_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."get_cleaner_booking_access_context"("p_booking_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_cleaner_booking_access_context"("p_booking_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_cleaner_booking_access_context"("p_booking_id" "uuid") TO "service_role";
 
 
 
@@ -25243,15 +26280,17 @@ GRANT ALL ON FUNCTION "public"."process_direct_assignment_holds"() TO "service_r
 
 
 
+REVOKE ALL ON FUNCTION "public"."promotion_admin_row_to_jsonb"("p_row" "public"."promotions") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."promotion_admin_row_to_jsonb"("p_row" "public"."promotions") TO "anon";
 GRANT ALL ON FUNCTION "public"."promotion_admin_row_to_jsonb"("p_row" "public"."promotions") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."promotion_admin_row_to_jsonb"("p_row" "public"."promotions") TO "service_role";
 
 
 
-GRANT ALL ON FUNCTION "public"."promotion_row_audit_snapshot"("p_slug" "text", "p_headline" "text", "p_terms_markdown" "text", "p_type" "text", "p_value" numeric, "p_max_duration_hours" numeric, "p_eligible_service_ids" integer[], "p_exclude_extra_tasks" boolean, "p_requires_service_area" boolean, "p_active" boolean, "p_valid_from" timestamp with time zone, "p_valid_to" timestamp with time zone) TO "anon";
-GRANT ALL ON FUNCTION "public"."promotion_row_audit_snapshot"("p_slug" "text", "p_headline" "text", "p_terms_markdown" "text", "p_type" "text", "p_value" numeric, "p_max_duration_hours" numeric, "p_eligible_service_ids" integer[], "p_exclude_extra_tasks" boolean, "p_requires_service_area" boolean, "p_active" boolean, "p_valid_from" timestamp with time zone, "p_valid_to" timestamp with time zone) TO "authenticated";
-GRANT ALL ON FUNCTION "public"."promotion_row_audit_snapshot"("p_slug" "text", "p_headline" "text", "p_terms_markdown" "text", "p_type" "text", "p_value" numeric, "p_max_duration_hours" numeric, "p_eligible_service_ids" integer[], "p_exclude_extra_tasks" boolean, "p_requires_service_area" boolean, "p_active" boolean, "p_valid_from" timestamp with time zone, "p_valid_to" timestamp with time zone) TO "service_role";
+REVOKE ALL ON FUNCTION "public"."promotion_row_audit_snapshot"("p_slug" "text", "p_headline" "text", "p_terms_markdown" "text", "p_type" "text", "p_value" numeric, "p_max_duration_hours" numeric, "p_eligible_service_ids" integer[], "p_exclude_extra_tasks" boolean, "p_requires_service_area" boolean, "p_active" boolean, "p_valid_from" timestamp with time zone, "p_valid_to" timestamp with time zone, "p_requires_new_customer" boolean, "p_max_redemptions" integer, "p_max_redemptions_per_user" integer, "p_allow_recurring" boolean) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."promotion_row_audit_snapshot"("p_slug" "text", "p_headline" "text", "p_terms_markdown" "text", "p_type" "text", "p_value" numeric, "p_max_duration_hours" numeric, "p_eligible_service_ids" integer[], "p_exclude_extra_tasks" boolean, "p_requires_service_area" boolean, "p_active" boolean, "p_valid_from" timestamp with time zone, "p_valid_to" timestamp with time zone, "p_requires_new_customer" boolean, "p_max_redemptions" integer, "p_max_redemptions_per_user" integer, "p_allow_recurring" boolean) TO "anon";
+GRANT ALL ON FUNCTION "public"."promotion_row_audit_snapshot"("p_slug" "text", "p_headline" "text", "p_terms_markdown" "text", "p_type" "text", "p_value" numeric, "p_max_duration_hours" numeric, "p_eligible_service_ids" integer[], "p_exclude_extra_tasks" boolean, "p_requires_service_area" boolean, "p_active" boolean, "p_valid_from" timestamp with time zone, "p_valid_to" timestamp with time zone, "p_requires_new_customer" boolean, "p_max_redemptions" integer, "p_max_redemptions_per_user" integer, "p_allow_recurring" boolean) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."promotion_row_audit_snapshot"("p_slug" "text", "p_headline" "text", "p_terms_markdown" "text", "p_type" "text", "p_value" numeric, "p_max_duration_hours" numeric, "p_eligible_service_ids" integer[], "p_exclude_extra_tasks" boolean, "p_requires_service_area" boolean, "p_active" boolean, "p_valid_from" timestamp with time zone, "p_valid_to" timestamp with time zone, "p_requires_new_customer" boolean, "p_max_redemptions" integer, "p_max_redemptions_per_user" integer, "p_allow_recurring" boolean) TO "service_role";
 
 
 
@@ -25314,6 +26353,76 @@ GRANT ALL ON FUNCTION "public"."refresh_subscription_recurrence_dates"("p_subscr
 
 
 
+GRANT ALL ON FUNCTION "public"."regexp_match"("public"."citext", "public"."citext") TO "postgres";
+GRANT ALL ON FUNCTION "public"."regexp_match"("public"."citext", "public"."citext") TO "anon";
+GRANT ALL ON FUNCTION "public"."regexp_match"("public"."citext", "public"."citext") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."regexp_match"("public"."citext", "public"."citext") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."regexp_match"("public"."citext", "public"."citext", "text") TO "postgres";
+GRANT ALL ON FUNCTION "public"."regexp_match"("public"."citext", "public"."citext", "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."regexp_match"("public"."citext", "public"."citext", "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."regexp_match"("public"."citext", "public"."citext", "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."regexp_matches"("public"."citext", "public"."citext") TO "postgres";
+GRANT ALL ON FUNCTION "public"."regexp_matches"("public"."citext", "public"."citext") TO "anon";
+GRANT ALL ON FUNCTION "public"."regexp_matches"("public"."citext", "public"."citext") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."regexp_matches"("public"."citext", "public"."citext") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."regexp_matches"("public"."citext", "public"."citext", "text") TO "postgres";
+GRANT ALL ON FUNCTION "public"."regexp_matches"("public"."citext", "public"."citext", "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."regexp_matches"("public"."citext", "public"."citext", "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."regexp_matches"("public"."citext", "public"."citext", "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."regexp_replace"("public"."citext", "public"."citext", "text") TO "postgres";
+GRANT ALL ON FUNCTION "public"."regexp_replace"("public"."citext", "public"."citext", "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."regexp_replace"("public"."citext", "public"."citext", "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."regexp_replace"("public"."citext", "public"."citext", "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."regexp_replace"("public"."citext", "public"."citext", "text", "text") TO "postgres";
+GRANT ALL ON FUNCTION "public"."regexp_replace"("public"."citext", "public"."citext", "text", "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."regexp_replace"("public"."citext", "public"."citext", "text", "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."regexp_replace"("public"."citext", "public"."citext", "text", "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."regexp_split_to_array"("public"."citext", "public"."citext") TO "postgres";
+GRANT ALL ON FUNCTION "public"."regexp_split_to_array"("public"."citext", "public"."citext") TO "anon";
+GRANT ALL ON FUNCTION "public"."regexp_split_to_array"("public"."citext", "public"."citext") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."regexp_split_to_array"("public"."citext", "public"."citext") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."regexp_split_to_array"("public"."citext", "public"."citext", "text") TO "postgres";
+GRANT ALL ON FUNCTION "public"."regexp_split_to_array"("public"."citext", "public"."citext", "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."regexp_split_to_array"("public"."citext", "public"."citext", "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."regexp_split_to_array"("public"."citext", "public"."citext", "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."regexp_split_to_table"("public"."citext", "public"."citext") TO "postgres";
+GRANT ALL ON FUNCTION "public"."regexp_split_to_table"("public"."citext", "public"."citext") TO "anon";
+GRANT ALL ON FUNCTION "public"."regexp_split_to_table"("public"."citext", "public"."citext") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."regexp_split_to_table"("public"."citext", "public"."citext") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."regexp_split_to_table"("public"."citext", "public"."citext", "text") TO "postgres";
+GRANT ALL ON FUNCTION "public"."regexp_split_to_table"("public"."citext", "public"."citext", "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."regexp_split_to_table"("public"."citext", "public"."citext", "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."regexp_split_to_table"("public"."citext", "public"."citext", "text") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."register_booking_job_photo"("p_booking_id" "uuid", "p_photo_type" "text", "p_storage_path" "text", "p_caption" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."register_booking_job_photo"("p_booking_id" "uuid", "p_photo_type" "text", "p_storage_path" "text", "p_caption" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."register_booking_job_photo"("p_booking_id" "uuid", "p_photo_type" "text", "p_storage_path" "text", "p_caption" "text") TO "service_role";
@@ -25364,6 +26473,20 @@ REVOKE ALL ON FUNCTION "public"."remove_co_cleaner_from_team"("p_co_cleaner_id" 
 GRANT ALL ON FUNCTION "public"."remove_co_cleaner_from_team"("p_co_cleaner_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."remove_co_cleaner_from_team"("p_co_cleaner_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."remove_co_cleaner_from_team"("p_co_cleaner_id" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."replace"("public"."citext", "public"."citext", "public"."citext") TO "postgres";
+GRANT ALL ON FUNCTION "public"."replace"("public"."citext", "public"."citext", "public"."citext") TO "anon";
+GRANT ALL ON FUNCTION "public"."replace"("public"."citext", "public"."citext", "public"."citext") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."replace"("public"."citext", "public"."citext", "public"."citext") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."reserve_promotion_for_booking"("p_booking_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."reserve_promotion_for_booking"("p_booking_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."reserve_promotion_for_booking"("p_booking_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."reserve_promotion_for_booking"("p_booking_id" "uuid") TO "service_role";
 
 
 
@@ -25460,6 +26583,12 @@ GRANT ALL ON FUNCTION "public"."service_schedule_timestamptz"("p_schedule_date" 
 
 
 
+GRANT ALL ON FUNCTION "public"."set_booking_completed_at"() TO "anon";
+GRANT ALL ON FUNCTION "public"."set_booking_completed_at"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."set_booking_completed_at"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."set_booking_timezone"() TO "anon";
 GRANT ALL ON FUNCTION "public"."set_booking_timezone"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."set_booking_timezone"() TO "service_role";
@@ -25487,6 +26616,13 @@ GRANT ALL ON FUNCTION "public"."set_platform_config_updated_at"() TO "service_ro
 GRANT ALL ON FUNCTION "public"."set_updated_at"() TO "anon";
 GRANT ALL ON FUNCTION "public"."set_updated_at"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."set_updated_at"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."split_part"("public"."citext", "public"."citext", integer) TO "postgres";
+GRANT ALL ON FUNCTION "public"."split_part"("public"."citext", "public"."citext", integer) TO "anon";
+GRANT ALL ON FUNCTION "public"."split_part"("public"."citext", "public"."citext", integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."split_part"("public"."citext", "public"."citext", integer) TO "service_role";
 
 
 
@@ -28415,6 +29551,13 @@ GRANT ALL ON FUNCTION "public"."start_cleaner_booking"("p_booking_id" "uuid") TO
 
 
 
+GRANT ALL ON FUNCTION "public"."strpos"("public"."citext", "public"."citext") TO "postgres";
+GRANT ALL ON FUNCTION "public"."strpos"("public"."citext", "public"."citext") TO "anon";
+GRANT ALL ON FUNCTION "public"."strpos"("public"."citext", "public"."citext") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."strpos"("public"."citext", "public"."citext") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."submit_booking_review"("p_booking_id" "uuid", "p_rating" integer, "p_comment" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."submit_booking_review"("p_booking_id" "uuid", "p_rating" integer, "p_comment" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."submit_booking_review"("p_booking_id" "uuid", "p_rating" integer, "p_comment" "text") TO "service_role";
@@ -28457,6 +29600,62 @@ GRANT ALL ON FUNCTION "public"."sync_profile_name_from_payout"("p_user_id" "uuid
 
 
 
+GRANT ALL ON FUNCTION "public"."texticlike"("public"."citext", "text") TO "postgres";
+GRANT ALL ON FUNCTION "public"."texticlike"("public"."citext", "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."texticlike"("public"."citext", "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."texticlike"("public"."citext", "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."texticlike"("public"."citext", "public"."citext") TO "postgres";
+GRANT ALL ON FUNCTION "public"."texticlike"("public"."citext", "public"."citext") TO "anon";
+GRANT ALL ON FUNCTION "public"."texticlike"("public"."citext", "public"."citext") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."texticlike"("public"."citext", "public"."citext") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."texticnlike"("public"."citext", "text") TO "postgres";
+GRANT ALL ON FUNCTION "public"."texticnlike"("public"."citext", "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."texticnlike"("public"."citext", "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."texticnlike"("public"."citext", "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."texticnlike"("public"."citext", "public"."citext") TO "postgres";
+GRANT ALL ON FUNCTION "public"."texticnlike"("public"."citext", "public"."citext") TO "anon";
+GRANT ALL ON FUNCTION "public"."texticnlike"("public"."citext", "public"."citext") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."texticnlike"("public"."citext", "public"."citext") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."texticregexeq"("public"."citext", "text") TO "postgres";
+GRANT ALL ON FUNCTION "public"."texticregexeq"("public"."citext", "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."texticregexeq"("public"."citext", "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."texticregexeq"("public"."citext", "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."texticregexeq"("public"."citext", "public"."citext") TO "postgres";
+GRANT ALL ON FUNCTION "public"."texticregexeq"("public"."citext", "public"."citext") TO "anon";
+GRANT ALL ON FUNCTION "public"."texticregexeq"("public"."citext", "public"."citext") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."texticregexeq"("public"."citext", "public"."citext") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."texticregexne"("public"."citext", "text") TO "postgres";
+GRANT ALL ON FUNCTION "public"."texticregexne"("public"."citext", "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."texticregexne"("public"."citext", "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."texticregexne"("public"."citext", "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."texticregexne"("public"."citext", "public"."citext") TO "postgres";
+GRANT ALL ON FUNCTION "public"."texticregexne"("public"."citext", "public"."citext") TO "anon";
+GRANT ALL ON FUNCTION "public"."texticregexne"("public"."citext", "public"."citext") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."texticregexne"("public"."citext", "public"."citext") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."time_dist"(time without time zone, time without time zone) TO "postgres";
 GRANT ALL ON FUNCTION "public"."time_dist"(time without time zone, time without time zone) TO "anon";
 GRANT ALL ON FUNCTION "public"."time_dist"(time without time zone, time without time zone) TO "authenticated";
@@ -28479,6 +29678,13 @@ GRANT ALL ON FUNCTION "public"."touch_message_delivery_attempt_updated_at"() TO 
 GRANT ALL ON FUNCTION "public"."touch_payout_methods_updated_at"() TO "anon";
 GRANT ALL ON FUNCTION "public"."touch_payout_methods_updated_at"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."touch_payout_methods_updated_at"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."translate"("public"."citext", "public"."citext", "text") TO "postgres";
+GRANT ALL ON FUNCTION "public"."translate"("public"."citext", "public"."citext", "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."translate"("public"."citext", "public"."citext", "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."translate"("public"."citext", "public"."citext", "text") TO "service_role";
 
 
 
@@ -28582,9 +29788,10 @@ GRANT ALL ON FUNCTION "public"."update_platform_fees_updated_at"() TO "service_r
 
 
 
-GRANT ALL ON FUNCTION "public"."update_promotion_config_admin"("p_promotion_id" "uuid", "p_expected_updated_at" timestamp with time zone, "p_headline" "text", "p_terms_markdown" "text", "p_type" "text", "p_value" numeric, "p_max_duration_hours" numeric, "p_eligible_service_ids" integer[], "p_exclude_extra_tasks" boolean, "p_requires_service_area" boolean, "p_active" boolean, "p_valid_from" timestamp with time zone, "p_valid_to" timestamp with time zone, "p_changed_by" "uuid", "p_changed_by_email" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."update_promotion_config_admin"("p_promotion_id" "uuid", "p_expected_updated_at" timestamp with time zone, "p_headline" "text", "p_terms_markdown" "text", "p_type" "text", "p_value" numeric, "p_max_duration_hours" numeric, "p_eligible_service_ids" integer[], "p_exclude_extra_tasks" boolean, "p_requires_service_area" boolean, "p_active" boolean, "p_valid_from" timestamp with time zone, "p_valid_to" timestamp with time zone, "p_changed_by" "uuid", "p_changed_by_email" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."update_promotion_config_admin"("p_promotion_id" "uuid", "p_expected_updated_at" timestamp with time zone, "p_headline" "text", "p_terms_markdown" "text", "p_type" "text", "p_value" numeric, "p_max_duration_hours" numeric, "p_eligible_service_ids" integer[], "p_exclude_extra_tasks" boolean, "p_requires_service_area" boolean, "p_active" boolean, "p_valid_from" timestamp with time zone, "p_valid_to" timestamp with time zone, "p_changed_by" "uuid", "p_changed_by_email" "text") TO "service_role";
+REVOKE ALL ON FUNCTION "public"."update_promotion_config_admin"("p_promotion_id" "uuid", "p_expected_updated_at" timestamp with time zone, "p_headline" "text", "p_terms_markdown" "text", "p_type" "text", "p_value" numeric, "p_max_duration_hours" numeric, "p_eligible_service_ids" integer[], "p_exclude_extra_tasks" boolean, "p_requires_service_area" boolean, "p_active" boolean, "p_valid_from" timestamp with time zone, "p_valid_to" timestamp with time zone, "p_changed_by" "uuid", "p_changed_by_email" "text", "p_requires_new_customer" boolean, "p_max_redemptions" integer, "p_max_redemptions_per_user" integer, "p_allow_recurring" boolean) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."update_promotion_config_admin"("p_promotion_id" "uuid", "p_expected_updated_at" timestamp with time zone, "p_headline" "text", "p_terms_markdown" "text", "p_type" "text", "p_value" numeric, "p_max_duration_hours" numeric, "p_eligible_service_ids" integer[], "p_exclude_extra_tasks" boolean, "p_requires_service_area" boolean, "p_active" boolean, "p_valid_from" timestamp with time zone, "p_valid_to" timestamp with time zone, "p_changed_by" "uuid", "p_changed_by_email" "text", "p_requires_new_customer" boolean, "p_max_redemptions" integer, "p_max_redemptions_per_user" integer, "p_allow_recurring" boolean) TO "anon";
+GRANT ALL ON FUNCTION "public"."update_promotion_config_admin"("p_promotion_id" "uuid", "p_expected_updated_at" timestamp with time zone, "p_headline" "text", "p_terms_markdown" "text", "p_type" "text", "p_value" numeric, "p_max_duration_hours" numeric, "p_eligible_service_ids" integer[], "p_exclude_extra_tasks" boolean, "p_requires_service_area" boolean, "p_active" boolean, "p_valid_from" timestamp with time zone, "p_valid_to" timestamp with time zone, "p_changed_by" "uuid", "p_changed_by_email" "text", "p_requires_new_customer" boolean, "p_max_redemptions" integer, "p_max_redemptions_per_user" integer, "p_allow_recurring" boolean) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."update_promotion_config_admin"("p_promotion_id" "uuid", "p_expected_updated_at" timestamp with time zone, "p_headline" "text", "p_terms_markdown" "text", "p_type" "text", "p_value" numeric, "p_max_duration_hours" numeric, "p_eligible_service_ids" integer[], "p_exclude_extra_tasks" boolean, "p_requires_service_area" boolean, "p_active" boolean, "p_valid_from" timestamp with time zone, "p_valid_to" timestamp with time zone, "p_changed_by" "uuid", "p_changed_by_email" "text", "p_requires_new_customer" boolean, "p_max_redemptions" integer, "p_max_redemptions_per_user" integer, "p_allow_recurring" boolean) TO "service_role";
 
 
 
@@ -28640,12 +29847,33 @@ GRANT ALL ON FUNCTION "public"."validate_booking_timeslot_24h_debug"("p_start_ti
 
 
 
+REVOKE ALL ON FUNCTION "public"."validate_promotion_code"("p_code" "text", "p_customer_id" "uuid", "p_channel" "text", "p_service_id" integer, "p_lat" double precision, "p_lng" double precision, "p_extra_task_ids" "text"[], "p_is_recurring" boolean, "p_booking_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."validate_promotion_code"("p_code" "text", "p_customer_id" "uuid", "p_channel" "text", "p_service_id" integer, "p_lat" double precision, "p_lng" double precision, "p_extra_task_ids" "text"[], "p_is_recurring" boolean, "p_booking_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."validate_promotion_code"("p_code" "text", "p_customer_id" "uuid", "p_channel" "text", "p_service_id" integer, "p_lat" double precision, "p_lng" double precision, "p_extra_task_ids" "text"[], "p_is_recurring" boolean, "p_booking_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."validate_promotion_code"("p_code" "text", "p_customer_id" "uuid", "p_channel" "text", "p_service_id" integer, "p_lat" double precision, "p_lng" double precision, "p_extra_task_ids" "text"[], "p_is_recurring" boolean, "p_booking_id" "uuid") TO "service_role";
 
 
 
 
 
 
+
+
+
+
+
+
+GRANT ALL ON FUNCTION "public"."max"("public"."citext") TO "postgres";
+GRANT ALL ON FUNCTION "public"."max"("public"."citext") TO "anon";
+GRANT ALL ON FUNCTION "public"."max"("public"."citext") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."max"("public"."citext") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."min"("public"."citext") TO "postgres";
+GRANT ALL ON FUNCTION "public"."min"("public"."citext") TO "anon";
+GRANT ALL ON FUNCTION "public"."min"("public"."citext") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."min"("public"."citext") TO "service_role";
 
 
 
@@ -29224,6 +30452,10 @@ GRANT ALL ON TABLE "public"."preferred_cleaners" TO "service_role";
 GRANT SELECT,REFERENCES,TRIGGER,TRUNCATE,MAINTAIN ON TABLE "public"."pricing_rules" TO "anon";
 GRANT SELECT,REFERENCES,TRIGGER,TRUNCATE,MAINTAIN ON TABLE "public"."pricing_rules" TO "authenticated";
 GRANT ALL ON TABLE "public"."pricing_rules" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."promotion_codes" TO "service_role";
 
 
 
