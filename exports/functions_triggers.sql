@@ -948,25 +948,12 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'error', 'already_taken');
   END IF;
 
-  IF v_row.assignment_escalated_at IS NOT NULL THEN
-    RETURN jsonb_build_object('success', false, 'error', 'not_eligible');
-  END IF;
-
   IF v_row.assignment_phase = 'exclusive' THEN
-    v_eligible := (
-      v_row.direct_assigned_cleaner_id = v_uid
-      OR v_row.cleaner_id = v_uid
-    )
-    AND v_row.status IN ('pending', 'confirmed', 'scheduled')
-    AND (
-      v_row.assignment_hold_until IS NULL
-      OR v_row.assignment_hold_until > now()
-    );
+    v_eligible := public.cleaner_is_eligible_for_exclusive_assignment(p_booking_id, v_uid);
   ELSIF v_row.assignment_phase = 'broadcast' THEN
     v_eligible := public.cleaner_is_eligible_for_broadcast_assignment(p_booking_id, v_uid);
   ELSE
-    v_eligible := v_row.cleaner_id = v_uid
-      AND v_row.status IN ('confirmed', 'scheduled');
+    v_eligible := false;
   END IF;
 
   IF NOT v_eligible THEN
@@ -1456,6 +1443,59 @@ AS $function$
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.admin_explain_customer_risk_block(p_customer_id uuid)
+ RETURNS text
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+DECLARE
+  v_profile public.customer_trust_profiles;
+  v_req jsonb;
+  v_stage text;
+BEGIN
+  IF p_customer_id IS NULL THEN
+    RAISE EXCEPTION 'customer_id is required' USING ERRCODE = 'P0001';
+  END IF;
+
+  v_profile := public.recalculate_customer_trust_profile(p_customer_id);
+  v_req := public.customer_risk_booking_verification_requirement_core(p_customer_id, NULL);
+  v_stage := v_req->>'verification_required_stage';
+
+  IF v_stage IS NULL OR v_stage = '' THEN
+    RETURN 'Allowed because customer is not in manual review and payment/dispatch gates are clear.';
+  END IF;
+
+  IF v_stage = 'before_payment' THEN
+    RETURN format(
+      'Blocked before payment: %s (failed payments total=%s, chargebacks=%s, complaints=%s).',
+      coalesce(v_req->>'verification_required_reason', 'verification required'),
+      v_profile.failed_payment_count,
+      v_profile.chargeback_count,
+      v_profile.cleaner_complaint_count
+    );
+  END IF;
+
+  IF v_stage = 'before_dispatch' THEN
+    RETURN format(
+      'Allowed to pay but blocked before dispatch: %s ID verified=%s, completed bookings=%s.',
+      coalesce(v_req->>'verification_required_reason', 'dispatch verification required'),
+      v_profile.id_verified,
+      v_profile.completed_bookings_count
+    );
+  END IF;
+
+  RETURN format(
+    'Manual review: %s (chargebacks=%s, complaints=%s, last reviewed=%s).',
+    coalesce(v_req->>'verification_required_reason', 'manual review required'),
+    v_profile.chargeback_count,
+    v_profile.cleaner_complaint_count,
+    coalesce(to_char(v_profile.last_reviewed_at, 'YYYY-MM-DD HH24:MI'), 'never')
+  );
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.admin_soft_delete_user(p_user_id uuid, p_reason text DEFAULT 'Deleted by admin'::text)
  RETURNS void
  LANGUAGE plpgsql
@@ -1640,6 +1680,54 @@ end;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.apply_stop_booking_unassigned_ops_reminders(p_booking_id uuid, p_actor_id uuid DEFAULT NULL::uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_row public.bookings%ROWTYPE;
+BEGIN
+  IF p_booking_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'missing_booking_id');
+  END IF;
+
+  SELECT * INTO v_row
+  FROM public.bookings
+  WHERE id = p_booking_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_found');
+  END IF;
+
+  IF v_row.ops_unassigned_paid_reminders_stopped_at IS NOT NULL THEN
+    RETURN jsonb_build_object(
+      'success', true,
+      'already_stopped', true,
+      'booking_id', p_booking_id,
+      'stopped_at', v_row.ops_unassigned_paid_reminders_stopped_at
+    );
+  END IF;
+
+  UPDATE public.bookings
+  SET
+    ops_unassigned_paid_reminders_stopped_at = now(),
+    ops_unassigned_paid_reminders_stopped_by = p_actor_id,
+    updated_at = now(),
+    last_updated = now()
+  WHERE id = p_booking_id;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'booking_id', p_booking_id,
+    'stopped_at', now()
+  );
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.approve_and_complete_booking(p_booking_id uuid, p_rating integer, p_feedback text)
  RETURNS void
  LANGUAGE plpgsql
@@ -1678,17 +1766,13 @@ CREATE OR REPLACE FUNCTION public.approve_cleaner_application(p_application_id u
  SET search_path TO 'public', 'pg_temp'
 AS $function$
 DECLARE
-  v_app                public.cleaner_applications%ROWTYPE;
-  v_user_id            uuid;
-  v_first_name         text;
-  v_last_name          text;
-  v_app_phone_e164     text;
-  v_now                timestamptz := now();
-  v_roles_inserted     int := 0;
-  v_service_categories public.service_category[];
-  v_language_ids       text[];
-  v_languages          text[];
-  v_pets_comfort       text;
+  v_app             public.cleaner_applications%ROWTYPE;
+  v_user_id         uuid;
+  v_first_name      text;
+  v_last_name       text;
+  v_app_phone_e164  text;
+  v_now             timestamptz := now();
+  v_roles_inserted  int := 0;
 BEGIN
   SELECT * INTO v_app
   FROM public.cleaner_applications
@@ -1729,20 +1813,6 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'user_not_found' USING ERRCODE = 'P0002';
   END IF;
-
-  SELECT array_agg(DISTINCT st.category)
-  INTO v_service_categories
-  FROM unnest(COALESCE(v_app.service_type_ids, '{}'::int[])) AS sid
-  JOIN public.service_types st ON st.id = sid
-  WHERE st.category IS NOT NULL;
-
-  v_language_ids := public.resolve_cleaner_application_language_ids(v_app);
-  v_languages := CASE
-    WHEN cardinality(v_language_ids) > 0
-      THEN public.cleaner_language_labels_from_application(v_language_ids)
-    ELSE NULL
-  END;
-  v_pets_comfort := public.resolve_cleaner_application_pets_comfort(v_app);
 
   v_first_name := NULLIF(split_part(trim(coalesce(v_app.name, '')), ' ', 1), '');
 
@@ -1790,10 +1860,7 @@ BEGIN
     skills,
     certifications,
     service_areas,
-    service_categories,
     hourly_rate,
-    languages,
-    pets_comfort,
     status,
     verified,
     updated_at
@@ -1804,27 +1871,17 @@ BEGIN
     v_app.skills,
     v_app.certifications,
     v_app.service_areas,
-    v_service_categories,
     v_app.hourly_rate,
-    COALESCE(v_languages, ARRAY['English']::text[]),
-    v_pets_comfort,
     'active',
     true,
     v_now
   )
   ON CONFLICT (user_id) DO UPDATE SET
-    bio                = COALESCE(NULLIF(EXCLUDED.bio, ''), public.cleaner_data.bio),
-    skills             = COALESCE(EXCLUDED.skills, public.cleaner_data.skills),
-    certifications     = COALESCE(EXCLUDED.certifications, public.cleaner_data.certifications),
-    service_areas      = COALESCE(EXCLUDED.service_areas, public.cleaner_data.service_areas),
-    service_categories = COALESCE(EXCLUDED.service_categories, public.cleaner_data.service_categories),
-    hourly_rate        = COALESCE(EXCLUDED.hourly_rate, public.cleaner_data.hourly_rate),
-    languages          = COALESCE(
-      v_languages,
-      public.cleaner_data.languages,
-      ARRAY['English']::text[]
-    ),
-    pets_comfort       = COALESCE(v_pets_comfort, public.cleaner_data.pets_comfort),
+    bio            = COALESCE(NULLIF(EXCLUDED.bio, ''), public.cleaner_data.bio),
+    skills         = COALESCE(EXCLUDED.skills, public.cleaner_data.skills),
+    certifications = COALESCE(EXCLUDED.certifications, public.cleaner_data.certifications),
+    service_areas  = COALESCE(EXCLUDED.service_areas, public.cleaner_data.service_areas),
+    hourly_rate    = COALESCE(EXCLUDED.hourly_rate, public.cleaner_data.hourly_rate),
     status = CASE
       WHEN public.cleaner_data.status = 'suspended'
       THEN public.cleaner_data.status
@@ -1894,6 +1951,15 @@ BEGIN
   v_payment := lower(trim(coalesce(v_row.payment_status, '')));
   IF v_payment <> 'paid' THEN
     RETURN jsonb_build_object('success', false, 'error', 'payment_not_paid');
+  END IF;
+
+  IF v_row.customer_id IS NOT NULL
+     AND NOT public.customer_trust_can_dispatch_cleaner(v_row.customer_id, p_booking_id) THEN
+    RETURN jsonb_build_object(
+      'success', false,
+      'error', 'verification_required',
+      'message', 'Identity verification is required before a cleaner can be assigned'
+    );
   END IF;
 
   IF v_row.cleaner_id IS NOT NULL THEN
@@ -2371,6 +2437,28 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.booking_eligible_for_dispatch_broadcast_retry(p_assignment_phase text, p_created_at timestamp with time zone, p_dispatch_gated_at timestamp with time zone, p_dispatch_gate_cleared_at timestamp with time zone)
+ RETURNS boolean
+ LANGUAGE sql
+ STABLE
+ SET search_path TO 'public'
+AS $function$
+  SELECT
+    p_assignment_phase = 'broadcast'
+    OR (
+      p_assignment_phase IS NULL
+      AND (
+        (p_created_at AT TIME ZONE 'Africa/Accra')::date
+          = (now() AT TIME ZONE 'Africa/Accra')::date
+        OR (
+          p_dispatch_gated_at IS NOT NULL
+          AND p_dispatch_gate_cleared_at IS NULL
+        )
+      )
+    );
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.booking_final_amount_minor(p_final_amount_minor integer, p_total_price numeric)
  RETURNS integer
  LANGUAGE sql
@@ -2676,6 +2764,7 @@ DECLARE
   v_candidate uuid;
   v_notified integer := 0;
   v_bookings integer := 0;
+  v_direct jsonb;
 BEGIN
   PERFORM set_config('app.system_cleaner_discovery', '1', true);
 
@@ -2683,7 +2772,10 @@ BEGIN
     SELECT *
     FROM public.bookings
     WHERE cleaner_id IS NULL
-      AND direct_assigned_cleaner_id IS NULL
+      AND (
+        direct_assigned_cleaner_id IS NULL
+        OR assignment_phase = 'broadcast'
+      )
       AND cleaner_accepted_at IS NULL
       AND assignment_escalated_at IS NULL
       AND lower(COALESCE(payment_status, '')) = 'paid'
@@ -2695,22 +2787,40 @@ BEGIN
       AND public.booking_broadcast_grace_ends_at(
         scheduled_at_utc, duration_hours, duration_final
       ) > now()
-      AND (
-        (
-          assignment_phase IS NULL
-          AND (created_at AT TIME ZONE 'Africa/Accra')::date
-            = (now() AT TIME ZONE 'Africa/Accra')::date
-        )
-        OR assignment_phase = 'broadcast'
+      AND public.booking_eligible_for_dispatch_broadcast_retry(
+        assignment_phase,
+        created_at,
+        dispatch_gated_at,
+        dispatch_gate_cleared_at
       )
     ORDER BY created_at ASC
     FOR UPDATE SKIP LOCKED
   LOOP
+    IF r.customer_id IS NOT NULL
+       AND NOT public.customer_trust_can_dispatch_cleaner(r.customer_id, r.id) THEN
+      UPDATE public.bookings
+      SET
+        dispatch_gated_at = COALESCE(dispatch_gated_at, now()),
+        dispatch_gate_reason = COALESCE(
+          dispatch_gate_reason,
+          'customer_verification_required'
+        ),
+        updated_at = now(),
+        last_updated = now()
+      WHERE id = r.id;
+      CONTINUE;
+    END IF;
+
     IF r.assignment_phase IS NULL THEN
       UPDATE public.bookings
       SET
         assignment_phase = 'broadcast',
         assignment_hold_until = NULL,
+        dispatch_gate_cleared_at = CASE
+          WHEN dispatch_gated_at IS NOT NULL AND dispatch_gate_cleared_at IS NULL
+            THEN now()
+          ELSE dispatch_gate_cleared_at
+        END,
         updated_at = now(),
         last_updated = now()
       WHERE id = r.id;
@@ -2770,10 +2880,13 @@ BEGIN
     END LOOP;
   END LOOP;
 
+  v_direct := public.retry_dispatch_gated_direct_assignments();
+
   RETURN jsonb_build_object(
     'ok', true,
     'bookings_broadcasted', v_bookings,
-    'notifications_created', v_notified
+    'notifications_created', v_notified,
+    'direct_assignment_retries', v_direct
   );
 END;
 $function$
@@ -3776,6 +3889,44 @@ BEGIN
     ) g
     WHERE g.cleaner_id = p_cleaner_id
   );
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.cleaner_is_eligible_for_exclusive_assignment(p_booking_id uuid, p_cleaner_id uuid)
+ RETURNS boolean
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_row public.bookings%ROWTYPE;
+BEGIN
+  IF p_booking_id IS NULL OR p_cleaner_id IS NULL THEN
+    RETURN false;
+  END IF;
+
+  SELECT *
+  INTO v_row
+  FROM public.bookings b
+  WHERE b.id = p_booking_id;
+
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+
+  RETURN v_row.assignment_phase = 'exclusive'
+    AND v_row.cleaner_accepted_at IS NULL
+    AND lower(coalesce(v_row.payment_status, '')) = 'paid'
+    AND v_row.status IN ('pending', 'confirmed', 'scheduled')
+    AND (
+      v_row.direct_assigned_cleaner_id = p_cleaner_id
+      OR v_row.cleaner_id = p_cleaner_id
+    )
+    AND (
+      v_row.assignment_hold_until IS NULL
+      OR v_row.assignment_hold_until > now()
+    );
 END;
 $function$
 
@@ -6070,6 +6221,24 @@ AS $function$
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.customer_trust_can_dispatch_cleaner(p_customer_id uuid, p_booking_id uuid DEFAULT NULL::uuid)
+ RETURNS boolean
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+  SELECT COALESCE(
+    (
+      public.customer_risk_booking_verification_requirement_core(
+        p_customer_id,
+        p_booking_id
+      )->>'can_dispatch_cleaner'
+    )::boolean,
+    false
+  );
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.date_dist(date, date)
  RETURNS integer
  LANGUAGE c
@@ -6086,7 +6255,6 @@ AS $function$
 DECLARE
   v_uid uuid := auth.uid();
   v_row public.bookings%ROWTYPE;
-  v_release jsonb;
 BEGIN
   IF v_uid IS NULL THEN
     RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
@@ -6099,10 +6267,7 @@ BEGIN
   SELECT * INTO v_row
   FROM public.bookings
   WHERE id = p_booking_id
-    AND (
-      cleaner_id = v_uid
-      OR direct_assigned_cleaner_id = v_uid
-    )
+    AND cleaner_id = v_uid
     AND status IN ('confirmed', 'scheduled')
   FOR UPDATE;
 
@@ -6110,22 +6275,10 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'error', 'not_declinable');
   END IF;
 
-  IF lower(COALESCE(v_row.payment_status, '')) = 'paid'
-     AND v_row.cleaner_accepted_at IS NULL
-     AND v_row.assignment_phase IN ('exclusive', 'broadcast')
-  THEN
-    v_release := public.release_booking_to_broadcast(p_booking_id);
-    IF COALESCE(v_release->>'success', 'false') <> 'true' THEN
-      RETURN jsonb_build_object('success', false, 'error', 'release_failed');
-    END IF;
-    RETURN jsonb_build_object('success', true, 'booking_id', p_booking_id, 'released_to_broadcast', true);
-  END IF;
-
   UPDATE public.bookings
   SET
     status = 'cancelled',
-    updated_at = now(),
-    last_updated = now()
+    updated_at = now()
   WHERE id = p_booking_id;
 
   IF v_row.customer_id IS NOT NULL THEN
@@ -9778,9 +9931,18 @@ BEGIN
     FROM public.bookings b
     WHERE b.id = p_exclude_booking_id
       AND b.customer_id = p_customer_id
-      AND b.subscription_id IS NULL
-      AND b.status IN ('pending', 'confirmed', 'scheduled')
-      AND lower(coalesce(b.payment_status::text, 'pending')) IN ('pending', 'paid', 'success')
+      AND (
+        (
+          b.subscription_id IS NULL
+          AND b.status IN ('pending', 'confirmed', 'scheduled')
+          AND lower(coalesce(b.payment_status::text, 'pending')) IN ('pending', 'paid', 'success')
+        )
+        OR (
+          b.subscription_id IS NOT NULL
+          AND b.status IN ('pending', 'confirmed')
+          AND lower(coalesce(b.payment_status::text, 'pending')) = 'pending'
+        )
+      )
     LIMIT 1;
 
     IF v_safe_exclude_booking_id IS NULL THEN
@@ -10302,6 +10464,115 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.get_best_available_cleaners(p_date date, p_time time without time zone, p_duration numeric, p_lat double precision, p_lng double precision, p_max_distance_meters integer, p_requested_services text[])
+ RETURNS TABLE(cleaner_id uuid, cleaner_name text, avatar_url text, bio text, hourly_rate numeric, rating double precision, distance_meters double precision, final_score double precision)
+ LANGUAGE plpgsql
+ STABLE
+AS $function$
+DECLARE
+  v_cust_id uuid := auth.uid();
+  v_booking_range tstzrange;
+  v_cust_loc geography := ST_SetSRID(ST_MakePoint(p_lng, p_lat), 4326)::geography;
+BEGIN
+  IF v_cust_id IS NULL THEN
+    RAISE EXCEPTION 'Not authorized';
+  END IF;
+
+  v_booking_range := tstzrange(
+    (p_date + p_time)::timestamptz,
+    (p_date + p_time + (p_duration || ' hours')::interval)::timestamptz,
+    '[)'
+  );
+
+  RETURN QUERY
+  WITH available_cleaners AS (
+    SELECT
+      cd.user_id AS cleaner_user_id,
+      p.fullname AS cleaner_fullname,
+      p.avatar_url AS profile_avatar_url,
+      COALESCE(cd.bio, p.bio) AS profile_bio,
+      cd.hourly_rate AS cleaner_hourly_rate,
+      cd.rating AS cleaner_rating,
+      cd.skills AS cleaner_skills,
+      cd.specialties AS cleaner_specialties,
+      COALESCE(cd.base_location::geography, p.location_wkt) AS effective_location,
+      ST_Distance(
+        COALESCE(cd.base_location::geography, p.location_wkt),
+        v_cust_loc
+      )::float AS dist
+    FROM public.cleaner_data cd
+    JOIN public.profiles p ON p.user_id = cd.user_id
+    WHERE cd.status = 'active'
+      AND cd.verified = true
+      AND COALESCE(cd.base_location::geography, p.location_wkt) IS NOT NULL
+      AND (
+        auth.uid() = cd.user_id
+        OR public.is_profile_discoverable_by_others(p)
+      )
+      AND ST_DWithin(
+        COALESCE(cd.base_location::geography, p.location_wkt),
+        v_cust_loc,
+        LEAST(
+          COALESCE(cd.max_travel_distance_meters, p_max_distance_meters),
+          p_max_distance_meters
+        )
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM public.bookings b
+        WHERE b.cleaner_id = cd.user_id
+          AND b.booking_period && v_booking_range
+          AND b.status != 'cancelled'
+      )
+      AND NOT EXISTS (
+        SELECT 1
+        FROM public.cleaner_availability_exceptions cae
+        WHERE cae.cleaner_id = cd.user_id
+          AND cae.exception_date = p_date
+      )
+  ),
+  scored_cleaners AS (
+    SELECT
+      ac.cleaner_user_id,
+      ac.cleaner_fullname,
+      ac.profile_avatar_url,
+      ac.profile_bio,
+      ac.cleaner_hourly_rate,
+      ac.cleaner_rating,
+      ac.cleaner_skills,
+      ac.cleaner_specialties,
+      ac.dist,
+      CASE
+        WHEN cardinality(COALESCE(p_requested_services, ARRAY[]::text[])) > 0
+        THEN (
+          SELECT count(*)::float / cardinality(p_requested_services)
+          FROM unnest(p_requested_services) s
+          WHERE s = ANY(COALESCE(ac.cleaner_skills, ARRAY[]::text[]))
+             OR s = ANY(COALESCE(ac.cleaner_specialties, ARRAY[]::text[]))
+        ) * 40
+        ELSE 20
+      END AS s_score
+    FROM available_cleaners ac
+  )
+  SELECT
+    sc.cleaner_user_id AS cleaner_id,
+    sc.cleaner_fullname AS cleaner_name,
+    sc.profile_avatar_url AS avatar_url,
+    sc.profile_bio AS bio,
+    sc.cleaner_hourly_rate AS hourly_rate,
+    sc.cleaner_rating::float AS rating,
+    sc.dist::float AS distance_meters,
+    (
+      (GREATEST(0, (1.0 - (sc.dist / p_max_distance_meters))) * 30)
+      + (COALESCE(sc.cleaner_rating, 0) / 5.0 * 30)
+      + sc.s_score
+    )::float AS final_score
+  FROM scored_cleaners sc
+  ORDER BY final_score DESC, sc.dist ASC;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.get_best_available_cleaners(p_date date, p_time time without time zone, p_duration numeric, p_lat double precision, p_lng double precision, p_max_distance_meters integer, p_requested_services text[], p_exclude_booking_id uuid DEFAULT NULL::uuid, p_requested_category service_category DEFAULT NULL::service_category)
  RETURNS TABLE(cleaner_id uuid, cleaner_name text, avatar_url text, bio text, hourly_rate numeric, rating double precision, review_count integer, distance_meters double precision, final_score double precision, company_name text, team_size integer, team_role text, specialties text[])
  LANGUAGE plpgsql
@@ -10693,8 +10964,6 @@ DECLARE
   v_uid uuid := auth.uid();
   v_row public.bookings%ROWTYPE;
   v_eligible boolean := false;
-  v_location record;
-  v_offer jsonb;
 BEGIN
   IF v_uid IS NULL OR p_booking_id IS NULL THEN
     RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
@@ -10711,57 +10980,17 @@ BEGIN
 
   IF v_row.cleaner_accepted_at IS NOT NULL OR v_row.assignment_phase = 'accepted' THEN
     IF v_row.cleaner_id = v_uid THEN
-      v_offer := public.build_cleaner_assignment_offer_payload(p_booking_id);
-
-      SELECT *
-      INTO v_location
-      FROM public.get_cleaner_booking_location_fields(ARRAY[p_booking_id])
-      WHERE booking_id = p_booking_id;
-
-      IF v_location IS NOT NULL THEN
-        v_offer := v_offer || jsonb_build_object(
-          'address_revealed', coalesce(v_location.full_address_available, false),
-          'display_location', v_location.display_location,
-          'full_address', CASE
-            WHEN coalesce(v_location.full_address_available, false) THEN v_location.address
-            ELSE NULL
-          END,
-          'coordinates_accuracy', v_location.coordinates_accuracy,
-          'approximate_latitude', CASE
-            WHEN v_location.location_coordinates IS NOT NULL THEN ST_Y(v_location.location_coordinates::geometry)
-            ELSE NULL
-          END,
-          'approximate_longitude', CASE
-            WHEN v_location.location_coordinates IS NOT NULL THEN ST_X(v_location.location_coordinates::geometry)
-            ELSE NULL
-          END
-        );
-      END IF;
-
       RETURN jsonb_build_object(
         'success', true,
         'already_accepted', true,
-        'offer', v_offer
+        'offer', public.build_cleaner_assignment_offer_payload(p_booking_id)
       );
     END IF;
     RETURN jsonb_build_object('success', false, 'error', 'already_taken');
   END IF;
 
-  IF v_row.assignment_escalated_at IS NOT NULL THEN
-    RETURN jsonb_build_object('success', false, 'error', 'not_eligible');
-  END IF;
-
   IF v_row.assignment_phase = 'exclusive' THEN
-    v_eligible := (
-      v_row.direct_assigned_cleaner_id = v_uid
-      OR v_row.cleaner_id = v_uid
-    )
-    AND lower(coalesce(v_row.payment_status, '')) = 'paid'
-    AND v_row.status IN ('pending', 'confirmed', 'scheduled')
-    AND (
-      v_row.assignment_hold_until IS NULL
-      OR v_row.assignment_hold_until > now()
-    );
+    v_eligible := public.cleaner_is_eligible_for_exclusive_assignment(p_booking_id, v_uid);
   ELSIF v_row.assignment_phase = 'broadcast' THEN
     v_eligible := public.cleaner_is_eligible_for_broadcast_assignment(p_booking_id, v_uid);
   ELSE
@@ -10776,6 +11005,46 @@ BEGIN
     'success', true,
     'offer', public.build_cleaner_assignment_offer_payload(p_booking_id)
   );
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.get_cleaner_availability_by_id(p_cleaner_id uuid, p_date date, p_time time without time zone, p_duration numeric, p_timezone text DEFAULT 'UTC'::text)
+ RETURNS TABLE(id uuid, fullname text, avatar_url text, hourly_rate numeric, is_available boolean)
+ LANGUAGE plpgsql
+ STABLE
+AS $function$
+DECLARE
+    v_start_local timestamp;
+    v_end_local   timestamp;
+    v_requested_range tstzrange;
+BEGIN
+    v_start_local := (p_date + p_time)::timestamp;
+    v_end_local   := v_start_local + (p_duration * interval '1 hour') + interval '1 hour';
+
+    v_requested_range := tstzrange(
+        (v_start_local AT TIME ZONE p_timezone),
+        (v_end_local   AT TIME ZONE p_timezone),
+        '[)'
+    );
+
+    RETURN QUERY
+    SELECT
+        cd.user_id,
+        p.fullname,
+        p.avatar_url,
+        cd.hourly_rate,
+        NOT EXISTS (
+            SELECT 1
+            FROM public.bookings b
+            WHERE b.cleaner_id = p_cleaner_id
+              AND b.booking_period && v_requested_range
+              AND b.status IS DISTINCT FROM 'cancelled'
+        ) AS is_available
+    FROM public.cleaner_data cd
+    JOIN public.profiles p ON p.id = cd.user_id
+    WHERE cd.user_id = p_cleaner_id
+      AND cd.status = 'active';
 END;
 $function$
 
@@ -10957,6 +11226,55 @@ BEGIN
       ELSE NULL
     END,
     'customer_contact_available', v_customer_phone IS NOT NULL
+  );
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.get_cleaner_booking_location_fields(p_booking_id uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_row public.bookings%ROWTYPE;
+  v_lat double precision;
+  v_lng double precision;
+BEGIN
+  IF v_uid IS NULL OR p_booking_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  SELECT *
+  INTO v_row
+  FROM public.bookings b
+  WHERE b.id = p_booking_id;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_found');
+  END IF;
+
+  IF v_row.cleaner_id IS DISTINCT FROM v_uid
+     OR v_row.cleaner_accepted_at IS NULL THEN
+    RETURN jsonb_build_object(
+      'success', true,
+      'address_revealed', false
+    );
+  END IF;
+
+  IF v_row.location_coordinates IS NOT NULL THEN
+    v_lat := ST_Y(v_row.location_coordinates::geometry);
+    v_lng := ST_X(v_row.location_coordinates::geometry);
+  END IF;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'address_revealed', true,
+    'address', v_row.address,
+    'latitude', v_lat,
+    'longitude', v_lng
   );
 END;
 $function$
@@ -11183,12 +11501,10 @@ CREATE OR REPLACE FUNCTION public.get_cleaner_profile_v1(target_user_id uuid)
  RETURNS jsonb
  LANGUAGE plpgsql
  SECURITY DEFINER
- SET search_path TO 'public', 'pg_temp'
+ SET search_path TO 'public'
 AS $function$
 DECLARE
   v_profile public.profiles%ROWTYPE;
-  v_user_id uuid;
-  v_team jsonb;
   result jsonb;
 BEGIN
   SELECT *
@@ -11202,8 +11518,7 @@ BEGIN
     RETURN jsonb_build_object(
       'profile', NULL,
       'cleaner_data', NULL,
-      'verification', NULL,
-      'team', NULL
+      'verification', NULL
     );
   END IF;
 
@@ -11213,60 +11528,21 @@ BEGIN
     RETURN jsonb_build_object(
       'profile', NULL,
       'cleaner_data', NULL,
-      'verification', NULL,
-      'team', NULL
+      'verification', NULL
     );
   END IF;
 
-  v_user_id := COALESCE(v_profile.user_id, v_profile.id);
-
   SELECT jsonb_build_object(
-    'company_name', b.company_name,
-    'team_role', b.team_role,
-    'team_size', b.team_size
-  )
-  INTO v_team
-  FROM public.cleaner_team_branding_for(v_user_id) b
-  LIMIT 1;
-
-  SELECT jsonb_build_object(
-    'profile', to_jsonb(v_profile),
-    'cleaner_data', (SELECT to_jsonb(cd) FROM cleaner_data cd WHERE cd.user_id = v_user_id),
-    'verification', jsonb_build_object(
-      'checks', jsonb_build_object(
-        'identity', (
-          EXISTS (
-            SELECT 1 FROM cleaner_applications ca
-            WHERE ca.user_id = v_user_id
-              AND (ca.kyc_status = 'verified' OR ca.kyc_review_answer = 'GREEN')
-          )
-          OR (
-            EXISTS (
-              SELECT 1 FROM cleaner_verifications cv
-              WHERE cv.id = v_user_id
-                AND cv.id_front_url IS NOT NULL
-                AND cv.id_back_url IS NOT NULL
-            )
-            AND EXISTS (
-              SELECT 1 FROM cleaner_applications ca
-              WHERE ca.user_id = v_user_id AND ca.status = 'approved'
-            )
-          )
-        ),
-        'reference', EXISTS (
-          SELECT 1 FROM cleaner_applications ca
-          WHERE ca.user_id = v_user_id
-            AND ca.status = 'approved'
-            AND NULLIF(BTRIM(ca.reference1_name), '') IS NOT NULL
-            AND NULLIF(BTRIM(ca.reference1_phone), '') IS NOT NULL
-        ),
-        'police_report', EXISTS (
-          SELECT 1 FROM cleaner_verifications cv
-          WHERE cv.id = v_user_id AND cv.police_report_url IS NOT NULL
-        )
+    'profile', (SELECT to_jsonb(p) FROM profiles p WHERE p.id = target_user_id OR p.user_id = target_user_id LIMIT 1),
+    'cleaner_data', (SELECT to_jsonb(cd) FROM cleaner_data cd WHERE cd.user_id = target_user_id),
+    'verification', (
+      SELECT jsonb_build_object(
+        'id_front_url', cv.id_front_url,
+        'id_back_url', cv.id_back_url
       )
-    ),
-    'team', v_team
+      FROM cleaner_verifications cv
+      WHERE cv.id = target_user_id
+    )
   )
   INTO result;
 
@@ -11992,7 +12268,7 @@ CREATE OR REPLACE FUNCTION public.get_payment_split_config()
  SET search_path TO 'public'
 AS $function$
   SELECT jsonb_object_agg(key, value)
-  FROM payment_split_config
+  FROM public.payment_split_config
   WHERE key IN ('tax_percentage', 'vendor_percentage');
 $function$
 
@@ -13037,19 +13313,7 @@ BEGIN
   FOR r IN
     SELECT b.id
     FROM public.bookings b
-    WHERE b.assignment_phase = 'exclusive'
-      AND b.cleaner_accepted_at IS NULL
-      AND b.assignment_escalated_at IS NULL
-      AND lower(coalesce(b.payment_status, '')) = 'paid'
-      AND b.status IN ('pending', 'confirmed', 'scheduled')
-      AND (
-        b.direct_assigned_cleaner_id = v_uid
-        OR b.cleaner_id = v_uid
-      )
-      AND (
-        b.assignment_hold_until IS NULL
-        OR b.assignment_hold_until > now()
-      )
+    WHERE public.cleaner_is_eligible_for_exclusive_assignment(b.id, v_uid)
     ORDER BY coalesce(b.assignment_hold_until, b.scheduled_at_utc) ASC NULLS LAST
   LOOP
     v_payload := public.build_cleaner_assignment_offer_payload(r.id);
@@ -13291,12 +13555,12 @@ BEGIN
     RAISE EXCEPTION 'invalid event_type: %', p_event_type;
   END IF;
 
+  -- p_severity = 0: use default severity for this event type.
   v_severity := COALESCE(
     NULLIF(p_severity, 0),
     public.customer_risk_default_event_severity(p_event_type)
   );
 
-  -- Repeated payment failures escalate: first failure is +1, repeats are +3.
   IF p_event_type = 'failed_payment' THEN
     SELECT COUNT(*)::integer INTO v_failed_prior_24h
     FROM public.customer_risk_events e
@@ -13308,7 +13572,6 @@ BEGIN
     END IF;
   END IF;
 
-  -- Serious complaints score higher regardless of the caller-provided severity.
   IF p_event_type = 'cleaner_complaint'
      AND (
        public.customer_risk_is_serious_complaint_type(p_metadata->>'complaint_type')
@@ -13323,10 +13586,6 @@ BEGIN
   VALUES (
     p_customer_id, p_booking_id, p_event_type, v_severity, COALESCE(p_metadata, '{}'::jsonb)
   );
-
-  UPDATE public.customer_trust_profiles
-  SET last_risk_event_at = now(), updated_at = now()
-  WHERE customer_id = p_customer_id;
 
   RETURN public.recalculate_customer_trust_profile(p_customer_id);
 END;
@@ -13532,6 +13791,30 @@ BEGIN
 
     -- Return all rows regardless of whether an update happened
     RETURN QUERY SELECT t.id, t.label, t.hours FROM public.extra_tasks t ORDER BY t.label ASC;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.mark_booking_dispatch_gated(p_booking_id uuid, p_reason text DEFAULT 'customer_verification_required'::text)
+ RETURNS void
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  UPDATE public.bookings b
+  SET
+    direct_assigned_cleaner_id = COALESCE(
+      b.direct_assigned_cleaner_id,
+      b.cleaner_id
+    ),
+    cleaner_id = NULL,
+    dispatch_gated_at = COALESCE(b.dispatch_gated_at, now()),
+    dispatch_gate_reason = COALESCE(b.dispatch_gate_reason, p_reason),
+    updated_at = now(),
+    last_updated = now()
+  WHERE b.id = p_booking_id
+    AND b.dispatch_gate_cleared_at IS NULL;
 END;
 $function$
 
@@ -13873,73 +14156,56 @@ $function$
 
 CREATE OR REPLACE FUNCTION public.normalize_ghana_mobile_e164_ts(p_input text)
  RETURNS text
- LANGUAGE sql
- IMMUTABLE STRICT
-AS $function$
-  WITH compact AS (
-    SELECT regexp_replace(trim(p_input), '[\s\-()]', '', 'g') AS c
-  ),
-  plus2330_fix AS (
-    SELECT
-      CASE
-        WHEN c ~ '^\+2330[2-5][0-9]{8}$'
-        THEN '+233' || substr(c, 6)
-        ELSE c
-      END AS c2
-    FROM compact
-  ),
-  extracted AS (
-    SELECT (regexp_match(c2, '^(?:\+?233|0)?([2-5][0-9]{8})$'))[1] AS nsn
-    FROM plus2330_fix
-  )
-  SELECT CASE WHEN nsn IS NULL THEN NULL ELSE '+233' || nsn END
-  FROM extracted;
-$function$
-
-
-CREATE OR REPLACE FUNCTION public.normalize_ghana_phone_to_e164(p_input text)
- RETURNS text
  LANGUAGE plpgsql
  IMMUTABLE
 AS $function$
 DECLARE
-  v_raw    text;
-  v_digits text;
+  v_compact text;
 BEGIN
   IF p_input IS NULL THEN
     RETURN NULL;
   END IF;
 
-  v_raw := regexp_replace(trim(p_input), '[\s-]', '', 'g');
+  v_compact := regexp_replace(trim(p_input), '[\s\-()]', '', 'g');
 
-  IF v_raw = '' OR position('@' in v_raw) > 0 THEN
+  IF v_compact = '' OR position('@'::text IN v_compact) > 0 THEN
     RETURN NULL;
   END IF;
 
-  IF left(v_raw, 1) = '+' THEN
-    v_digits := substring(v_raw from 2);
-  ELSE
-    v_digits := v_raw;
+  -- Common mistake: +2330535729691 - duplicate national 0 after +233 (TS slice(5) => substr from char 6).
+  IF v_compact ~ '^\+2330[2-5][0-9]{8}$' THEN
+    RETURN '+233' || substr(v_compact, 6);
   END IF;
 
-  IF v_digits !~ '^\d+$' THEN
-    RETURN NULL;
+  -- Equivalent to GHANA_MOBILE_COMPACT /^(\+233|233|0)?([2-5][0-9]{8})$/ anchored end-to-end via separate branches:
+
+  IF v_compact ~ '^\+233[2-5][0-9]{8}$' THEN
+    RETURN '+233' || substr(v_compact, 5);
   END IF;
 
-  IF left(v_digits, 3) = '233' AND length(v_digits) = 12 THEN
-    RETURN '+' || v_digits;
+  IF v_compact ~ '^233[2-5][0-9]{8}$' THEN
+    RETURN '+233' || substr(v_compact, 4);
   END IF;
 
-  IF left(v_digits, 1) = '0' AND length(v_digits) = 10 THEN
-    RETURN '+233' || substring(v_digits from 2);
+  IF v_compact ~ '^0[2-5][0-9]{8}$' THEN
+    RETURN '+233' || substr(v_compact, 2);
   END IF;
 
-  IF length(v_digits) = 9 THEN
-    RETURN '+233' || v_digits;
+  IF v_compact ~ '^[2-5][0-9]{8}$' THEN
+    RETURN '+233' || v_compact;
   END IF;
 
   RETURN NULL;
 END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.normalize_ghana_phone_to_e164(p_input text)
+ RETURNS text
+ LANGUAGE sql
+ IMMUTABLE
+AS $function$
+  SELECT public.normalize_ghana_mobile_e164_ts(p_input);
 $function$
 
 
@@ -15666,12 +15932,31 @@ AS $function$
     'active', p_row.active,
     'valid_from', p_row.valid_from,
     'valid_to', p_row.valid_to,
-    'requires_new_customer', p_row.requires_new_customer,
-    'max_redemptions', p_row.max_redemptions,
-    'max_redemptions_per_user', p_row.max_redemptions_per_user,
-    'allow_recurring', p_row.allow_recurring,
     'updated_at', p_row.updated_at,
     'created_at', p_row.created_at
+  );
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.promotion_row_audit_snapshot(p_slug text, p_headline text, p_terms_markdown text, p_type text, p_value numeric, p_max_duration_hours numeric, p_eligible_service_ids integer[], p_exclude_extra_tasks boolean, p_requires_service_area boolean, p_active boolean, p_valid_from timestamp with time zone, p_valid_to timestamp with time zone)
+ RETURNS jsonb
+ LANGUAGE sql
+ STABLE
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+  SELECT jsonb_build_object(
+    'slug', p_slug,
+    'headline', p_headline,
+    'terms_markdown', p_terms_markdown,
+    'type', p_type,
+    'value', p_value,
+    'max_duration_hours', p_max_duration_hours,
+    'eligible_service_ids', to_jsonb(p_eligible_service_ids),
+    'exclude_extra_tasks', p_exclude_extra_tasks,
+    'requires_service_area', p_requires_service_area,
+    'active', p_active,
+    'valid_from', p_valid_from,
+    'valid_to', p_valid_to
   );
 $function$
 
@@ -15858,6 +16143,7 @@ DECLARE
   v_has_high_value_90d boolean := false;
   v_has_third_party_90d boolean := false;
   v_has_sensitive_90d boolean := false;
+  v_last_risk_event_at timestamptz;
   v_stage text := NULL;
 BEGIN
   PERFORM public.sync_customer_trust_verification_flags(p_customer_id);
@@ -15902,7 +16188,8 @@ BEGIN
     bool_or(
       e.event_type = 'sensitive_property_access'
       AND e.created_at > now() - interval '90 days'
-    )
+    ),
+    MAX(e.created_at) FILTER (WHERE e.voided_at IS NULL)
   INTO
     v_failed_total,
     v_failed_24h,
@@ -15912,7 +16199,8 @@ BEGIN
     v_risk_score,
     v_has_high_value_90d,
     v_has_third_party_90d,
-    v_has_sensitive_90d
+    v_has_sensitive_90d,
+    v_last_risk_event_at
   FROM public.customer_risk_events e
   WHERE e.customer_id = p_customer_id;
 
@@ -15939,6 +16227,7 @@ BEGIN
     verification_required = v_stage IS NOT NULL,
     verification_required_stage = v_stage,
     verification_required_reason = public.customer_risk_stage_reason(v_stage),
+    last_risk_event_at = v_last_risk_event_at,
     updated_at = now()
   WHERE customer_id = p_customer_id
   RETURNING * INTO v_profile;
@@ -17592,6 +17881,87 @@ AS $function$
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.retry_dispatch_gated_direct_assignments()
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  r public.bookings%ROWTYPE;
+  v_hold_minutes integer;
+  v_released integer := 0;
+BEGIN
+  FOR r IN
+    SELECT *
+    FROM public.bookings
+    WHERE cleaner_id IS NULL
+      AND direct_assigned_cleaner_id IS NOT NULL
+      AND dispatch_gated_at IS NOT NULL
+      AND dispatch_gate_cleared_at IS NULL
+      AND cleaner_accepted_at IS NULL
+      AND assignment_escalated_at IS NULL
+      AND lower(COALESCE(payment_status, '')) = 'paid'
+      AND status IN ('pending', 'confirmed', 'scheduled')
+      AND scheduled_date IS NOT NULL
+      AND scheduled_time IS NOT NULL
+    ORDER BY dispatch_gated_at ASC
+    FOR UPDATE SKIP LOCKED
+  LOOP
+    IF r.customer_id IS NOT NULL
+       AND NOT public.customer_trust_can_dispatch_cleaner(r.customer_id, r.id) THEN
+      CONTINUE;
+    END IF;
+
+    v_hold_minutes := public.direct_assignment_hold_minutes(
+      r.scheduled_date,
+      r.timezone_name
+    );
+
+    UPDATE public.bookings
+    SET
+      cleaner_id = r.direct_assigned_cleaner_id,
+      assignment_phase = 'exclusive',
+      assignment_hold_until = now() + (v_hold_minutes || ' minutes')::interval,
+      assignment_reminder_sent_at = NULL,
+      dispatch_gate_cleared_at = now(),
+      status = CASE
+        WHEN status = 'pending' THEN 'confirmed'
+        ELSE status
+      END,
+      updated_at = now(),
+      last_updated = now()
+    WHERE id = r.id;
+
+    INSERT INTO public.notifications (user_id, type, title, message, data)
+    VALUES (
+      r.direct_assigned_cleaner_id,
+      'direct_assignment_offer',
+      'You were selected for a job',
+      format(
+        'You''ve been selected for a job. Accept within %s minutes before it is offered to other cleaners.',
+        v_hold_minutes
+      ),
+      jsonb_build_object(
+        'booking_id', r.id,
+        'bookingId', r.id,
+        'assignment_phase', 'exclusive',
+        'hold_minutes', v_hold_minutes,
+        'source', 'dispatch_gate_retry'
+      )
+    );
+
+    v_released := v_released + 1;
+  END LOOP;
+
+  RETURN jsonb_build_object(
+    'ok', true,
+    'direct_assignments_released', v_released
+  );
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.revoke_co_cleaner_invite(p_invite_id uuid)
  RETURNS jsonb
  LANGUAGE plpgsql
@@ -17695,6 +18065,56 @@ AS $function$
     WHEN p_search_query IS NULL OR length(trim(p_search_query)) < 2 THEN NULL
     ELSE replace(replace(trim(p_search_query), '%', ''), '_', '')
   END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.search_available_cleaners(p_lat double precision, p_lng double precision, p_date date, p_time time without time zone, p_duration double precision, p_requested_services text[] DEFAULT '{}'::text[], p_max_distance_meters double precision DEFAULT 50000)
+ RETURNS TABLE(cleaner_id uuid, cleaner_name text, avatar_url text, rating double precision, distance_meters double precision, matching_skills_count integer, total_skills_count integer)
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+AS $function$
+DECLARE
+  v_cust_loc geography := ST_SetSRID(ST_MakePoint(p_lng, p_lat), 4326)::geography;
+  v_booking_range tstzrange := tstzrange(
+    (p_date + p_time)::timestamptz,
+    (p_date + p_time + (p_duration || ' hours')::interval)::timestamptz,
+    '[)'
+  );
+BEGIN
+  IF auth.uid() IS NULL THEN
+    RAISE EXCEPTION 'Not authorized';
+  END IF;
+
+  RETURN QUERY
+  SELECT
+    cd.user_id,
+    p.fullname,
+    p.avatar_url,
+    cd.rating::float,
+    (cd.base_location::geography <-> v_cust_loc)::float AS dist_m,
+    (
+      SELECT count(*)::int
+      FROM unnest(p_requested_services) s
+      WHERE s = ANY(cd.skills) OR s = ANY(cd.specialties)
+    ) AS matching_skills_count,
+    COALESCE(array_length(cd.skills, 1), 0) AS total_skills_count
+  FROM public.cleaner_data cd
+  JOIN public.profiles p ON p.id = cd.user_id
+  WHERE cd.status = 'active'
+    AND (
+      auth.uid() = cd.user_id
+      OR public.is_profile_discoverable_by_others(p)
+    )
+    AND ST_DWithin(cd.base_location::geography, v_cust_loc, p_max_distance_meters)
+    AND NOT EXISTS (
+      SELECT 1
+      FROM public.bookings b
+      WHERE b.cleaner_id = cd.user_id
+        AND b.booking_period && v_booking_range
+        AND b.status != 'cancelled'
+    )
+  ORDER BY cd.base_location::geography <-> v_cust_loc ASC;
+END;
 $function$
 
 
@@ -21366,6 +21786,28 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.stop_booking_unassigned_ops_reminders(p_booking_id uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  IF NOT public.is_admin(v_uid) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authorized');
+  END IF;
+
+  RETURN public.apply_stop_booking_unassigned_ops_reminders(p_booking_id, v_uid);
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.strpos(citext, citext)
  RETURNS integer
  LANGUAGE sql
@@ -21559,6 +22001,7 @@ CREATE OR REPLACE FUNCTION public.sync_customer_trust_from_kyc_profiles()
  SET search_path TO 'public'
 AS $function$
 BEGIN
+  -- Shared identity: cleaner KYC approval must update customer booking trust too.
   PERFORM public.recalculate_customer_trust_profile(NEW.user_id);
   RETURN NEW;
 END;
@@ -21586,9 +22029,10 @@ BEGIN
   )
   INTO v_phone_verified;
 
-  -- kyc_profiles.kyc_status check constraint allows: not_started, started,
-  -- submitted, completed, approved, rejected, failed. 'approved'/'completed'
-  -- map to verified (see utils/kycProfile.ts mapKycStatusToVerificationStatus).
+  -- Identity verification is user-level. A user who completes KYC as a cleaner
+  -- is considered id_verified for customer booking trust decisions as well.
+  -- Therefore we intentionally check all kyc_profiles rows for the user (no
+  -- subject_type filter). kyc_status approved/completed maps to verified.
   SELECT EXISTS (
     SELECT 1
     FROM public.kyc_profiles kp
@@ -21941,11 +22385,29 @@ $function$
 CREATE OR REPLACE FUNCTION public.trg_init_direct_assignment_on_paid()
  RETURNS trigger
  LANGUAGE plpgsql
+ SET search_path TO 'public'
 AS $function$
 DECLARE
   v_hold_minutes integer;
 BEGIN
   IF lower(COALESCE(NEW.payment_status, '')) <> 'paid' THEN
+    RETURN NEW;
+  END IF;
+
+  IF NEW.customer_id IS NOT NULL
+     AND NOT public.customer_trust_can_dispatch_cleaner(NEW.customer_id, NEW.id) THEN
+    IF NEW.cleaner_id IS NOT NULL THEN
+      IF NEW.direct_assigned_cleaner_id IS NULL THEN
+        NEW.direct_assigned_cleaner_id := NEW.cleaner_id;
+      END IF;
+      NEW.cleaner_id := NULL;
+    END IF;
+    IF NEW.dispatch_gated_at IS NULL THEN
+      NEW.dispatch_gated_at := now();
+    END IF;
+    IF NEW.dispatch_gate_reason IS NULL THEN
+      NEW.dispatch_gate_reason := 'customer_verification_required';
+    END IF;
     RETURN NEW;
   END IF;
 
@@ -22460,6 +22922,196 @@ AS $function$
 BEGIN
   NEW.updated_at = NOW();
   RETURN NEW;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.update_promotion_config_admin(p_promotion_id uuid, p_expected_updated_at timestamp with time zone, p_headline text, p_terms_markdown text, p_type text, p_value numeric, p_max_duration_hours numeric, p_eligible_service_ids integer[], p_exclude_extra_tasks boolean, p_requires_service_area boolean, p_active boolean, p_valid_from timestamp with time zone, p_valid_to timestamp with time zone, p_changed_by uuid, p_changed_by_email text)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+DECLARE
+  v_now timestamptz := now();
+  v_headline text := btrim(coalesce(p_headline, ''));
+  v_type text := btrim(coalesce(p_type, ''));
+  v_terms_markdown text := NULLIF(btrim(coalesce(p_terms_markdown, '')), '');
+  v_active boolean := coalesce(p_active, false);
+  v_audit_action text;
+  v_row public.promotions%ROWTYPE;
+  v_candidate public.promotions%ROWTYPE;
+  v_updated public.promotions%ROWTYPE;
+  v_previous jsonb;
+  v_next jsonb;
+  v_missing integer[];
+BEGIN
+  IF p_promotion_id IS NULL THEN
+    RAISE EXCEPTION 'promotion_id_required' USING ERRCODE = '22023';
+  END IF;
+
+  IF p_expected_updated_at IS NULL THEN
+    RAISE EXCEPTION 'expected_updated_at_required' USING ERRCODE = '22023';
+  END IF;
+
+  IF p_changed_by IS NULL THEN
+    RAISE EXCEPTION 'changed_by_required' USING ERRCODE = '22023';
+  END IF;
+
+  IF v_headline = '' THEN
+    RAISE EXCEPTION 'headline_required' USING ERRCODE = '22023';
+  END IF;
+
+  IF v_type <> 'free_hours' THEN
+    RAISE EXCEPTION 'unsupported_promotion_type' USING ERRCODE = '22023';
+  END IF;
+
+  IF p_value IS NULL OR p_value <= 0 THEN
+    RAISE EXCEPTION 'invalid_free_hours_value' USING ERRCODE = '22023';
+  END IF;
+
+  IF p_max_duration_hours IS NULL
+     OR p_max_duration_hours <= 0
+     OR p_max_duration_hours > p_value THEN
+    RAISE EXCEPTION 'invalid_max_duration_hours' USING ERRCODE = '22023';
+  END IF;
+
+  IF p_valid_from IS NULL THEN
+    RAISE EXCEPTION 'valid_from_required' USING ERRCODE = '22023';
+  END IF;
+
+  IF p_valid_to IS NOT NULL AND p_valid_to <= p_valid_from THEN
+    RAISE EXCEPTION 'valid_to_must_follow_valid_from' USING ERRCODE = '22023';
+  END IF;
+
+  IF p_eligible_service_ids IS NOT NULL
+     AND cardinality(p_eligible_service_ids) > 0 THEN
+    SELECT array_agg(sid.id ORDER BY sid.id)
+    INTO v_missing
+    FROM unnest(p_eligible_service_ids) AS sid(id)
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM public.service_types st
+      WHERE st.id = sid.id
+        AND st.active IS TRUE
+    );
+
+    IF v_missing IS NOT NULL THEN
+      RAISE EXCEPTION 'invalid_eligible_service_ids: %', v_missing::text
+        USING ERRCODE = '22023';
+    END IF;
+  END IF;
+
+  SELECT *
+  INTO v_row
+  FROM public.promotions
+  WHERE id = p_promotion_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'promotion_not_found' USING ERRCODE = 'P0002';
+  END IF;
+
+  IF v_row.updated_at IS DISTINCT FROM p_expected_updated_at THEN
+    RAISE EXCEPTION 'stale_promotion_config'
+      USING ERRCODE = '55000',
+            HINT = 'Reload the campaign and try again';
+  END IF;
+
+  v_previous := public.promotion_row_audit_snapshot(
+    v_row.slug,
+    v_row.headline,
+    v_row.terms_markdown,
+    v_row.type::text,
+    v_row.value,
+    v_row.max_duration_hours,
+    v_row.eligible_service_ids,
+    v_row.exclude_extra_tasks,
+    v_row.requires_service_area,
+    v_row.active,
+    v_row.valid_from,
+    v_row.valid_to
+  );
+
+  v_next := public.promotion_row_audit_snapshot(
+    v_row.slug,
+    v_headline,
+    v_terms_markdown,
+    v_type,
+    p_value,
+    p_max_duration_hours,
+    p_eligible_service_ids,
+    coalesce(p_exclude_extra_tasks, false),
+    coalesce(p_requires_service_area, false),
+    v_active,
+    p_valid_from,
+    p_valid_to
+  );
+
+  IF v_previous = v_next THEN
+    RETURN public.promotion_admin_row_to_jsonb(v_row);
+  END IF;
+
+  v_audit_action :=
+    CASE
+      WHEN v_row.active IS DISTINCT FROM v_active AND v_active IS TRUE
+        THEN 'activated'
+      WHEN v_row.active IS DISTINCT FROM v_active AND v_active IS FALSE
+        THEN 'deactivated'
+      ELSE 'updated'
+    END;
+
+  v_candidate := v_row;
+  v_candidate.headline := v_headline;
+  v_candidate.terms_markdown := v_terms_markdown;
+  v_candidate.type := v_type;
+  v_candidate.value := p_value;
+  v_candidate.max_duration_hours := p_max_duration_hours;
+  v_candidate.eligible_service_ids := p_eligible_service_ids;
+  v_candidate.exclude_extra_tasks := coalesce(p_exclude_extra_tasks, false);
+  v_candidate.requires_service_area := coalesce(p_requires_service_area, false);
+  v_candidate.active := v_active;
+  v_candidate.valid_from := p_valid_from;
+  v_candidate.valid_to := p_valid_to;
+  v_candidate.updated_at := v_now;
+
+  UPDATE public.promotions
+  SET
+    headline = v_candidate.headline,
+    terms_markdown = v_candidate.terms_markdown,
+    type = v_candidate.type,
+    value = v_candidate.value,
+    max_duration_hours = v_candidate.max_duration_hours,
+    eligible_service_ids = v_candidate.eligible_service_ids,
+    exclude_extra_tasks = v_candidate.exclude_extra_tasks,
+    requires_service_area = v_candidate.requires_service_area,
+    active = v_candidate.active,
+    valid_from = v_candidate.valid_from,
+    valid_to = v_candidate.valid_to,
+    updated_at = v_candidate.updated_at
+  WHERE id = p_promotion_id
+  RETURNING * INTO v_updated;
+
+  INSERT INTO public.promotion_config_audit (
+    promotion_id,
+    promotion_slug,
+    changed_by,
+    changed_by_email,
+    action,
+    previous_config,
+    new_config
+  )
+  VALUES (
+    v_updated.id,
+    v_updated.slug,
+    p_changed_by,
+    NULLIF(btrim(coalesce(p_changed_by_email, '')), ''),
+    v_audit_action,
+    v_previous,
+    v_next
+  );
+
+  RETURN public.promotion_admin_row_to_jsonb(v_updated);
 END;
 $function$
 
