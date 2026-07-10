@@ -3722,6 +3722,20 @@ AS $function$
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.cleaner_completed_paid_jobs_count(p_cleaner_id uuid)
+ RETURNS integer
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+  SELECT count(*)::integer
+  FROM public.bookings b
+  WHERE b.cleaner_id = p_cleaner_id
+    AND b.status = 'completed'
+    AND lower(coalesce(b.payment_status::text, '')) IN ('paid', 'success');
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.cleaner_display_rating(p_rating numeric, p_review_count integer)
  RETURNS double precision
  LANGUAGE sql
@@ -9972,6 +9986,8 @@ BEGIN
         s.avatar_url,
         NULL::text AS bio,
         s.rating,
+        s.review_count,
+        s.completed_jobs,
         s.company_name,
         s.team_size,
         s.team_role
@@ -10007,6 +10023,8 @@ BEGIN
         g.avatar_url,
         g.bio,
         g.rating,
+        g.review_count,
+        g.completed_jobs,
         g.company_name,
         g.team_size,
         g.team_role
@@ -10042,6 +10060,8 @@ BEGIN
           s.avatar_url,
           NULL::text AS bio,
           s.rating,
+          s.review_count,
+          s.completed_jobs,
           s.company_name,
           s.team_size,
           s.team_role
@@ -10574,13 +10594,14 @@ $function$
 
 
 CREATE OR REPLACE FUNCTION public.get_best_available_cleaners(p_date date, p_time time without time zone, p_duration numeric, p_lat double precision, p_lng double precision, p_max_distance_meters integer, p_requested_services text[], p_exclude_booking_id uuid DEFAULT NULL::uuid, p_requested_category service_category DEFAULT NULL::service_category)
- RETURNS TABLE(cleaner_id uuid, cleaner_name text, avatar_url text, bio text, hourly_rate numeric, rating double precision, review_count integer, distance_meters double precision, final_score double precision, company_name text, team_size integer, team_role text, specialties text[])
+ RETURNS TABLE(cleaner_id uuid, cleaner_name text, avatar_url text, bio text, hourly_rate numeric, rating double precision, review_count integer, completed_jobs integer, distance_meters double precision, final_score double precision, company_name text, team_size integer, team_role text, specialties text[])
  LANGUAGE plpgsql
  STABLE
  SET search_path TO 'public', 'pg_temp'
 AS $function$
 DECLARE
   v_cust_id uuid := auth.uid();
+  v_exclude_user_id uuid;
   v_booking_start timestamptz;
   v_booking_range tstzrange;
   v_cust_loc geography := ST_SetSRID(ST_MakePoint(p_lng, p_lat), 4326)::geography;
@@ -10590,6 +10611,13 @@ BEGIN
   THEN
     RAISE EXCEPTION 'Not authorized';
   END IF;
+
+  v_exclude_user_id := CASE
+    WHEN current_setting('app.system_cleaner_discovery', true) = '1'
+         AND p_exclude_booking_id IS NOT NULL THEN
+      (SELECT b.customer_id FROM public.bookings b WHERE b.id = p_exclude_booking_id LIMIT 1)
+    ELSE v_cust_id
+  END;
 
   v_booking_start := public.service_schedule_timestamptz(p_date, p_time);
   v_booking_range := tstzrange(
@@ -10629,7 +10657,7 @@ BEGIN
       AND COALESCE(cd.base_location::geography, p.location_wkt) IS NOT NULL
       AND public.is_profile_discoverable_by_others(p)
       AND cd.user_id IS DISTINCT FROM COALESCE(
-        v_cust_id,
+        v_exclude_user_id,
         (SELECT b.customer_id FROM public.bookings b WHERE b.id = p_exclude_booking_id LIMIT 1)
       )
       AND ST_DWithin(
@@ -10688,6 +10716,7 @@ BEGIN
     sc.cleaner_hourly_rate AS hourly_rate,
     public.cleaner_display_rating(sc.cleaner_rating, sc.cleaner_review_count) AS rating,
     COALESCE(sc.cleaner_review_count, 0) AS review_count,
+    public.cleaner_completed_paid_jobs_count(sc.cleaner_user_id) AS completed_jobs,
     sc.dist::float AS distance_meters,
     (
       (GREATEST(0, (1.0 - (sc.dist / p_max_distance_meters))) * 30)
@@ -18119,7 +18148,7 @@ $function$
 
 
 CREATE OR REPLACE FUNCTION public.search_available_cleaners(p_lat double precision, p_lng double precision, p_date date, p_time time without time zone, p_duration double precision, p_requested_services text[] DEFAULT '{}'::text[], p_max_distance_meters double precision DEFAULT 50000, p_exclude_booking_id uuid DEFAULT NULL::uuid, p_requested_category service_category DEFAULT NULL::service_category, p_search_query text DEFAULT NULL::text)
- RETURNS TABLE(cleaner_id uuid, cleaner_name text, avatar_url text, rating double precision, review_count integer, distance_meters double precision, matching_skills_count integer, total_skills_count integer, company_name text, team_size integer, team_role text, specialties text[])
+ RETURNS TABLE(cleaner_id uuid, cleaner_name text, avatar_url text, rating double precision, review_count integer, completed_jobs integer, distance_meters double precision, matching_skills_count integer, total_skills_count integer, company_name text, team_size integer, team_role text, specialties text[])
  LANGUAGE plpgsql
  STABLE SECURITY DEFINER
  SET search_path TO 'public', 'pg_temp'
@@ -18150,6 +18179,7 @@ BEGIN
     p.avatar_url,
     public.cleaner_display_rating(cd.rating, cd.review_count)::float,
     COALESCE(cd.review_count, 0),
+    public.cleaner_completed_paid_jobs_count(cd.user_id),
     (cd.base_location::geography <-> v_cust_loc)::float AS dist_m,
     (
       SELECT count(*)::int
