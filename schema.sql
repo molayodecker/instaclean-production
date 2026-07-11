@@ -2811,18 +2811,19 @@ CREATE OR REPLACE FUNCTION "public"."claim_booking_review_request"("p_booking_id
 DECLARE
   v_claimed_at timestamptz := now();
 BEGIN
-  UPDATE public.bookings
+  UPDATE public.bookings b
   SET review_request_sent_at = v_claimed_at
-  WHERE id = p_booking_id
-    AND review_request_sent_at IS NULL
-    AND payment_status = 'paid'
-    AND status = 'completed'
-    AND cleaner_id IS NOT NULL
-    AND completed_at IS NOT NULL
+  WHERE b.id = p_booking_id
+    AND b.review_request_sent_at IS NULL
+    AND b.payment_status = 'paid'
+    AND b.status = 'completed'
+    AND b.cleaner_id IS NOT NULL
+    AND b.completed_at IS NOT NULL
     AND NOT EXISTS (
       SELECT 1
       FROM public.reviews r
       WHERE r.booking_id = p_booking_id
+        AND r.reviewer_id = b.customer_id
     );
 
   IF FOUND THEN
@@ -3749,7 +3750,7 @@ $$;
 ALTER FUNCTION "public"."cleanup_orphaned_pending_subscription"("p_subscription_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."complete_cleaner_booking"("p_booking_id" "uuid") RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."complete_cleaner_booking"("p_booking_id" "uuid", "p_completion_notes" "text" DEFAULT NULL::"text", "p_customer_rating" integer DEFAULT NULL::integer, "p_customer_comment" "text" DEFAULT NULL::"text") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
@@ -3757,6 +3758,12 @@ DECLARE
   v_uid uuid := auth.uid();
   v_row public.bookings%ROWTYPE;
   v_missing text[];
+  v_booking_day date;
+  v_today date;
+  v_stored_rating numeric;
+  v_review_count integer;
+  v_customer_review_submitted boolean := false;
+  v_customer_review_error text;
 BEGIN
   IF v_uid IS NULL THEN
     RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
@@ -3764,6 +3771,11 @@ BEGIN
 
   IF p_booking_id IS NULL THEN
     RETURN jsonb_build_object('success', false, 'error', 'missing_booking_id');
+  END IF;
+
+  IF p_customer_rating IS NOT NULL
+     AND (p_customer_rating < 1 OR p_customer_rating > 5) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_rating');
   END IF;
 
   SELECT * INTO v_row
@@ -3789,19 +3801,92 @@ BEGIN
     );
   END IF;
 
+  IF p_customer_rating IS NOT NULL THEN
+    v_booking_day := COALESCE(v_row.scheduled_date::date, v_row.created_at::date);
+    v_today := (now() AT TIME ZONE COALESCE(v_row.timezone_name, 'Africa/Accra'))::date;
+
+    IF v_booking_day IS NOT NULL AND v_booking_day + 7 < v_today THEN
+      v_customer_review_error := 'review_window_closed';
+    ELSIF EXISTS (
+      SELECT 1
+      FROM public.reviews r
+      WHERE r.booking_id = p_booking_id
+        AND r.reviewer_id = v_uid
+    ) THEN
+      v_customer_review_error := 'already_reviewed';
+    END IF;
+  END IF;
+
   UPDATE public.bookings
   SET
     status = 'completed',
+    completed_at = COALESCE(completed_at, now()),
+    completion_notes = COALESCE(
+      NULLIF(BTRIM(COALESCE(p_completion_notes, '')), ''),
+      completion_notes
+    ),
     last_updated = now(),
     updated_at = now()
   WHERE id = p_booking_id;
 
-  RETURN jsonb_build_object('success', true, 'booking_id', p_booking_id, 'new_status', 'completed');
+  IF p_customer_rating IS NOT NULL AND v_customer_review_error IS NULL THEN
+    INSERT INTO public.reviews (booking_id, reviewer_id, reviewee_id, rating, comment)
+    VALUES (
+      p_booking_id,
+      v_uid,
+      v_row.customer_id,
+      p_customer_rating,
+      NULLIF(BTRIM(COALESCE(p_customer_comment, '')), '')
+    )
+    ON CONFLICT (booking_id, reviewer_id) WHERE booking_id IS NOT NULL DO NOTHING;
+
+    IF NOT FOUND THEN
+      v_customer_review_error := 'already_reviewed';
+    ELSE
+      v_customer_review_submitted := true;
+    END IF;
+  END IF;
+
+  IF v_customer_review_submitted OR v_customer_review_error = 'already_reviewed' THEN
+    IF v_customer_review_submitted THEN
+      UPDATE public.bookings
+      SET has_cleaner_reviewed_customer = true
+      WHERE id = p_booking_id;
+
+      PERFORM public.recompute_customer_review_stats(v_row.customer_id);
+    ELSE
+      UPDATE public.bookings
+      SET has_cleaner_reviewed_customer = true
+      WHERE id = p_booking_id;
+    END IF;
+
+    PERFORM public.refresh_booking_customer_review_eligibility(p_booking_id);
+
+    SELECT p.customer_rating, p.customer_review_count
+    INTO v_stored_rating, v_review_count
+    FROM public.profiles p
+    WHERE p.user_id = v_row.customer_id;
+  END IF;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'booking_id', p_booking_id,
+    'new_status', 'completed',
+    'customer_review_submitted', v_customer_review_submitted,
+    'customer_review_error', v_customer_review_error,
+    'customer_rating', v_stored_rating,
+    'customer_review_count', COALESCE(v_review_count, 0),
+    'customer_display_rating',
+      CASE
+        WHEN v_stored_rating IS NULL AND v_review_count IS NULL THEN NULL
+        ELSE public.customer_display_rating(v_stored_rating, v_review_count)
+      END
+  );
 END;
 $$;
 
 
-ALTER FUNCTION "public"."complete_cleaner_booking"("p_booking_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."complete_cleaner_booking"("p_booking_id" "uuid", "p_completion_notes" "text", "p_customer_rating" integer, "p_customer_comment" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."complete_subscription_paystack_activation"("p_subscription_id" "uuid", "p_customer_id" "uuid", "p_activation_token" "uuid", "p_billing_mode" "text", "p_paystack_authorization_code" "text", "p_paystack_customer_code" "text", "p_paystack_subscription_code" "text" DEFAULT NULL::"text", "p_paystack_plan_code" "text" DEFAULT NULL::"text") RETURNS "jsonb"
@@ -5516,6 +5601,32 @@ $$;
 
 
 ALTER FUNCTION "public"."credit_cleaner_wallet_for_booking"("p_booking_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."customer_display_rating"("p_rating" numeric, "p_review_count" integer) RETURNS double precision
+    LANGUAGE "sql" IMMUTABLE
+    AS $$
+  SELECT CASE
+    WHEN COALESCE(p_review_count, 0) <= 0 OR p_rating IS NULL THEN 5.0
+    ELSE p_rating::double precision
+  END;
+$$;
+
+
+ALTER FUNCTION "public"."customer_display_rating"("p_rating" numeric, "p_review_count" integer) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."customer_rating_for_sort"("p_rating" numeric, "p_review_count" integer) RETURNS double precision
+    LANGUAGE "sql" IMMUTABLE
+    AS $$
+  SELECT CASE
+    WHEN COALESCE(p_review_count, 0) <= 0 THEN 3.5
+    ELSE COALESCE(p_rating, 3.5)::double precision
+  END;
+$$;
+
+
+ALTER FUNCTION "public"."customer_rating_for_sort"("p_rating" numeric, "p_review_count" integer) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."customer_risk_booking_verification_requirement_core"("p_customer_id" "uuid", "p_booking_id" "uuid" DEFAULT NULL::"uuid") RETURNS "jsonb"
@@ -9775,6 +9886,7 @@ CREATE OR REPLACE FUNCTION "public"."get_user_profile_stats"("p_user_id" "uuid",
 DECLARE
   v_result json;
   v_cleaner_rating numeric;
+  v_customer_rating numeric;
 BEGIN
   IF p_is_cleaner THEN
     SELECT rating INTO v_cleaner_rating
@@ -9782,7 +9894,7 @@ BEGIN
 
     SELECT json_build_object(
       'earnedToday', COALESCE((
-        SELECT SUM(COALESCE(final_amount_minor, total_price))::numeric
+        SELECT ROUND(SUM(final_amount_minor)::numeric / 100.0, 2)
         FROM bookings
         WHERE cleaner_id = p_user_id
           AND status = 'completed'
@@ -9804,6 +9916,9 @@ BEGIN
       ), 0)
     ) INTO v_result;
   ELSE
+    SELECT customer_rating INTO v_customer_rating
+    FROM profiles WHERE user_id = p_user_id;
+
     SELECT json_build_object(
       'totalBookings', COALESCE((
         SELECT COUNT(*)::integer FROM bookings WHERE customer_id = p_user_id
@@ -9818,17 +9933,28 @@ BEGIN
         WHERE customer_id = p_user_id AND status = 'completed'
       ), 0),
       'totalSpent', COALESCE((
-        SELECT SUM(COALESCE(final_amount_minor, total_price))::numeric
+        SELECT ROUND(SUM(final_amount_minor)::numeric / 100.0, 2)
         FROM bookings
         WHERE customer_id = p_user_id AND status = 'completed'
       ), 0),
       'averageRating', COALESCE((
-        SELECT ROUND(AVG(rating)::numeric, 1)
-        FROM reviews WHERE reviewer_id = p_user_id
-      ), 0),
+        SELECT ROUND(AVG(r.rating)::numeric, 1)
+        FROM reviews r
+        WHERE r.reviewee_id = p_user_id
+          AND EXISTS (
+            SELECT 1 FROM cleaner_data cd WHERE cd.user_id = r.reviewer_id
+          )
+      ), COALESCE(v_customer_rating, 0)),
       'reviewCount', COALESCE((
-        SELECT COUNT(*)::integer FROM reviews WHERE reviewer_id = p_user_id
-      ), 0)
+        SELECT COUNT(*)::integer
+        FROM reviews r
+        WHERE r.reviewee_id = p_user_id
+          AND EXISTS (
+            SELECT 1 FROM cleaner_data cd WHERE cd.user_id = r.reviewer_id
+          )
+      ), COALESCE((
+        SELECT customer_review_count FROM profiles WHERE user_id = p_user_id
+      ), 0))
     ) INTO v_result;
   END IF;
 
@@ -10358,6 +10484,8 @@ CREATE TABLE IF NOT EXISTS "public"."profiles" (
     "deletion_completed_at" timestamp with time zone,
     "deletion_status" "text" DEFAULT 'none'::"text" NOT NULL,
     "middlename" "text",
+    "customer_rating" numeric,
+    "customer_review_count" integer DEFAULT 0 NOT NULL,
     CONSTRAINT "profiles_deletion_status_check" CHECK (("deletion_status" = ANY (ARRAY['none'::"text", 'scheduled'::"text", 'cancelled'::"text", 'processing'::"text", 'completed'::"text"])))
 );
 
@@ -10394,6 +10522,14 @@ COMMENT ON COLUMN "public"."profiles"."deletion_status" IS 'Lifecycle: none | sc
 
 
 COMMENT ON COLUMN "public"."profiles"."middlename" IS 'Optional middle name; included in fn_sync_profile_fullname trigger.';
+
+
+
+COMMENT ON COLUMN "public"."profiles"."customer_rating" IS 'Average of up to the 500 most recent cleaner reviews received; NULL when none.';
+
+
+
+COMMENT ON COLUMN "public"."profiles"."customer_review_count" IS 'Count of cleaner reviews in the rolling 500-review window used for customer_rating.';
 
 
 
@@ -12378,6 +12514,53 @@ $$;
 ALTER FUNCTION "public"."recompute_cleaner_review_stats"("p_cleaner_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."recompute_customer_review_stats"("p_customer_id" "uuid") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_new_rating numeric;
+  v_review_count integer;
+BEGIN
+  IF p_customer_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  SELECT
+    ROUND(AVG(recent.rating)::numeric, 2),
+    COUNT(*)::integer
+  INTO v_new_rating, v_review_count
+  FROM (
+    SELECT r.rating
+    FROM public.reviews r
+    WHERE r.reviewee_id = p_customer_id
+      AND EXISTS (
+        SELECT 1
+        FROM public.cleaner_data cd
+        WHERE cd.user_id = r.reviewer_id
+      )
+    ORDER BY r.created_at DESC, r.id DESC
+    LIMIT 500
+  ) recent;
+
+  IF COALESCE(v_review_count, 0) = 0 THEN
+    UPDATE public.profiles
+    SET customer_rating = NULL, customer_review_count = 0
+    WHERE user_id = p_customer_id;
+  ELSE
+    UPDATE public.profiles
+    SET customer_rating = v_new_rating, customer_review_count = v_review_count
+    WHERE user_id = p_customer_id;
+  END IF;
+
+  PERFORM public.sync_customer_rating_on_bookings(p_customer_id);
+END;
+$$;
+
+
+ALTER FUNCTION "public"."recompute_customer_review_stats"("p_customer_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."record_admin_cash_payout"("p_cleaner_id" "uuid", "p_amount_subunit" integer, "p_recorded_by" "uuid", "p_booking_id" "uuid" DEFAULT NULL::"uuid", "p_notes" "text" DEFAULT NULL::"text") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public', 'pg_temp'
@@ -12695,6 +12878,47 @@ $$;
 
 
 ALTER FUNCTION "public"."refresh_auth_identity_lookup"("target_user_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."refresh_booking_customer_review_eligibility"("p_booking_id" "uuid") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_booking public.bookings%ROWTYPE;
+  v_booking_day date;
+  v_today date;
+  v_window_closed boolean;
+  v_can_review boolean;
+BEGIN
+  SELECT * INTO v_booking
+  FROM public.bookings b
+  WHERE b.id = p_booking_id;
+
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  v_booking_day := COALESCE(v_booking.scheduled_date::date, v_booking.created_at::date);
+  v_today := (now() AT TIME ZONE COALESCE(v_booking.timezone_name, 'Africa/Accra'))::date;
+  v_window_closed := v_booking_day IS NOT NULL AND v_booking_day + 7 < v_today;
+
+  v_can_review :=
+    v_booking.status = 'completed'
+    AND v_booking.cleaner_id IS NOT NULL
+    AND NOT COALESCE(v_booking.has_cleaner_reviewed_customer, false)
+    AND NOT v_window_closed;
+
+  UPDATE public.bookings b
+  SET
+    customer_review_window_closed = v_window_closed,
+    can_review_customer = v_can_review
+  WHERE b.id = p_booking_id;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."refresh_booking_customer_review_eligibility"("p_booking_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."refresh_cleaner_health_snapshots"("p_snapshot_date" "date" DEFAULT CURRENT_DATE) RETURNS "jsonb"
@@ -14710,7 +14934,6 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'error', 'booking_cancelled');
   END IF;
 
-  -- NULL scheduled_date on an unfinished booking must not slip through.
   IF v_booking.status IS DISTINCT FROM 'completed' AND v_booking.scheduled_date IS NULL THEN
     RETURN jsonb_build_object('success', false, 'error', 'booking_not_finished');
   END IF;
@@ -14722,7 +14945,6 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'error', 'booking_not_finished');
   END IF;
 
-  -- Reviews close seven days after the booking day (service-local).
   IF v_booking_day IS NOT NULL AND v_booking_day + 7 < v_today THEN
     RETURN jsonb_build_object('success', false, 'error', 'review_window_closed');
   END IF;
@@ -14735,7 +14957,7 @@ BEGIN
     p_rating,
     NULLIF(BTRIM(COALESCE(p_comment, '')), '')
   )
-  ON CONFLICT (booking_id) WHERE booking_id IS NOT NULL DO NOTHING;
+  ON CONFLICT (booking_id, reviewer_id) WHERE booking_id IS NOT NULL DO NOTHING;
 
   IF NOT FOUND THEN
     RETURN jsonb_build_object('success', false, 'error', 'already_reviewed');
@@ -14761,6 +14983,90 @@ $$;
 
 
 ALTER FUNCTION "public"."submit_booking_review"("p_booking_id" "uuid", "p_rating" integer, "p_comment" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."submit_customer_review"("p_booking_id" "uuid", "p_rating" integer, "p_comment" "text" DEFAULT NULL::"text") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_user uuid := auth.uid();
+  v_booking public.bookings%ROWTYPE;
+  v_booking_day date;
+  v_today date;
+  v_stored_rating numeric;
+  v_review_count integer;
+BEGIN
+  IF v_user IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  IF p_rating IS NULL OR p_rating < 1 OR p_rating > 5 THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_rating');
+  END IF;
+
+  SELECT * INTO v_booking
+  FROM public.bookings b
+  WHERE b.id = p_booking_id;
+
+  IF NOT FOUND OR v_booking.cleaner_id IS DISTINCT FROM v_user THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_assigned_cleaner');
+  END IF;
+
+  IF v_booking.status IS DISTINCT FROM 'completed' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'booking_not_completed');
+  END IF;
+
+  IF v_booking.status = 'cancelled' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'booking_cancelled');
+  END IF;
+
+  v_booking_day := COALESCE(v_booking.scheduled_date::date, v_booking.created_at::date);
+  v_today := (now() AT TIME ZONE COALESCE(v_booking.timezone_name, 'Africa/Accra'))::date;
+
+  IF v_booking_day IS NOT NULL AND v_booking_day + 7 < v_today THEN
+    RETURN jsonb_build_object('success', false, 'error', 'review_window_closed');
+  END IF;
+
+  INSERT INTO public.reviews (booking_id, reviewer_id, reviewee_id, rating, comment)
+  VALUES (
+    p_booking_id,
+    v_user,
+    v_booking.customer_id,
+    p_rating,
+    NULLIF(BTRIM(COALESCE(p_comment, '')), '')
+  )
+  ON CONFLICT (booking_id, reviewer_id) WHERE booking_id IS NOT NULL DO NOTHING;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'already_reviewed');
+  END IF;
+
+  UPDATE public.bookings
+  SET has_cleaner_reviewed_customer = true
+  WHERE id = p_booking_id;
+
+  PERFORM public.recompute_customer_review_stats(v_booking.customer_id);
+  PERFORM public.refresh_booking_customer_review_eligibility(p_booking_id);
+
+  SELECT p.customer_rating, p.customer_review_count
+  INTO v_stored_rating, v_review_count
+  FROM public.profiles p
+  WHERE p.user_id = v_booking.customer_id;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'booking_id', p_booking_id,
+    'rating', p_rating,
+    'customer_rating', v_stored_rating,
+    'customer_review_count', COALESCE(v_review_count, 0),
+    'customer_display_rating', public.customer_display_rating(v_stored_rating, v_review_count)
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."submit_customer_review"("p_booking_id" "uuid", "p_rating" integer, "p_comment" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."sync_auth_identity_lookup_from_auth_identities"() RETURNS "trigger"
@@ -14853,6 +15159,65 @@ $$;
 
 
 ALTER FUNCTION "public"."sync_auth_user_to_public_user"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."sync_customer_rating_on_bookings"("p_customer_id" "uuid") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_rating numeric;
+  v_review_count integer;
+  v_display double precision;
+BEGIN
+  IF p_customer_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  SELECT p.customer_rating, COALESCE(p.customer_review_count, 0)
+  INTO v_rating, v_review_count
+  FROM public.profiles p
+  WHERE p.user_id = p_customer_id;
+
+  v_display := public.customer_display_rating(v_rating, v_review_count);
+
+  UPDATE public.bookings b
+  SET
+    customer_rating = v_rating,
+    customer_review_count = v_review_count,
+    customer_display_rating = v_display
+  WHERE b.customer_id = p_customer_id;
+
+  UPDATE public.bookings b
+  SET customer_review_window_closed = sub.window_closed,
+      can_review_customer = sub.can_review
+  FROM (
+    SELECT
+      b2.id AS booking_id,
+      (
+        COALESCE(b2.scheduled_date::date, b2.created_at::date) IS NOT NULL
+        AND COALESCE(b2.scheduled_date::date, b2.created_at::date) + 7
+          < (now() AT TIME ZONE COALESCE(b2.timezone_name, 'Africa/Accra'))::date
+      ) AS window_closed,
+      (
+        b2.status = 'completed'
+        AND b2.cleaner_id IS NOT NULL
+        AND NOT COALESCE(b2.has_cleaner_reviewed_customer, false)
+        AND NOT (
+          COALESCE(b2.scheduled_date::date, b2.created_at::date) IS NOT NULL
+          AND COALESCE(b2.scheduled_date::date, b2.created_at::date) + 7
+            < (now() AT TIME ZONE COALESCE(b2.timezone_name, 'Africa/Accra'))::date
+        )
+      ) AS can_review
+    FROM public.bookings b2
+    WHERE b2.customer_id = p_customer_id
+  ) sub
+  WHERE b.id = sub.booking_id;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."sync_customer_rating_on_bookings"("p_customer_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."sync_customer_trust_from_kyc_profiles"() RETURNS "trigger"
@@ -15191,6 +15556,24 @@ $$;
 
 
 ALTER FUNCTION "public"."trg_bookings_ensure_cleaner_earnings_minor"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."trg_bookings_refresh_customer_review_eligibility"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF NEW.status = 'completed'
+     AND (TG_OP = 'INSERT' OR OLD.status IS DISTINCT FROM NEW.status) THEN
+    PERFORM public.sync_customer_rating_on_bookings(NEW.customer_id);
+    PERFORM public.refresh_booking_customer_review_eligibility(NEW.id);
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."trg_bookings_refresh_customer_review_eligibility"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."trg_init_direct_assignment_on_paid"() RETURNS "trigger"
@@ -16783,7 +17166,7 @@ CREATE TABLE IF NOT EXISTS "public"."bookings" (
     "booking_cover_amount" numeric,
     "timezone" "text" DEFAULT 'UTC'::"text",
     "completion_notes" "text",
-    "customer_rating" smallint,
+    "customer_rating" numeric,
     "subscription_id" "uuid",
     "recurrence_interval" "text",
     "currency" "text" DEFAULT 'GHS'::"text",
@@ -16851,13 +17234,17 @@ CREATE TABLE IF NOT EXISTS "public"."bookings" (
     "ops_unassigned_paid_reminders_stopped_by" "uuid",
     "cancelled_by" "uuid",
     "cancellation_reason" "text",
+    "customer_review_count" integer,
+    "customer_display_rating" double precision,
+    "has_cleaner_reviewed_customer" boolean DEFAULT false NOT NULL,
+    "can_review_customer" boolean,
+    "customer_review_window_closed" boolean DEFAULT false NOT NULL,
     CONSTRAINT "bookings_assignment_phase_check" CHECK ((("assignment_phase" IS NULL) OR ("assignment_phase" = ANY (ARRAY['exclusive'::"text", 'broadcast'::"text", 'accepted'::"text"])))),
     CONSTRAINT "bookings_cancellation_tier_check" CHECK ((("cancellation_tier" IS NULL) OR ("cancellation_tier" = ANY (ARRAY['full_refund'::"text", 'partial_refund'::"text", 'no_refund'::"text"])))),
     CONSTRAINT "bookings_cancelled_by_role_check" CHECK ((("cancelled_by_role" IS NULL) OR ("cancelled_by_role" = ANY (ARRAY['customer'::"text", 'cleaner'::"text", 'admin'::"text", 'platform'::"text"])))),
     CONSTRAINT "bookings_core_amount_nonnegative_check" CHECK ((("core_amount_minor" IS NULL) OR ("core_amount_minor" >= 0))),
     CONSTRAINT "bookings_customer_cannot_be_cleaner" CHECK ((("cleaner_id" IS NULL) OR ("customer_id" IS NULL) OR ("cleaner_id" <> "customer_id"))),
     CONSTRAINT "bookings_customer_cannot_be_direct_assigned_cleaner" CHECK ((("direct_assigned_cleaner_id" IS NULL) OR ("customer_id" IS NULL) OR ("direct_assigned_cleaner_id" <> "customer_id"))),
-    CONSTRAINT "bookings_customer_rating_range" CHECK ((("customer_rating" IS NULL) OR (("customer_rating" >= 1) AND ("customer_rating" <= 5)))),
     CONSTRAINT "bookings_duration_hours_valid" CHECK ((("duration_hours" > (0)::numeric) AND ("duration_hours" <= (24)::numeric))),
     CONSTRAINT "bookings_final_amount_nonnegative_check" CHECK ((("final_amount_minor" IS NULL) OR ("final_amount_minor" >= 0))),
     CONSTRAINT "bookings_payment_split_type_check" CHECK ((("payment_split_type" IS NULL) OR ("payment_split_type" = ANY (ARRAY['split_code'::"text", 'percentage'::"text", 'flat'::"text"])))),
@@ -16886,7 +17273,7 @@ COMMENT ON COLUMN "public"."bookings"."completion_notes" IS 'Cleaner notes when 
 
 
 
-COMMENT ON COLUMN "public"."bookings"."customer_rating" IS 'Cleaner rating of customer experience (1-5)';
+COMMENT ON COLUMN "public"."bookings"."customer_rating" IS 'Denormalized customer average rating (profiles.customer_rating) for cleaner job cards.';
 
 
 
@@ -17015,6 +17402,26 @@ COMMENT ON COLUMN "public"."bookings"."ops_unassigned_paid_reminders_stopped_at"
 
 
 COMMENT ON COLUMN "public"."bookings"."ops_unassigned_paid_reminders_stopped_by" IS 'Admin user who stopped unassigned-paid ops reminders (NULL when stopped via signed ops link).';
+
+
+
+COMMENT ON COLUMN "public"."bookings"."customer_review_count" IS 'Denormalized customer review count (profiles.customer_review_count) for cleaner job cards.';
+
+
+
+COMMENT ON COLUMN "public"."bookings"."customer_display_rating" IS 'Denormalized Uber-style display rating for the customer on this booking row.';
+
+
+
+COMMENT ON COLUMN "public"."bookings"."has_cleaner_reviewed_customer" IS 'True once the assigned cleaner submitted submit_customer_review for this booking.';
+
+
+
+COMMENT ON COLUMN "public"."bookings"."can_review_customer" IS 'Denormalized eligibility flag for the assigned cleaner to rate the customer.';
+
+
+
+COMMENT ON COLUMN "public"."bookings"."customer_review_window_closed" IS 'True when the cleaner review window (7 days after booking day, service-local) has passed.';
 
 
 
@@ -20407,7 +20814,7 @@ CREATE INDEX "promotion_redemptions_expired_reservations_idx" ON "public"."promo
 
 
 
-CREATE UNIQUE INDEX "reviews_booking_id_key" ON "public"."reviews" USING "btree" ("booking_id") WHERE ("booking_id" IS NOT NULL);
+CREATE UNIQUE INDEX "reviews_booking_reviewer_key" ON "public"."reviews" USING "btree" ("booking_id", "reviewer_id") WHERE ("booking_id" IS NOT NULL);
 
 
 
@@ -20460,6 +20867,10 @@ CREATE OR REPLACE TRIGGER "bookings_compute_scheduled_at_utc" BEFORE INSERT OR U
 
 
 CREATE OR REPLACE TRIGGER "bookings_guard_payment_status" BEFORE UPDATE ON "public"."bookings" FOR EACH ROW EXECUTE FUNCTION "public"."guard_booking_payment_status_writes"();
+
+
+
+CREATE OR REPLACE TRIGGER "bookings_refresh_customer_review_eligibility" AFTER INSERT OR UPDATE OF "status" ON "public"."bookings" FOR EACH ROW EXECUTE FUNCTION "public"."trg_bookings_refresh_customer_review_eligibility"();
 
 
 
@@ -23877,9 +24288,9 @@ GRANT ALL ON FUNCTION "public"."cleanup_orphaned_pending_subscription"("p_subscr
 
 
 
-GRANT ALL ON FUNCTION "public"."complete_cleaner_booking"("p_booking_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."complete_cleaner_booking"("p_booking_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."complete_cleaner_booking"("p_booking_id" "uuid") TO "service_role";
+REVOKE ALL ON FUNCTION "public"."complete_cleaner_booking"("p_booking_id" "uuid", "p_completion_notes" "text", "p_customer_rating" integer, "p_customer_comment" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."complete_cleaner_booking"("p_booking_id" "uuid", "p_completion_notes" "text", "p_customer_rating" integer, "p_customer_comment" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."complete_cleaner_booking"("p_booking_id" "uuid", "p_completion_notes" "text", "p_customer_rating" integer, "p_customer_comment" "text") TO "service_role";
 
 
 
@@ -23991,6 +24402,18 @@ GRANT ALL ON FUNCTION "public"."create_preferred_cleaner_invite"("p_invitee_emai
 
 REVOKE ALL ON FUNCTION "public"."credit_cleaner_wallet_for_booking"("p_booking_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."credit_cleaner_wallet_for_booking"("p_booking_id" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."customer_display_rating"("p_rating" numeric, "p_review_count" integer) TO "anon";
+GRANT ALL ON FUNCTION "public"."customer_display_rating"("p_rating" numeric, "p_review_count" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."customer_display_rating"("p_rating" numeric, "p_review_count" integer) TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."customer_rating_for_sort"("p_rating" numeric, "p_review_count" integer) TO "anon";
+GRANT ALL ON FUNCTION "public"."customer_rating_for_sort"("p_rating" numeric, "p_review_count" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."customer_rating_for_sort"("p_rating" numeric, "p_review_count" integer) TO "service_role";
 
 
 
@@ -27400,6 +27823,11 @@ GRANT ALL ON FUNCTION "public"."recompute_cleaner_review_stats"("p_cleaner_id" "
 
 
 
+REVOKE ALL ON FUNCTION "public"."recompute_customer_review_stats"("p_customer_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."recompute_customer_review_stats"("p_customer_id" "uuid") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."record_admin_cash_payout"("p_cleaner_id" "uuid", "p_amount_subunit" integer, "p_recorded_by" "uuid", "p_booking_id" "uuid", "p_notes" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."record_admin_cash_payout"("p_cleaner_id" "uuid", "p_amount_subunit" integer, "p_recorded_by" "uuid", "p_booking_id" "uuid", "p_notes" "text") TO "service_role";
 
@@ -27422,6 +27850,11 @@ GRANT ALL ON FUNCTION "public"."record_ops_event"("p_level" "text", "p_source" "
 GRANT ALL ON FUNCTION "public"."refresh_auth_identity_lookup"("target_user_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."refresh_auth_identity_lookup"("target_user_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."refresh_auth_identity_lookup"("target_user_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."refresh_booking_customer_review_eligibility"("p_booking_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."refresh_booking_customer_review_eligibility"("p_booking_id" "uuid") TO "service_role";
 
 
 
@@ -30666,6 +31099,12 @@ GRANT ALL ON FUNCTION "public"."submit_booking_review"("p_booking_id" "uuid", "p
 
 
 
+REVOKE ALL ON FUNCTION "public"."submit_customer_review"("p_booking_id" "uuid", "p_rating" integer, "p_comment" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."submit_customer_review"("p_booking_id" "uuid", "p_rating" integer, "p_comment" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."submit_customer_review"("p_booking_id" "uuid", "p_rating" integer, "p_comment" "text") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."sync_auth_identity_lookup_from_auth_identities"() TO "anon";
 GRANT ALL ON FUNCTION "public"."sync_auth_identity_lookup_from_auth_identities"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."sync_auth_identity_lookup_from_auth_identities"() TO "service_role";
@@ -30681,6 +31120,11 @@ GRANT ALL ON FUNCTION "public"."sync_auth_identity_lookup_from_auth_users"() TO 
 GRANT ALL ON FUNCTION "public"."sync_auth_user_to_public_user"() TO "anon";
 GRANT ALL ON FUNCTION "public"."sync_auth_user_to_public_user"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."sync_auth_user_to_public_user"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."sync_customer_rating_on_bookings"("p_customer_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."sync_customer_rating_on_bookings"("p_customer_id" "uuid") TO "service_role";
 
 
 
@@ -30801,6 +31245,12 @@ GRANT ALL ON FUNCTION "public"."trg_bookings_clear_payment_split_on_amount_chang
 GRANT ALL ON FUNCTION "public"."trg_bookings_ensure_cleaner_earnings_minor"() TO "anon";
 GRANT ALL ON FUNCTION "public"."trg_bookings_ensure_cleaner_earnings_minor"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."trg_bookings_ensure_cleaner_earnings_minor"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."trg_bookings_refresh_customer_review_eligibility"() TO "anon";
+GRANT ALL ON FUNCTION "public"."trg_bookings_refresh_customer_review_eligibility"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."trg_bookings_refresh_customer_review_eligibility"() TO "service_role";
 
 
 

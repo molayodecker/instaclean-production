@@ -3404,18 +3404,19 @@ AS $function$
 DECLARE
   v_claimed_at timestamptz := now();
 BEGIN
-  UPDATE public.bookings
+  UPDATE public.bookings b
   SET review_request_sent_at = v_claimed_at
-  WHERE id = p_booking_id
-    AND review_request_sent_at IS NULL
-    AND payment_status = 'paid'
-    AND status = 'completed'
-    AND cleaner_id IS NOT NULL
-    AND completed_at IS NOT NULL
+  WHERE b.id = p_booking_id
+    AND b.review_request_sent_at IS NULL
+    AND b.payment_status = 'paid'
+    AND b.status = 'completed'
+    AND b.cleaner_id IS NOT NULL
+    AND b.completed_at IS NOT NULL
     AND NOT EXISTS (
       SELECT 1
       FROM public.reviews r
       WHERE r.booking_id = p_booking_id
+        AND r.reviewer_id = b.customer_id
     );
 
   IF FOUND THEN
@@ -4296,7 +4297,7 @@ END;
 $function$
 
 
-CREATE OR REPLACE FUNCTION public.complete_cleaner_booking(p_booking_id uuid)
+CREATE OR REPLACE FUNCTION public.complete_cleaner_booking(p_booking_id uuid, p_completion_notes text DEFAULT NULL::text, p_customer_rating integer DEFAULT NULL::integer, p_customer_comment text DEFAULT NULL::text)
  RETURNS jsonb
  LANGUAGE plpgsql
  SECURITY DEFINER
@@ -4306,6 +4307,12 @@ DECLARE
   v_uid uuid := auth.uid();
   v_row public.bookings%ROWTYPE;
   v_missing text[];
+  v_booking_day date;
+  v_today date;
+  v_stored_rating numeric;
+  v_review_count integer;
+  v_customer_review_submitted boolean := false;
+  v_customer_review_error text;
 BEGIN
   IF v_uid IS NULL THEN
     RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
@@ -4313,6 +4320,11 @@ BEGIN
 
   IF p_booking_id IS NULL THEN
     RETURN jsonb_build_object('success', false, 'error', 'missing_booking_id');
+  END IF;
+
+  IF p_customer_rating IS NOT NULL
+     AND (p_customer_rating < 1 OR p_customer_rating > 5) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_rating');
   END IF;
 
   SELECT * INTO v_row
@@ -4338,14 +4350,87 @@ BEGIN
     );
   END IF;
 
+  IF p_customer_rating IS NOT NULL THEN
+    v_booking_day := COALESCE(v_row.scheduled_date::date, v_row.created_at::date);
+    v_today := (now() AT TIME ZONE COALESCE(v_row.timezone_name, 'Africa/Accra'))::date;
+
+    IF v_booking_day IS NOT NULL AND v_booking_day + 7 < v_today THEN
+      v_customer_review_error := 'review_window_closed';
+    ELSIF EXISTS (
+      SELECT 1
+      FROM public.reviews r
+      WHERE r.booking_id = p_booking_id
+        AND r.reviewer_id = v_uid
+    ) THEN
+      v_customer_review_error := 'already_reviewed';
+    END IF;
+  END IF;
+
   UPDATE public.bookings
   SET
     status = 'completed',
+    completed_at = COALESCE(completed_at, now()),
+    completion_notes = COALESCE(
+      NULLIF(BTRIM(COALESCE(p_completion_notes, '')), ''),
+      completion_notes
+    ),
     last_updated = now(),
     updated_at = now()
   WHERE id = p_booking_id;
 
-  RETURN jsonb_build_object('success', true, 'booking_id', p_booking_id, 'new_status', 'completed');
+  IF p_customer_rating IS NOT NULL AND v_customer_review_error IS NULL THEN
+    INSERT INTO public.reviews (booking_id, reviewer_id, reviewee_id, rating, comment)
+    VALUES (
+      p_booking_id,
+      v_uid,
+      v_row.customer_id,
+      p_customer_rating,
+      NULLIF(BTRIM(COALESCE(p_customer_comment, '')), '')
+    )
+    ON CONFLICT (booking_id, reviewer_id) WHERE booking_id IS NOT NULL DO NOTHING;
+
+    IF NOT FOUND THEN
+      v_customer_review_error := 'already_reviewed';
+    ELSE
+      v_customer_review_submitted := true;
+    END IF;
+  END IF;
+
+  IF v_customer_review_submitted OR v_customer_review_error = 'already_reviewed' THEN
+    IF v_customer_review_submitted THEN
+      UPDATE public.bookings
+      SET has_cleaner_reviewed_customer = true
+      WHERE id = p_booking_id;
+
+      PERFORM public.recompute_customer_review_stats(v_row.customer_id);
+    ELSE
+      UPDATE public.bookings
+      SET has_cleaner_reviewed_customer = true
+      WHERE id = p_booking_id;
+    END IF;
+
+    PERFORM public.refresh_booking_customer_review_eligibility(p_booking_id);
+
+    SELECT p.customer_rating, p.customer_review_count
+    INTO v_stored_rating, v_review_count
+    FROM public.profiles p
+    WHERE p.user_id = v_row.customer_id;
+  END IF;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'booking_id', p_booking_id,
+    'new_status', 'completed',
+    'customer_review_submitted', v_customer_review_submitted,
+    'customer_review_error', v_customer_review_error,
+    'customer_rating', v_stored_rating,
+    'customer_review_count', COALESCE(v_review_count, 0),
+    'customer_display_rating',
+      CASE
+        WHEN v_stored_rating IS NULL AND v_review_count IS NULL THEN NULL
+        ELSE public.customer_display_rating(v_stored_rating, v_review_count)
+      END
+  );
 END;
 $function$
 
@@ -6050,6 +6135,30 @@ BEGIN
     updated_at = NOW()
   WHERE id = v_wallet_id;
 END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.customer_display_rating(p_rating numeric, p_review_count integer)
+ RETURNS double precision
+ LANGUAGE sql
+ IMMUTABLE
+AS $function$
+  SELECT CASE
+    WHEN COALESCE(p_review_count, 0) <= 0 OR p_rating IS NULL THEN 5.0
+    ELSE p_rating::double precision
+  END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.customer_rating_for_sort(p_rating numeric, p_review_count integer)
+ RETURNS double precision
+ LANGUAGE sql
+ IMMUTABLE
+AS $function$
+  SELECT CASE
+    WHEN COALESCE(p_review_count, 0) <= 0 THEN 3.5
+    ELSE COALESCE(p_rating, 3.5)::double precision
+  END;
 $function$
 
 
@@ -12549,6 +12658,7 @@ AS $function$
 DECLARE
   v_result json;
   v_cleaner_rating numeric;
+  v_customer_rating numeric;
 BEGIN
   IF p_is_cleaner THEN
     SELECT rating INTO v_cleaner_rating
@@ -12556,7 +12666,7 @@ BEGIN
 
     SELECT json_build_object(
       'earnedToday', COALESCE((
-        SELECT SUM(COALESCE(final_amount_minor, total_price))::numeric
+        SELECT ROUND(SUM(final_amount_minor)::numeric / 100.0, 2)
         FROM bookings
         WHERE cleaner_id = p_user_id
           AND status = 'completed'
@@ -12578,6 +12688,9 @@ BEGIN
       ), 0)
     ) INTO v_result;
   ELSE
+    SELECT customer_rating INTO v_customer_rating
+    FROM profiles WHERE user_id = p_user_id;
+
     SELECT json_build_object(
       'totalBookings', COALESCE((
         SELECT COUNT(*)::integer FROM bookings WHERE customer_id = p_user_id
@@ -12592,17 +12705,28 @@ BEGIN
         WHERE customer_id = p_user_id AND status = 'completed'
       ), 0),
       'totalSpent', COALESCE((
-        SELECT SUM(COALESCE(final_amount_minor, total_price))::numeric
+        SELECT ROUND(SUM(final_amount_minor)::numeric / 100.0, 2)
         FROM bookings
         WHERE customer_id = p_user_id AND status = 'completed'
       ), 0),
       'averageRating', COALESCE((
-        SELECT ROUND(AVG(rating)::numeric, 1)
-        FROM reviews WHERE reviewer_id = p_user_id
-      ), 0),
+        SELECT ROUND(AVG(r.rating)::numeric, 1)
+        FROM reviews r
+        WHERE r.reviewee_id = p_user_id
+          AND EXISTS (
+            SELECT 1 FROM cleaner_data cd WHERE cd.user_id = r.reviewer_id
+          )
+      ), COALESCE(v_customer_rating, 0)),
       'reviewCount', COALESCE((
-        SELECT COUNT(*)::integer FROM reviews WHERE reviewer_id = p_user_id
-      ), 0)
+        SELECT COUNT(*)::integer
+        FROM reviews r
+        WHERE r.reviewee_id = p_user_id
+          AND EXISTS (
+            SELECT 1 FROM cleaner_data cd WHERE cd.user_id = r.reviewer_id
+          )
+      ), COALESCE((
+        SELECT customer_review_count FROM profiles WHERE user_id = p_user_id
+      ), 0))
     ) INTO v_result;
   END IF;
 
@@ -16302,6 +16426,52 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.recompute_customer_review_stats(p_customer_id uuid)
+ RETURNS void
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_new_rating numeric;
+  v_review_count integer;
+BEGIN
+  IF p_customer_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  SELECT
+    ROUND(AVG(recent.rating)::numeric, 2),
+    COUNT(*)::integer
+  INTO v_new_rating, v_review_count
+  FROM (
+    SELECT r.rating
+    FROM public.reviews r
+    WHERE r.reviewee_id = p_customer_id
+      AND EXISTS (
+        SELECT 1
+        FROM public.cleaner_data cd
+        WHERE cd.user_id = r.reviewer_id
+      )
+    ORDER BY r.created_at DESC, r.id DESC
+    LIMIT 500
+  ) recent;
+
+  IF COALESCE(v_review_count, 0) = 0 THEN
+    UPDATE public.profiles
+    SET customer_rating = NULL, customer_review_count = 0
+    WHERE user_id = p_customer_id;
+  ELSE
+    UPDATE public.profiles
+    SET customer_rating = v_new_rating, customer_review_count = v_review_count
+    WHERE user_id = p_customer_id;
+  END IF;
+
+  PERFORM public.sync_customer_rating_on_bookings(p_customer_id);
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.record_admin_cash_payout(p_cleaner_id uuid, p_amount_subunit integer, p_recorded_by uuid, p_booking_id uuid DEFAULT NULL::uuid, p_notes text DEFAULT NULL::text)
  RETURNS jsonb
  LANGUAGE plpgsql
@@ -16610,6 +16780,46 @@ begin
     providers = excluded.providers,
     updated_at = now();
 end;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.refresh_booking_customer_review_eligibility(p_booking_id uuid)
+ RETURNS void
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_booking public.bookings%ROWTYPE;
+  v_booking_day date;
+  v_today date;
+  v_window_closed boolean;
+  v_can_review boolean;
+BEGIN
+  SELECT * INTO v_booking
+  FROM public.bookings b
+  WHERE b.id = p_booking_id;
+
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  v_booking_day := COALESCE(v_booking.scheduled_date::date, v_booking.created_at::date);
+  v_today := (now() AT TIME ZONE COALESCE(v_booking.timezone_name, 'Africa/Accra'))::date;
+  v_window_closed := v_booking_day IS NOT NULL AND v_booking_day + 7 < v_today;
+
+  v_can_review :=
+    v_booking.status = 'completed'
+    AND v_booking.cleaner_id IS NOT NULL
+    AND NOT COALESCE(v_booking.has_cleaner_reviewed_customer, false)
+    AND NOT v_window_closed;
+
+  UPDATE public.bookings b
+  SET
+    customer_review_window_closed = v_window_closed,
+    can_review_customer = v_can_review
+  WHERE b.id = p_booking_id;
+END;
 $function$
 
 
@@ -21885,7 +22095,6 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'error', 'booking_cancelled');
   END IF;
 
-  -- NULL scheduled_date on an unfinished booking must not slip through.
   IF v_booking.status IS DISTINCT FROM 'completed' AND v_booking.scheduled_date IS NULL THEN
     RETURN jsonb_build_object('success', false, 'error', 'booking_not_finished');
   END IF;
@@ -21897,7 +22106,6 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'error', 'booking_not_finished');
   END IF;
 
-  -- Reviews close seven days after the booking day (service-local).
   IF v_booking_day IS NOT NULL AND v_booking_day + 7 < v_today THEN
     RETURN jsonb_build_object('success', false, 'error', 'review_window_closed');
   END IF;
@@ -21910,7 +22118,7 @@ BEGIN
     p_rating,
     NULLIF(BTRIM(COALESCE(p_comment, '')), '')
   )
-  ON CONFLICT (booking_id) WHERE booking_id IS NOT NULL DO NOTHING;
+  ON CONFLICT (booking_id, reviewer_id) WHERE booking_id IS NOT NULL DO NOTHING;
 
   IF NOT FOUND THEN
     RETURN jsonb_build_object('success', false, 'error', 'already_reviewed');
@@ -21930,6 +22138,89 @@ BEGIN
     'cleaner_rating', v_stored_rating,
     'cleaner_review_count', COALESCE(v_review_count, 0),
     'cleaner_display_rating', public.cleaner_display_rating(v_stored_rating, v_review_count)
+  );
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.submit_customer_review(p_booking_id uuid, p_rating integer, p_comment text DEFAULT NULL::text)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_user uuid := auth.uid();
+  v_booking public.bookings%ROWTYPE;
+  v_booking_day date;
+  v_today date;
+  v_stored_rating numeric;
+  v_review_count integer;
+BEGIN
+  IF v_user IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  IF p_rating IS NULL OR p_rating < 1 OR p_rating > 5 THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_rating');
+  END IF;
+
+  SELECT * INTO v_booking
+  FROM public.bookings b
+  WHERE b.id = p_booking_id;
+
+  IF NOT FOUND OR v_booking.cleaner_id IS DISTINCT FROM v_user THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_assigned_cleaner');
+  END IF;
+
+  IF v_booking.status IS DISTINCT FROM 'completed' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'booking_not_completed');
+  END IF;
+
+  IF v_booking.status = 'cancelled' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'booking_cancelled');
+  END IF;
+
+  v_booking_day := COALESCE(v_booking.scheduled_date::date, v_booking.created_at::date);
+  v_today := (now() AT TIME ZONE COALESCE(v_booking.timezone_name, 'Africa/Accra'))::date;
+
+  IF v_booking_day IS NOT NULL AND v_booking_day + 7 < v_today THEN
+    RETURN jsonb_build_object('success', false, 'error', 'review_window_closed');
+  END IF;
+
+  INSERT INTO public.reviews (booking_id, reviewer_id, reviewee_id, rating, comment)
+  VALUES (
+    p_booking_id,
+    v_user,
+    v_booking.customer_id,
+    p_rating,
+    NULLIF(BTRIM(COALESCE(p_comment, '')), '')
+  )
+  ON CONFLICT (booking_id, reviewer_id) WHERE booking_id IS NOT NULL DO NOTHING;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'already_reviewed');
+  END IF;
+
+  UPDATE public.bookings
+  SET has_cleaner_reviewed_customer = true
+  WHERE id = p_booking_id;
+
+  PERFORM public.recompute_customer_review_stats(v_booking.customer_id);
+  PERFORM public.refresh_booking_customer_review_eligibility(p_booking_id);
+
+  SELECT p.customer_rating, p.customer_review_count
+  INTO v_stored_rating, v_review_count
+  FROM public.profiles p
+  WHERE p.user_id = v_booking.customer_id;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'booking_id', p_booking_id,
+    'rating', p_rating,
+    'customer_rating', v_stored_rating,
+    'customer_review_count', COALESCE(v_review_count, 0),
+    'customer_display_rating', public.customer_display_rating(v_stored_rating, v_review_count)
   );
 END;
 $function$
@@ -22021,6 +22312,64 @@ begin
 
   return new;
 end;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.sync_customer_rating_on_bookings(p_customer_id uuid)
+ RETURNS void
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_rating numeric;
+  v_review_count integer;
+  v_display double precision;
+BEGIN
+  IF p_customer_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  SELECT p.customer_rating, COALESCE(p.customer_review_count, 0)
+  INTO v_rating, v_review_count
+  FROM public.profiles p
+  WHERE p.user_id = p_customer_id;
+
+  v_display := public.customer_display_rating(v_rating, v_review_count);
+
+  UPDATE public.bookings b
+  SET
+    customer_rating = v_rating,
+    customer_review_count = v_review_count,
+    customer_display_rating = v_display
+  WHERE b.customer_id = p_customer_id;
+
+  UPDATE public.bookings b
+  SET customer_review_window_closed = sub.window_closed,
+      can_review_customer = sub.can_review
+  FROM (
+    SELECT
+      b2.id AS booking_id,
+      (
+        COALESCE(b2.scheduled_date::date, b2.created_at::date) IS NOT NULL
+        AND COALESCE(b2.scheduled_date::date, b2.created_at::date) + 7
+          < (now() AT TIME ZONE COALESCE(b2.timezone_name, 'Africa/Accra'))::date
+      ) AS window_closed,
+      (
+        b2.status = 'completed'
+        AND b2.cleaner_id IS NOT NULL
+        AND NOT COALESCE(b2.has_cleaner_reviewed_customer, false)
+        AND NOT (
+          COALESCE(b2.scheduled_date::date, b2.created_at::date) IS NOT NULL
+          AND COALESCE(b2.scheduled_date::date, b2.created_at::date) + 7
+            < (now() AT TIME ZONE COALESCE(b2.timezone_name, 'Africa/Accra'))::date
+        )
+      ) AS can_review
+    FROM public.bookings b2
+    WHERE b2.customer_id = p_customer_id
+  ) sub
+  WHERE b.id = sub.booking_id;
+END;
 $function$
 
 
@@ -22407,6 +22756,23 @@ BEGIN
     );
   END IF;
 
+  RETURN NEW;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.trg_bookings_refresh_customer_review_eligibility()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  IF NEW.status = 'completed'
+     AND (TG_OP = 'INSERT' OR OLD.status IS DISTINCT FROM NEW.status) THEN
+    PERFORM public.sync_customer_rating_on_bookings(NEW.customer_id);
+    PERFORM public.refresh_booking_customer_review_eligibility(NEW.id);
+  END IF;
   RETURN NEW;
 END;
 $function$
@@ -23966,6 +24332,8 @@ CREATE TRIGGER trg_booking_refunds_updated_at BEFORE UPDATE ON booking_refunds F
 CREATE TRIGGER bookings_compute_scheduled_at_utc BEFORE INSERT OR UPDATE OF scheduled_date, scheduled_time, timezone_name ON bookings FOR EACH ROW EXECUTE FUNCTION compute_booking_scheduled_at_utc();
 
 CREATE TRIGGER bookings_guard_payment_status BEFORE UPDATE ON bookings FOR EACH ROW EXECUTE FUNCTION guard_booking_payment_status_writes();
+
+CREATE TRIGGER bookings_refresh_customer_review_eligibility AFTER INSERT OR UPDATE OF status ON bookings FOR EACH ROW EXECUTE FUNCTION trg_bookings_refresh_customer_review_eligibility();
 
 CREATE TRIGGER release_promotion_on_booking_cancelled AFTER UPDATE OF status ON bookings FOR EACH ROW EXECUTE FUNCTION trg_release_promotion_on_booking_cancelled();
 
