@@ -6074,7 +6074,8 @@ BEGIN
     RETURN;
   END IF;
 
-  v_earnings_subunit := public.cleaner_earnings_subunit_from_booking(
+  v_earnings_subunit := public.resolve_cleaner_payout_subunit_from_booking(
+    v_booking.cleaner_earnings_minor,
     v_booking.final_amount_minor,
     v_booking.total_price,
     v_booking.platform_fee,
@@ -7220,50 +7221,48 @@ CREATE OR REPLACE FUNCTION public.fetch_cleaner_earnings(p_user_id uuid, p_start
  RETURNS json
  LANGUAGE plpgsql
  SECURITY DEFINER
+ SET search_path TO 'public'
 AS $function$
 DECLARE
-    v_total_deduction_rate numeric;
-    v_fixed_deductions numeric;
-    v_in_transit numeric;
-    v_estimated numeric;
-    v_total numeric;
+  v_in_transit numeric;
+  v_estimated numeric;
+  v_total numeric;
 BEGIN
-    -- 1. Calculate the sum of all active percentage-based and fixed rules
-    SELECT 
-        COALESCE(SUM(rate_percentage), 0) / 100, 
-        COALESCE(SUM(fixed_amount), 0)
-    INTO v_total_deduction_rate, v_fixed_deductions
-    FROM public.deduction_rules 
-    WHERE is_active = true AND end_date IS NULL;
+  -- Paid jobs not yet completed: sum authoritative cleaner payout snapshot.
+  SELECT COALESCE(
+    SUM(
+      public.resolve_cleaner_payout_subunit_from_booking(
+        b.cleaner_earnings_minor,
+        b.final_amount_minor,
+        b.total_price,
+        b.platform_fee,
+        b.booking_cover,
+        b.booking_cover_amount,
+        b.core_amount_minor
+      )
+    ),
+    0
+  ) INTO v_in_transit
+  FROM public.bookings b
+  WHERE b.cleaner_id = p_user_id
+    AND b.payment_status = 'paid'
+    AND b.status IS DISTINCT FROM 'completed';
 
-    -- 2. In Transit: Gross amount minus dynamic deductions
-    -- Money from jobs PAID but not yet COMPLETED
-    SELECT COALESCE(
-        SUM(total_price - (total_price * v_total_deduction_rate) - v_fixed_deductions), 
-        0
-    ) INTO v_in_transit 
-    FROM public.bookings 
-    WHERE cleaner_id = p_user_id 
-    AND payment_status = 'paid' 
-    AND status != 'completed';
+  SELECT COALESCE(balance_subunit, 0) INTO v_estimated
+  FROM public.wallets
+  WHERE user_id = p_user_id;
 
-    -- 3. Estimated Payout: Current actual balance in the wallet
-    SELECT COALESCE(balance_subunit, 0) INTO v_estimated 
-    FROM public.wallets 
-    WHERE user_id = p_user_id;
-
-    -- 4. Total Earnings: Sum of all completed credit transactions in date range
-    SELECT COALESCE(SUM(amount_subunit), 0) INTO v_total 
-    FROM public.wallet_transactions 
-    WHERE wallet_id = (SELECT id FROM wallets WHERE user_id = p_user_id)
+  SELECT COALESCE(SUM(amount_subunit), 0) INTO v_total
+  FROM public.wallet_transactions
+  WHERE wallet_id = (SELECT id FROM public.wallets WHERE user_id = p_user_id)
     AND type = 'credit'
     AND created_at BETWEEN p_start_date AND p_end_date;
 
-    RETURN json_build_object(
-        'inTransit', ROUND(v_in_transit),
-        'estimatedPayout', v_estimated,
-        'total', v_total
-    );
+  RETURN json_build_object(
+    'inTransit', ROUND(v_in_transit),
+    'estimatedPayout', v_estimated,
+    'total', v_total
+  );
 END;
 $function$
 
@@ -18117,6 +18116,28 @@ AS $function$
     ),
     45
   );
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.resolve_cleaner_payout_subunit_from_booking(p_cleaner_earnings_minor integer, p_final_amount_minor integer, p_total_price numeric, p_platform_fee numeric, p_booking_cover boolean, p_booking_cover_amount numeric, p_core_amount_minor integer)
+ RETURNS integer
+ LANGUAGE plpgsql
+ IMMUTABLE
+AS $function$
+BEGIN
+  IF p_cleaner_earnings_minor IS NOT NULL AND p_cleaner_earnings_minor > 0 THEN
+    RETURN p_cleaner_earnings_minor;
+  END IF;
+
+  RETURN public.cleaner_earnings_subunit_from_booking(
+    p_final_amount_minor,
+    p_total_price,
+    p_platform_fee,
+    p_booking_cover,
+    p_booking_cover_amount,
+    p_core_amount_minor
+  );
+END;
 $function$
 
 
