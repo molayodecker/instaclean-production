@@ -14306,6 +14306,26 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.normalize_cleaner_application_email()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+BEGIN
+  IF NEW.email IS NOT NULL THEN
+    NEW.email := btrim(NEW.email);
+    IF NEW.email = '' THEN
+      NEW.email := NULL;
+    ELSE
+      NEW.email := lower(NEW.email);
+    END IF;
+  END IF;
+
+  RETURN NEW;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.normalize_ghana_mobile_e164_ts(p_input text)
  RETURNS text
  LANGUAGE plpgsql
@@ -24377,6 +24397,8 @@ CREATE TRIGGER trg_set_cleaner_assigned_at_for_hold BEFORE INSERT OR UPDATE OF c
 CREATE TRIGGER trigger_calculate_booking_period BEFORE INSERT OR UPDATE OF scheduled_date, scheduled_time, duration_hours, timezone ON bookings FOR EACH ROW EXECUTE FUNCTION calculate_booking_period();
 
 CREATE TRIGGER trigger_set_booking_timezone BEFORE INSERT ON bookings FOR EACH ROW EXECUTE FUNCTION set_booking_timezone();
+
+CREATE TRIGGER trg_normalize_cleaner_application_email BEFORE INSERT OR UPDATE OF email ON cleaner_applications FOR EACH ROW EXECUTE FUNCTION normalize_cleaner_application_email();
 
 CREATE TRIGGER trigger_update_cleaner_availability_exceptions_updated_at BEFORE UPDATE ON cleaner_availability_exceptions FOR EACH ROW EXECUTE FUNCTION update_cleaner_availability_exceptions_updated_at();
 

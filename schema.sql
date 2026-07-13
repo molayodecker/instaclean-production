@@ -11520,6 +11520,28 @@ COMMENT ON FUNCTION "public"."merge_user_accounts"("p_primary" "uuid", "p_second
 
 
 
+CREATE OR REPLACE FUNCTION "public"."normalize_cleaner_application_email"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+BEGIN
+  IF NEW.email IS NOT NULL THEN
+    NEW.email := btrim(NEW.email);
+    IF NEW.email = '' THEN
+      NEW.email := NULL;
+    ELSE
+      NEW.email := lower(NEW.email);
+    END IF;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."normalize_cleaner_application_email"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."normalize_ghana_mobile_e164_ts"("p_input" "text") RETURNS "text"
     LANGUAGE "plpgsql" IMMUTABLE
     AS $_$
@@ -20048,7 +20070,7 @@ CREATE UNIQUE INDEX "cleaner_application_drafts_user_id_key" ON "public"."cleane
 
 
 
-CREATE UNIQUE INDEX "cleaner_applications_email_uniq" ON "public"."cleaner_applications" USING "btree" ("lower"(TRIM(BOTH FROM "email"))) WHERE ("email" IS NOT NULL);
+CREATE UNIQUE INDEX "cleaner_applications_email_uniq" ON "public"."cleaner_applications" USING "btree" ("lower"("btrim"("email"))) WHERE (("email" IS NOT NULL) AND ("btrim"("email") <> ''::"text"));
 
 
 
@@ -20969,6 +20991,10 @@ CREATE OR REPLACE TRIGGER "trg_init_direct_assignment_on_paid" BEFORE INSERT OR 
 
 
 CREATE OR REPLACE TRIGGER "trg_message_delivery_attempts_updated_at" BEFORE UPDATE ON "public"."message_delivery_attempts" FOR EACH ROW EXECUTE FUNCTION "public"."touch_message_delivery_attempt_updated_at"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_normalize_cleaner_application_email" BEFORE INSERT OR UPDATE OF "email" ON "public"."cleaner_applications" FOR EACH ROW EXECUTE FUNCTION "public"."normalize_cleaner_application_email"();
 
 
 
@@ -27190,6 +27216,12 @@ REVOKE ALL ON FUNCTION "public"."merge_user_accounts"("p_primary" "uuid", "p_sec
 GRANT ALL ON FUNCTION "public"."merge_user_accounts"("p_primary" "uuid", "p_secondary" "uuid", "p_merged_by" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."merge_user_accounts"("p_primary" "uuid", "p_secondary" "uuid", "p_merged_by" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."merge_user_accounts"("p_primary" "uuid", "p_secondary" "uuid", "p_merged_by" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."normalize_cleaner_application_email"() TO "anon";
+GRANT ALL ON FUNCTION "public"."normalize_cleaner_application_email"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."normalize_cleaner_application_email"() TO "service_role";
 
 
 
