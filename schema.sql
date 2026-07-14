@@ -19289,6 +19289,7 @@ CREATE TABLE IF NOT EXISTS "public"."whatsapp_inbox_messages" (
     "twilio_message_sid" "text",
     "sent_by_user_id" "uuid",
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "business_phone_e164" "text",
     CONSTRAINT "whatsapp_inbox_messages_direction_check" CHECK (("direction" = ANY (ARRAY['inbound'::"text", 'outbound'::"text"]))),
     CONSTRAINT "whatsapp_inbox_messages_phone_e164_check" CHECK (("phone_e164" ~ '^\+[1-9][0-9]{6,14}$'::"text"))
 );
@@ -19298,6 +19299,10 @@ ALTER TABLE "public"."whatsapp_inbox_messages" OWNER TO "postgres";
 
 
 COMMENT ON TABLE "public"."whatsapp_inbox_messages" IS 'WhatsApp messages mirrored from Twilio (inbound) and admin sends (outbound); no anon policies - use service role on server.';
+
+
+
+COMMENT ON COLUMN "public"."whatsapp_inbox_messages"."business_phone_e164" IS 'Instaclean WhatsApp sender (E.164). Inbound: Twilio To. Outbound: admin-selected line.';
 
 
 
@@ -20895,6 +20900,10 @@ CREATE INDEX "wallet_transactions_withdrawal_request_id_idx" ON "public"."wallet
 
 
 CREATE UNIQUE INDEX "wallets_user_id_uidx" ON "public"."wallets" USING "btree" ("user_id");
+
+
+
+CREATE INDEX "whatsapp_inbox_messages_business_phone_e164_idx" ON "public"."whatsapp_inbox_messages" USING "btree" ("business_phone_e164") WHERE ("business_phone_e164" IS NOT NULL);
 
 
 
