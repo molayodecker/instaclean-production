@@ -17022,6 +17022,34 @@ COMMENT ON TABLE "public"."admin_cash_payouts" IS 'Offline/cash cleaner payouts 
 
 
 
+CREATE TABLE IF NOT EXISTS "public"."app_update_policy" (
+    "channel" "text" NOT NULL,
+    "min_version" "text" NOT NULL,
+    "recommended_version" "text",
+    "required_message" "text" DEFAULT 'There is a newer version of Instaclean available. Please update to continue.'::"text" NOT NULL,
+    "recommended_message" "text" DEFAULT 'A new version of Instaclean is available with improvements and fixes.'::"text",
+    "updated_at" timestamp with time zone DEFAULT "timezone"('utc'::"text", "now"()) NOT NULL,
+    CONSTRAINT "app_update_policy_channel_check" CHECK (("channel" = ANY (ARRAY['production'::"text", 'preview'::"text"]))),
+    CONSTRAINT "app_update_policy_min_version_format_check" CHECK (("min_version" ~ '^[0-9]+\.[0-9]+\.[0-9]+$'::"text")),
+    CONSTRAINT "app_update_policy_recommended_version_format_check" CHECK ((("recommended_version" IS NULL) OR ("recommended_version" ~ '^[0-9]+\.[0-9]+\.[0-9]+$'::"text")))
+);
+
+
+ALTER TABLE "public"."app_update_policy" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."app_update_policy" IS 'Minimum Instaclean app versions. iOS and Android use the same marketing version (min_version).';
+
+
+
+COMMENT ON COLUMN "public"."app_update_policy"."min_version" IS 'Hard gate: clients below this marketing version must update via the store.';
+
+
+
+COMMENT ON COLUMN "public"."app_update_policy"."recommended_version" IS 'Optional soft nudge when current >= min_version but below recommended_version.';
+
+
+
 CREATE TABLE IF NOT EXISTS "public"."auth_identity_lookup" (
     "user_id" "uuid" NOT NULL,
     "email" "text",
@@ -19359,6 +19387,11 @@ ALTER TABLE ONLY "public"."account_merges"
 
 ALTER TABLE ONLY "public"."admin_cash_payouts"
     ADD CONSTRAINT "admin_cash_payouts_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."app_update_policy"
+    ADD CONSTRAINT "app_update_policy_pkey" PRIMARY KEY ("channel");
 
 
 
@@ -22085,6 +22118,13 @@ CREATE POLICY "anyone_read_service_categories" ON "public"."service_categories" 
 
 
 CREATE POLICY "anyone_read_service_types" ON "public"."service_types" FOR SELECT USING (true);
+
+
+
+ALTER TABLE "public"."app_update_policy" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "app_update_policy_public_read" ON "public"."app_update_policy" FOR SELECT TO "authenticated", "anon" USING (true);
 
 
 
@@ -31672,6 +31712,12 @@ GRANT ALL ON TABLE "public"."account_merges" TO "service_role";
 
 
 GRANT ALL ON TABLE "public"."admin_cash_payouts" TO "service_role";
+
+
+
+GRANT SELECT,REFERENCES,TRIGGER,MAINTAIN ON TABLE "public"."app_update_policy" TO "anon";
+GRANT SELECT,REFERENCES,TRIGGER,MAINTAIN ON TABLE "public"."app_update_policy" TO "authenticated";
+GRANT ALL ON TABLE "public"."app_update_policy" TO "service_role";
 
 
 
