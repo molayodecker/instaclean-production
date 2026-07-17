@@ -1603,6 +1603,147 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.airbnb_turnover_payment_requirements_met(p_booking_id uuid)
+ RETURNS boolean
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_row public.bookings%ROWTYPE;
+  v_specialty_slug text;
+  v_window_hours numeric;
+  v_duration_hours numeric;
+  v_has_any_turnover_window boolean;
+  v_has_complete_turnover_window boolean;
+  v_is_calendar_backed boolean;
+BEGIN
+  SELECT b.*
+  INTO v_row
+  FROM public.bookings b
+  WHERE b.id = p_booking_id
+    AND b.customer_id = auth.uid()
+  LIMIT 1;
+
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+
+  SELECT st.specialty_slug
+  INTO v_specialty_slug
+  FROM public.service_types st
+  WHERE st.id = v_row.service_id
+  LIMIT 1;
+
+  IF v_specialty_slug IS DISTINCT FROM 'airbnb_turnover' THEN
+    RETURN false;
+  END IF;
+
+  v_duration_hours := COALESCE(v_row.duration_final, v_row.duration_hours);
+  IF v_duration_hours IS NULL OR v_duration_hours <= 0 THEN
+    RETURN false;
+  END IF;
+
+  IF v_row.scheduled_at_utc IS NULL THEN
+    RETURN false;
+  END IF;
+
+  v_has_any_turnover_window :=
+    v_row.turnover_guest_checkout_at IS NOT NULL
+    OR v_row.turnover_next_checkin_at IS NOT NULL;
+
+  v_has_complete_turnover_window :=
+    v_row.turnover_guest_checkout_at IS NOT NULL
+    AND v_row.turnover_next_checkin_at IS NOT NULL;
+
+  v_is_calendar_backed :=
+    v_row.turnover_source = 'airbnb_ical'
+    OR v_row.turnover_opportunity_id IS NOT NULL;
+
+  IF v_is_calendar_backed AND NOT v_has_complete_turnover_window THEN
+    RETURN false;
+  END IF;
+
+  IF v_has_any_turnover_window AND NOT v_has_complete_turnover_window THEN
+    RETURN false;
+  END IF;
+
+  IF NOT v_has_complete_turnover_window THEN
+    IF NULLIF(btrim(v_row.turnover_linen_handling), '') IS NULL THEN
+      RETURN false;
+    END IF;
+    RETURN true;
+  END IF;
+
+  IF v_row.turnover_next_checkin_at <= v_row.turnover_guest_checkout_at THEN
+    RETURN false;
+  END IF;
+
+  v_window_hours := public.airbnb_turnover_window_hours(
+    v_row.turnover_guest_checkout_at,
+    v_row.turnover_next_checkin_at
+  );
+
+  IF v_window_hours IS NULL OR v_window_hours <= 0 THEN
+    RETURN false;
+  END IF;
+
+  IF v_duration_hours > v_window_hours THEN
+    RETURN false;
+  END IF;
+
+  IF v_row.scheduled_at_utc < v_row.turnover_guest_checkout_at THEN
+    RETURN false;
+  END IF;
+
+  IF NOT public.airbnb_turnover_schedule_fits_window(
+    v_row.turnover_guest_checkout_at,
+    v_row.turnover_next_checkin_at,
+    v_row.scheduled_at_utc,
+    v_duration_hours,
+    30
+  ) THEN
+    RETURN false;
+  END IF;
+
+  RETURN true;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.airbnb_turnover_schedule_fits_window(p_checkout timestamp with time zone, p_checkin timestamp with time zone, p_scheduled_at timestamp with time zone, p_duration_hours numeric, p_guest_ready_buffer_minutes integer DEFAULT 30)
+ RETURNS boolean
+ LANGUAGE sql
+ IMMUTABLE
+AS $function$
+  SELECT
+    p_checkout IS NOT NULL
+    AND p_checkin IS NOT NULL
+    AND p_scheduled_at IS NOT NULL
+    AND p_duration_hours IS NOT NULL
+    AND p_duration_hours > 0
+    AND p_checkin > p_checkout
+    AND p_scheduled_at >= p_checkout
+    AND (
+      p_scheduled_at + make_interval(secs => round(p_duration_hours * 3600)::integer)
+    ) <= (
+      p_checkin - make_interval(mins => COALESCE(p_guest_ready_buffer_minutes, 30))
+    );
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.airbnb_turnover_window_hours(p_checkout timestamp with time zone, p_checkin timestamp with time zone)
+ RETURNS numeric
+ LANGUAGE sql
+ IMMUTABLE
+AS $function$
+  SELECT CASE
+    WHEN p_checkout IS NULL OR p_checkin IS NULL OR p_checkin <= p_checkout THEN NULL
+    ELSE EXTRACT(EPOCH FROM (p_checkin - p_checkout)) / 3600.0
+  END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.apply_referral_code(p_code text)
  RETURNS jsonb
  LANGUAGE plpgsql
@@ -2177,6 +2318,40 @@ BEGIN
       verified = EXCLUDED.verified,
       status = 'active';
   END IF;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.authorize_airbnb_turnover_payment(p_booking_id uuid)
+ RETURNS TABLE(booking_id uuid, customer_id uuid, final_amount_minor integer, currency text, payment_status text, booking_status booking_status, payment_reference text, payment_split_type text, paystack_split_code text, tax_share_minor integer, vendor_share_minor integer, platform_share_minor integer, tax_percentage_bps integer, vendor_percentage_bps integer, tax_paystack_share text, vendor_paystack_share text)
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  IF NOT public.airbnb_turnover_payment_requirements_met(p_booking_id) THEN
+    RETURN;
+  END IF;
+
+  RETURN QUERY
+  SELECT
+    gps.booking_id,
+    gps.customer_id,
+    gps.final_amount_minor,
+    gps.currency,
+    gps.payment_status,
+    gps.booking_status,
+    gps.payment_reference,
+    gps.payment_split_type,
+    gps.paystack_split_code,
+    gps.tax_share_minor,
+    gps.vendor_share_minor,
+    gps.platform_share_minor,
+    gps.tax_percentage_bps,
+    gps.vendor_percentage_bps,
+    gps.tax_paystack_share,
+    gps.vendor_paystack_share
+  FROM public.get_payable_booking_snapshot(p_booking_id) gps;
 END;
 $function$
 
@@ -13394,6 +13569,33 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.link_turnover_opportunity_to_booking()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  IF NEW.turnover_opportunity_id IS NULL THEN
+    RETURN NEW;
+  END IF;
+
+  UPDATE public.turnover_opportunities o
+  SET
+    status = 'booked',
+    booking_id = NEW.id,
+    updated_at = now()
+  FROM public.properties p
+  WHERE o.id = NEW.turnover_opportunity_id
+    AND p.id = o.property_id
+    AND p.customer_id = NEW.customer_id
+    AND o.status NOT IN ('ignored', 'cancelled');
+
+  RETURN NEW;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.list_broadcast_assignments_for_cleaner(p_cleaner_id uuid)
  RETURNS SETOF uuid
  LANGUAGE plpgsql
@@ -13492,6 +13694,40 @@ BEGIN
 
   RETURN v_offers;
 END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.list_turnover_opportunities_for_customer(p_limit integer DEFAULT 20)
+ RETURNS TABLE(id uuid, property_id uuid, property_name text, property_timezone text, departing_event_id uuid, arriving_event_id uuid, checkout_at timestamp with time zone, next_checkin_at timestamp with time zone, suggested_start_at timestamp with time zone, suggested_duration_hours numeric, status text, booking_id uuid, source text, window_hours numeric)
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+  SELECT
+    o.id,
+    o.property_id,
+    p.name AS property_name,
+    p.timezone AS property_timezone,
+    o.departing_event_id,
+    o.arriving_event_id,
+    o.checkout_at,
+    o.next_checkin_at,
+    o.suggested_start_at,
+    o.suggested_duration_hours,
+    o.status,
+    o.booking_id,
+    o.source,
+    CASE
+      WHEN o.next_checkin_at IS NULL THEN NULL
+      ELSE EXTRACT(EPOCH FROM (o.next_checkin_at - o.checkout_at)) / 3600.0
+    END AS window_hours
+  FROM public.turnover_opportunities o
+  JOIN public.properties p ON p.id = o.property_id
+  WHERE p.customer_id = auth.uid()
+    AND o.status IN ('needs_review', 'ready_to_book', 'conflict')
+    AND o.checkout_at >= now() - interval '7 days'
+  ORDER BY o.checkout_at ASC
+  LIMIT GREATEST(1, LEAST(COALESCE(p_limit, 20), 50));
 $function$
 
 
@@ -18620,6 +18856,51 @@ BEGIN
   END IF;
 
   RETURN NEW;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.set_default_customer_property(p_property_id uuid)
+ RETURNS properties
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_customer_id uuid := auth.uid();
+  v_property public.properties%ROWTYPE;
+BEGIN
+  IF v_customer_id IS NULL THEN
+    RAISE EXCEPTION 'Authentication required'
+      USING ERRCODE = '42501';
+  END IF;
+
+  SELECT *
+  INTO v_property
+  FROM public.properties
+  WHERE id = p_property_id
+    AND customer_id = v_customer_id
+  LIMIT 1;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Property not found'
+      USING ERRCODE = '23514';
+  END IF;
+
+  UPDATE public.properties
+  SET is_default = false,
+      updated_at = now()
+  WHERE customer_id = v_customer_id
+    AND is_default = true
+    AND id <> p_property_id;
+
+  UPDATE public.properties
+  SET is_default = true,
+      updated_at = now()
+  WHERE id = p_property_id
+  RETURNING * INTO v_property;
+
+  RETURN v_property;
 END;
 $function$
 
@@ -24308,6 +24589,98 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.validate_turnover_booking_fields()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+  v_specialty_slug text;
+  v_property_customer_id uuid;
+  v_opportunity_property_id uuid;
+  v_opportunity_customer_id uuid;
+  v_opportunity_status text;
+  v_opportunity_booking_id uuid;
+BEGIN
+  SELECT specialty_slug
+  INTO v_specialty_slug
+  FROM public.service_types
+  WHERE id = NEW.service_id;
+
+  IF v_specialty_slug IS DISTINCT FROM 'airbnb_turnover'
+     AND (
+       NEW.turnover_guest_checkout_at IS NOT NULL
+       OR NEW.turnover_next_checkin_at IS NOT NULL
+       OR NEW.turnover_linen_handling IS NOT NULL
+       OR NULLIF(btrim(NEW.turnover_restocking_notes), '') IS NOT NULL
+       OR NEW.turnover_opportunity_id IS NOT NULL
+       OR NEW.property_id IS NOT NULL
+       OR NEW.turnover_source IS NOT NULL
+     )
+  THEN
+    RAISE EXCEPTION 'Turnover fields are only allowed for airbnb_turnover bookings'
+      USING ERRCODE = '23514';
+  END IF;
+
+  IF NEW.property_id IS NOT NULL THEN
+    SELECT p.customer_id
+    INTO v_property_customer_id
+    FROM public.properties p
+    WHERE p.id = NEW.property_id;
+
+    IF NOT FOUND OR v_property_customer_id IS DISTINCT FROM NEW.customer_id THEN
+      RAISE EXCEPTION 'Property does not belong to booking customer'
+        USING ERRCODE = '23514';
+    END IF;
+  END IF;
+
+  IF NEW.turnover_opportunity_id IS NOT NULL THEN
+    SELECT
+      o.property_id,
+      p.customer_id,
+      o.status,
+      o.booking_id
+    INTO
+      v_opportunity_property_id,
+      v_opportunity_customer_id,
+      v_opportunity_status,
+      v_opportunity_booking_id
+    FROM public.turnover_opportunities o
+    JOIN public.properties p ON p.id = o.property_id
+    WHERE o.id = NEW.turnover_opportunity_id;
+
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'Turnover opportunity not found'
+        USING ERRCODE = '23514';
+    END IF;
+
+    IF v_opportunity_customer_id IS DISTINCT FROM NEW.customer_id THEN
+      RAISE EXCEPTION 'Turnover opportunity does not belong to booking customer'
+        USING ERRCODE = '23514';
+    END IF;
+
+    IF NEW.property_id IS NOT NULL
+       AND NEW.property_id IS DISTINCT FROM v_opportunity_property_id THEN
+      RAISE EXCEPTION 'Property does not match turnover opportunity'
+        USING ERRCODE = '23514';
+    END IF;
+
+    IF v_opportunity_status IN ('ignored', 'cancelled') THEN
+      RAISE EXCEPTION 'Turnover opportunity is not bookable'
+        USING ERRCODE = '23514';
+    END IF;
+
+    IF v_opportunity_booking_id IS NOT NULL
+       AND v_opportunity_booking_id IS DISTINCT FROM NEW.id THEN
+      RAISE EXCEPTION 'Turnover opportunity is already booked'
+        USING ERRCODE = '23514';
+    END IF;
+  END IF;
+
+  RETURN NEW;
+END;
+$function$
+
+
 
 -- === AGGREGATES (signatures; DDL in schema.sql) ===
 -- max(citext)
@@ -24374,7 +24747,11 @@ CREATE TRIGGER bookings_compute_scheduled_at_utc BEFORE INSERT OR UPDATE OF sche
 
 CREATE TRIGGER bookings_guard_payment_status BEFORE UPDATE ON bookings FOR EACH ROW EXECUTE FUNCTION guard_booking_payment_status_writes();
 
+CREATE TRIGGER bookings_link_turnover_opportunity AFTER INSERT OR UPDATE OF turnover_opportunity_id ON bookings FOR EACH ROW WHEN (new.turnover_opportunity_id IS NOT NULL) EXECUTE FUNCTION link_turnover_opportunity_to_booking();
+
 CREATE TRIGGER bookings_refresh_customer_review_eligibility AFTER INSERT OR UPDATE OF status ON bookings FOR EACH ROW EXECUTE FUNCTION trg_bookings_refresh_customer_review_eligibility();
+
+CREATE TRIGGER bookings_validate_turnover_fields BEFORE INSERT OR UPDATE ON bookings FOR EACH ROW EXECUTE FUNCTION validate_turnover_booking_fields();
 
 CREATE TRIGGER release_promotion_on_booking_cancelled AFTER UPDATE OF status ON bookings FOR EACH ROW EXECUTE FUNCTION trg_release_promotion_on_booking_cancelled();
 

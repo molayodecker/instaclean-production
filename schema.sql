@@ -158,7 +158,8 @@ CREATE TYPE "public"."service_category" AS ENUM (
     'cleaning',
     'washing',
     'ironing',
-    'flooding'
+    'flooding',
+    'airbnb'
 );
 
 
@@ -1270,6 +1271,150 @@ $$;
 ALTER FUNCTION "public"."advance_subscription_recurrence_dates"("p_subscription_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."airbnb_turnover_payment_requirements_met"("p_booking_id" "uuid") RETURNS boolean
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_row public.bookings%ROWTYPE;
+  v_specialty_slug text;
+  v_window_hours numeric;
+  v_duration_hours numeric;
+  v_has_any_turnover_window boolean;
+  v_has_complete_turnover_window boolean;
+  v_is_calendar_backed boolean;
+BEGIN
+  SELECT b.*
+  INTO v_row
+  FROM public.bookings b
+  WHERE b.id = p_booking_id
+    AND b.customer_id = auth.uid()
+  LIMIT 1;
+
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+
+  SELECT st.specialty_slug
+  INTO v_specialty_slug
+  FROM public.service_types st
+  WHERE st.id = v_row.service_id
+  LIMIT 1;
+
+  IF v_specialty_slug IS DISTINCT FROM 'airbnb_turnover' THEN
+    RETURN false;
+  END IF;
+
+  v_duration_hours := COALESCE(v_row.duration_final, v_row.duration_hours);
+  IF v_duration_hours IS NULL OR v_duration_hours <= 0 THEN
+    RETURN false;
+  END IF;
+
+  IF v_row.scheduled_at_utc IS NULL THEN
+    RETURN false;
+  END IF;
+
+  v_has_any_turnover_window :=
+    v_row.turnover_guest_checkout_at IS NOT NULL
+    OR v_row.turnover_next_checkin_at IS NOT NULL;
+
+  v_has_complete_turnover_window :=
+    v_row.turnover_guest_checkout_at IS NOT NULL
+    AND v_row.turnover_next_checkin_at IS NOT NULL;
+
+  v_is_calendar_backed :=
+    v_row.turnover_source = 'airbnb_ical'
+    OR v_row.turnover_opportunity_id IS NOT NULL;
+
+  IF v_is_calendar_backed AND NOT v_has_complete_turnover_window THEN
+    RETURN false;
+  END IF;
+
+  IF v_has_any_turnover_window AND NOT v_has_complete_turnover_window THEN
+    RETURN false;
+  END IF;
+
+  IF NOT v_has_complete_turnover_window THEN
+    IF NULLIF(btrim(v_row.turnover_linen_handling), '') IS NULL THEN
+      RETURN false;
+    END IF;
+    RETURN true;
+  END IF;
+
+  IF v_row.turnover_next_checkin_at <= v_row.turnover_guest_checkout_at THEN
+    RETURN false;
+  END IF;
+
+  v_window_hours := public.airbnb_turnover_window_hours(
+    v_row.turnover_guest_checkout_at,
+    v_row.turnover_next_checkin_at
+  );
+
+  IF v_window_hours IS NULL OR v_window_hours <= 0 THEN
+    RETURN false;
+  END IF;
+
+  IF v_duration_hours > v_window_hours THEN
+    RETURN false;
+  END IF;
+
+  IF v_row.scheduled_at_utc < v_row.turnover_guest_checkout_at THEN
+    RETURN false;
+  END IF;
+
+  IF NOT public.airbnb_turnover_schedule_fits_window(
+    v_row.turnover_guest_checkout_at,
+    v_row.turnover_next_checkin_at,
+    v_row.scheduled_at_utc,
+    v_duration_hours,
+    30
+  ) THEN
+    RETURN false;
+  END IF;
+
+  RETURN true;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."airbnb_turnover_payment_requirements_met"("p_booking_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."airbnb_turnover_schedule_fits_window"("p_checkout" timestamp with time zone, "p_checkin" timestamp with time zone, "p_scheduled_at" timestamp with time zone, "p_duration_hours" numeric, "p_guest_ready_buffer_minutes" integer DEFAULT 30) RETURNS boolean
+    LANGUAGE "sql" IMMUTABLE
+    AS $$
+  SELECT
+    p_checkout IS NOT NULL
+    AND p_checkin IS NOT NULL
+    AND p_scheduled_at IS NOT NULL
+    AND p_duration_hours IS NOT NULL
+    AND p_duration_hours > 0
+    AND p_checkin > p_checkout
+    AND p_scheduled_at >= p_checkout
+    AND (
+      p_scheduled_at + make_interval(secs => round(p_duration_hours * 3600)::integer)
+    ) <= (
+      p_checkin - make_interval(mins => COALESCE(p_guest_ready_buffer_minutes, 30))
+    );
+$$;
+
+
+ALTER FUNCTION "public"."airbnb_turnover_schedule_fits_window"("p_checkout" timestamp with time zone, "p_checkin" timestamp with time zone, "p_scheduled_at" timestamp with time zone, "p_duration_hours" numeric, "p_guest_ready_buffer_minutes" integer) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."airbnb_turnover_window_hours"("p_checkout" timestamp with time zone, "p_checkin" timestamp with time zone) RETURNS numeric
+    LANGUAGE "sql" IMMUTABLE
+    AS $$
+  SELECT CASE
+    WHEN p_checkout IS NULL OR p_checkin IS NULL OR p_checkin <= p_checkout THEN NULL
+    ELSE EXTRACT(EPOCH FROM (p_checkin - p_checkout)) / 3600.0
+  END;
+$$;
+
+
+ALTER FUNCTION "public"."airbnb_turnover_window_hours"("p_checkout" timestamp with time zone, "p_checkin" timestamp with time zone) OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."apply_referral_code"("p_code" "text") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -1858,6 +2003,41 @@ $$;
 
 
 ALTER FUNCTION "public"."assign_user_role"("target_user_id" "uuid", "target_role_id" "text", "is_verified" boolean) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."authorize_airbnb_turnover_payment"("p_booking_id" "uuid") RETURNS TABLE("booking_id" "uuid", "customer_id" "uuid", "final_amount_minor" integer, "currency" "text", "payment_status" "text", "booking_status" "public"."booking_status", "payment_reference" "text", "payment_split_type" "text", "paystack_split_code" "text", "tax_share_minor" integer, "vendor_share_minor" integer, "platform_share_minor" integer, "tax_percentage_bps" integer, "vendor_percentage_bps" integer, "tax_paystack_share" "text", "vendor_paystack_share" "text")
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF NOT public.airbnb_turnover_payment_requirements_met(p_booking_id) THEN
+    RETURN;
+  END IF;
+
+  RETURN QUERY
+  SELECT
+    gps.booking_id,
+    gps.customer_id,
+    gps.final_amount_minor,
+    gps.currency,
+    gps.payment_status,
+    gps.booking_status,
+    gps.payment_reference,
+    gps.payment_split_type,
+    gps.paystack_split_code,
+    gps.tax_share_minor,
+    gps.vendor_share_minor,
+    gps.platform_share_minor,
+    gps.tax_percentage_bps,
+    gps.vendor_percentage_bps,
+    gps.tax_paystack_share,
+    gps.vendor_paystack_share
+  FROM public.get_payable_booking_snapshot(p_booking_id) gps;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."authorize_airbnb_turnover_payment"("p_booking_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."auto_close_stale_bookings"("p_grace" interval DEFAULT '1 day'::interval, "p_limit" integer DEFAULT 100) RETURNS "jsonb"
@@ -10636,6 +10816,34 @@ $$;
 ALTER FUNCTION "public"."leave_co_cleaner_team"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."link_turnover_opportunity_to_booking"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF NEW.turnover_opportunity_id IS NULL THEN
+    RETURN NEW;
+  END IF;
+
+  UPDATE public.turnover_opportunities o
+  SET
+    status = 'booked',
+    booking_id = NEW.id,
+    updated_at = now()
+  FROM public.properties p
+  WHERE o.id = NEW.turnover_opportunity_id
+    AND p.id = o.property_id
+    AND p.customer_id = NEW.customer_id
+    AND o.status NOT IN ('ignored', 'cancelled');
+
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."link_turnover_opportunity_to_booking"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."list_broadcast_assignments_for_cleaner"("p_cleaner_id" "uuid") RETURNS SETOF "uuid"
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -10737,6 +10945,41 @@ $$;
 
 
 ALTER FUNCTION "public"."list_cleaner_assignment_offers"("p_cleaner_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."list_turnover_opportunities_for_customer"("p_limit" integer DEFAULT 20) RETURNS TABLE("id" "uuid", "property_id" "uuid", "property_name" "text", "property_timezone" "text", "departing_event_id" "uuid", "arriving_event_id" "uuid", "checkout_at" timestamp with time zone, "next_checkin_at" timestamp with time zone, "suggested_start_at" timestamp with time zone, "suggested_duration_hours" numeric, "status" "text", "booking_id" "uuid", "source" "text", "window_hours" numeric)
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT
+    o.id,
+    o.property_id,
+    p.name AS property_name,
+    p.timezone AS property_timezone,
+    o.departing_event_id,
+    o.arriving_event_id,
+    o.checkout_at,
+    o.next_checkin_at,
+    o.suggested_start_at,
+    o.suggested_duration_hours,
+    o.status,
+    o.booking_id,
+    o.source,
+    CASE
+      WHEN o.next_checkin_at IS NULL THEN NULL
+      ELSE EXTRACT(EPOCH FROM (o.next_checkin_at - o.checkout_at)) / 3600.0
+    END AS window_hours
+  FROM public.turnover_opportunities o
+  JOIN public.properties p ON p.id = o.property_id
+  WHERE p.customer_id = auth.uid()
+    AND o.status IN ('needs_review', 'ready_to_book', 'conflict')
+    AND o.checkout_at >= now() - interval '7 days'
+  ORDER BY o.checkout_at ASC
+  LIMIT GREATEST(1, LEAST(COALESCE(p_limit, 20), 50));
+$$;
+
+
+ALTER FUNCTION "public"."list_turnover_opportunities_for_customer"("p_limit" integer) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."log_cleaner_customer_complaint"("p_booking_id" "uuid", "p_complaint_type" "text", "p_severity" integer DEFAULT 2, "p_notes" "text" DEFAULT NULL::"text") RETURNS "jsonb"
@@ -14791,6 +15034,78 @@ $$;
 ALTER FUNCTION "public"."set_cleaner_assigned_at_for_hold"() OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."properties" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "customer_id" "uuid" NOT NULL,
+    "name" "text" NOT NULL,
+    "address" "text",
+    "location_coordinates" "public"."geography"(Point,4326),
+    "timezone" "text" DEFAULT 'Africa/Accra'::"text" NOT NULL,
+    "property_type" "text",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "is_default" boolean DEFAULT false NOT NULL,
+    CONSTRAINT "properties_name_not_blank" CHECK (("char_length"("btrim"("name")) > 0))
+);
+
+
+ALTER TABLE "public"."properties" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."properties" IS 'Customer-owned rental properties used for turnover calendar sync and booking context.';
+
+
+
+COMMENT ON COLUMN "public"."properties"."is_default" IS 'When true, this property is suggested on the booking location step.';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."set_default_customer_property"("p_property_id" "uuid") RETURNS "public"."properties"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_customer_id uuid := auth.uid();
+  v_property public.properties%ROWTYPE;
+BEGIN
+  IF v_customer_id IS NULL THEN
+    RAISE EXCEPTION 'Authentication required'
+      USING ERRCODE = '42501';
+  END IF;
+
+  SELECT *
+  INTO v_property
+  FROM public.properties
+  WHERE id = p_property_id
+    AND customer_id = v_customer_id
+  LIMIT 1;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Property not found'
+      USING ERRCODE = '23514';
+  END IF;
+
+  UPDATE public.properties
+  SET is_default = false,
+      updated_at = now()
+  WHERE customer_id = v_customer_id
+    AND is_default = true
+    AND id <> p_property_id;
+
+  UPDATE public.properties
+  SET is_default = true,
+      updated_at = now()
+  WHERE id = p_property_id
+  RETURNING * INTO v_property;
+
+  RETURN v_property;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."set_default_customer_property"("p_property_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."set_default_payout_method"("p_method_id" "uuid") RETURNS boolean
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -16983,6 +17298,100 @@ $$;
 ALTER FUNCTION "public"."validate_promotion_code"("p_code" "text", "p_customer_id" "uuid", "p_channel" "text", "p_service_id" integer, "p_lat" double precision, "p_lng" double precision, "p_extra_task_ids" "text"[], "p_is_recurring" boolean, "p_booking_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."validate_turnover_booking_fields"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+DECLARE
+  v_specialty_slug text;
+  v_property_customer_id uuid;
+  v_opportunity_property_id uuid;
+  v_opportunity_customer_id uuid;
+  v_opportunity_status text;
+  v_opportunity_booking_id uuid;
+BEGIN
+  SELECT specialty_slug
+  INTO v_specialty_slug
+  FROM public.service_types
+  WHERE id = NEW.service_id;
+
+  IF v_specialty_slug IS DISTINCT FROM 'airbnb_turnover'
+     AND (
+       NEW.turnover_guest_checkout_at IS NOT NULL
+       OR NEW.turnover_next_checkin_at IS NOT NULL
+       OR NEW.turnover_linen_handling IS NOT NULL
+       OR NULLIF(btrim(NEW.turnover_restocking_notes), '') IS NOT NULL
+       OR NEW.turnover_opportunity_id IS NOT NULL
+       OR NEW.property_id IS NOT NULL
+       OR NEW.turnover_source IS NOT NULL
+     )
+  THEN
+    RAISE EXCEPTION 'Turnover fields are only allowed for airbnb_turnover bookings'
+      USING ERRCODE = '23514';
+  END IF;
+
+  IF NEW.property_id IS NOT NULL THEN
+    SELECT p.customer_id
+    INTO v_property_customer_id
+    FROM public.properties p
+    WHERE p.id = NEW.property_id;
+
+    IF NOT FOUND OR v_property_customer_id IS DISTINCT FROM NEW.customer_id THEN
+      RAISE EXCEPTION 'Property does not belong to booking customer'
+        USING ERRCODE = '23514';
+    END IF;
+  END IF;
+
+  IF NEW.turnover_opportunity_id IS NOT NULL THEN
+    SELECT
+      o.property_id,
+      p.customer_id,
+      o.status,
+      o.booking_id
+    INTO
+      v_opportunity_property_id,
+      v_opportunity_customer_id,
+      v_opportunity_status,
+      v_opportunity_booking_id
+    FROM public.turnover_opportunities o
+    JOIN public.properties p ON p.id = o.property_id
+    WHERE o.id = NEW.turnover_opportunity_id;
+
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'Turnover opportunity not found'
+        USING ERRCODE = '23514';
+    END IF;
+
+    IF v_opportunity_customer_id IS DISTINCT FROM NEW.customer_id THEN
+      RAISE EXCEPTION 'Turnover opportunity does not belong to booking customer'
+        USING ERRCODE = '23514';
+    END IF;
+
+    IF NEW.property_id IS NOT NULL
+       AND NEW.property_id IS DISTINCT FROM v_opportunity_property_id THEN
+      RAISE EXCEPTION 'Property does not match turnover opportunity'
+        USING ERRCODE = '23514';
+    END IF;
+
+    IF v_opportunity_status IN ('ignored', 'cancelled') THEN
+      RAISE EXCEPTION 'Turnover opportunity is not bookable'
+        USING ERRCODE = '23514';
+    END IF;
+
+    IF v_opportunity_booking_id IS NOT NULL
+       AND v_opportunity_booking_id IS DISTINCT FROM NEW.id THEN
+      RAISE EXCEPTION 'Turnover opportunity is already booked'
+        USING ERRCODE = '23514';
+    END IF;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."validate_turnover_booking_fields"() OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."account_merges" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "primary_user_id" "uuid" NOT NULL,
@@ -17311,6 +17720,13 @@ CREATE TABLE IF NOT EXISTS "public"."bookings" (
     "has_cleaner_reviewed_customer" boolean DEFAULT false NOT NULL,
     "can_review_customer" boolean,
     "customer_review_window_closed" boolean DEFAULT false NOT NULL,
+    "turnover_guest_checkout_at" timestamp with time zone,
+    "turnover_next_checkin_at" timestamp with time zone,
+    "turnover_linen_handling" "text",
+    "turnover_restocking_notes" "text",
+    "turnover_source" "text",
+    "turnover_opportunity_id" "uuid",
+    "property_id" "uuid",
     CONSTRAINT "bookings_assignment_phase_check" CHECK ((("assignment_phase" IS NULL) OR ("assignment_phase" = ANY (ARRAY['exclusive'::"text", 'broadcast'::"text", 'accepted'::"text"])))),
     CONSTRAINT "bookings_cancellation_tier_check" CHECK ((("cancellation_tier" IS NULL) OR ("cancellation_tier" = ANY (ARRAY['full_refund'::"text", 'partial_refund'::"text", 'no_refund'::"text"])))),
     CONSTRAINT "bookings_cancelled_by_role_check" CHECK ((("cancelled_by_role" IS NULL) OR ("cancelled_by_role" = ANY (ARRAY['customer'::"text", 'cleaner'::"text", 'admin'::"text", 'platform'::"text"])))),
@@ -17326,6 +17742,10 @@ CREATE TABLE IF NOT EXISTS "public"."bookings" (
     CONSTRAINT "bookings_same_day_surcharge_nonnegative_check" CHECK (("same_day_surcharge_minor" >= 0)),
     CONSTRAINT "bookings_split_bps_check" CHECK (((COALESCE("tax_percentage_bps", 0) >= 0) AND (COALESCE("vendor_percentage_bps", 0) >= 0) AND ((COALESCE("tax_percentage_bps", 0) + COALESCE("vendor_percentage_bps", 0)) <= 10000))),
     CONSTRAINT "bookings_split_shares_nonnegative_check" CHECK (((COALESCE("tax_share_minor", 0) >= 0) AND (COALESCE("vendor_share_minor", 0) >= 0) AND (COALESCE("platform_share_minor", 0) >= 0))),
+    CONSTRAINT "bookings_turnover_linen_handling_check" CHECK ((("turnover_linen_handling" IS NULL) OR ("turnover_linen_handling" = ANY (ARRAY['clean_linen_provided'::"text", 'launder_on_site'::"text", 'no_linen_change'::"text"])))),
+    CONSTRAINT "bookings_turnover_restocking_notes_length_check" CHECK ((("turnover_restocking_notes" IS NULL) OR ("char_length"("turnover_restocking_notes") <= 2000))),
+    CONSTRAINT "bookings_turnover_source_check" CHECK ((("turnover_source" IS NULL) OR ("turnover_source" = ANY (ARRAY['manual'::"text", 'airbnb_ical'::"text"])))),
+    CONSTRAINT "bookings_turnover_window_order_check" CHECK ((("turnover_guest_checkout_at" IS NULL) OR ("turnover_next_checkin_at" IS NULL) OR ("turnover_next_checkin_at" > "turnover_guest_checkout_at"))),
     CONSTRAINT "bookings_weekend_surcharge_nonnegative_check" CHECK (("weekend_surcharge_minor" >= 0))
 );
 
@@ -17494,6 +17914,34 @@ COMMENT ON COLUMN "public"."bookings"."can_review_customer" IS 'Denormalized eli
 
 
 COMMENT ON COLUMN "public"."bookings"."customer_review_window_closed" IS 'True when the cleaner review window (7 days after booking day, service-local) has passed.';
+
+
+
+COMMENT ON COLUMN "public"."bookings"."turnover_guest_checkout_at" IS 'Guest checkout instant for Airbnb turnover jobs (UTC; display in property timezone).';
+
+
+
+COMMENT ON COLUMN "public"."bookings"."turnover_next_checkin_at" IS 'Next guest check-in instant for Airbnb turnover jobs (UTC; display in property timezone).';
+
+
+
+COMMENT ON COLUMN "public"."bookings"."turnover_linen_handling" IS 'Linen handling: clean_linen_provided, launder_on_site, or no_linen_change.';
+
+
+
+COMMENT ON COLUMN "public"."bookings"."turnover_restocking_notes" IS 'Host restocking instructions for guest-ready turnover (max 2000 chars).';
+
+
+
+COMMENT ON COLUMN "public"."bookings"."turnover_source" IS 'How turnover timestamps were populated: manual entry or airbnb_ical sync.';
+
+
+
+COMMENT ON COLUMN "public"."bookings"."turnover_opportunity_id" IS 'Calendar-derived turnover opportunity when booking was prefilled from iCal.';
+
+
+
+COMMENT ON COLUMN "public"."bookings"."property_id" IS 'Host property/listing associated with this turnover booking.';
 
 
 
@@ -18845,6 +19293,64 @@ CREATE TABLE IF NOT EXISTS "public"."promotion_redemptions" (
 ALTER TABLE "public"."promotion_redemptions" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."property_calendar_events" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "calendar_feed_id" "uuid" NOT NULL,
+    "property_id" "uuid" NOT NULL,
+    "external_uid" "text" NOT NULL,
+    "external_sequence" integer,
+    "status" "text" DEFAULT 'confirmed'::"text" NOT NULL,
+    "starts_at" timestamp with time zone NOT NULL,
+    "ends_at" timestamp with time zone NOT NULL,
+    "summary" "text",
+    "raw_event_hash" "text" NOT NULL,
+    "last_seen_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "missing_sync_count" integer DEFAULT 0 NOT NULL,
+    "cancelled_at" timestamp with time zone,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "property_calendar_events_status_check" CHECK (("status" = ANY (ARRAY['confirmed'::"text", 'blocked'::"text", 'cancelled'::"text", 'unknown'::"text"]))),
+    CONSTRAINT "property_calendar_events_window_order_check" CHECK (("ends_at" > "starts_at"))
+);
+
+
+ALTER TABLE "public"."property_calendar_events" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."property_calendar_feeds" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "property_id" "uuid" NOT NULL,
+    "owner_id" "uuid" NOT NULL,
+    "provider" "text" DEFAULT 'airbnb'::"text" NOT NULL,
+    "feed_url_encrypted" "text" NOT NULL,
+    "feed_url_hash" "text" NOT NULL,
+    "timezone" "text" NOT NULL,
+    "sync_enabled" boolean DEFAULT true NOT NULL,
+    "auto_create_turnovers" boolean DEFAULT false NOT NULL,
+    "default_checkin_time" time without time zone,
+    "default_checkout_time" time without time zone,
+    "minimum_turnover_minutes" integer DEFAULT 180 NOT NULL,
+    "last_synced_at" timestamp with time zone,
+    "last_successful_sync_at" timestamp with time zone,
+    "last_sync_error" "text",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "property_calendar_feeds_minimum_turnover_minutes_check" CHECK ((("minimum_turnover_minutes" >= 180) AND ("minimum_turnover_minutes" <= 480))),
+    CONSTRAINT "property_calendar_feeds_provider_check" CHECK (("provider" = ANY (ARRAY['airbnb'::"text", 'vrbo'::"text", 'booking_com'::"text", 'other'::"text"])))
+);
+
+
+ALTER TABLE "public"."property_calendar_feeds" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."property_calendar_feeds"."feed_url_encrypted" IS 'AES-GCM ciphertext of the iCal URL. Never expose to clients.';
+
+
+
+COMMENT ON COLUMN "public"."property_calendar_feeds"."feed_url_hash" IS 'SHA-256 hex of the feed URL for deduplication without decryption.';
+
+
+
 CREATE TABLE IF NOT EXISTS "public"."reviewer_permissions" (
     "user_id" "uuid" NOT NULL,
     "permission_key" "text" NOT NULL,
@@ -19198,6 +19704,28 @@ CREATE TABLE IF NOT EXISTS "public"."transactions" (
 
 
 ALTER TABLE "public"."transactions" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."turnover_opportunities" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "property_id" "uuid" NOT NULL,
+    "departing_event_id" "uuid",
+    "arriving_event_id" "uuid",
+    "checkout_at" timestamp with time zone NOT NULL,
+    "next_checkin_at" timestamp with time zone,
+    "suggested_start_at" timestamp with time zone,
+    "suggested_duration_hours" numeric(4,1),
+    "status" "text" DEFAULT 'needs_review'::"text" NOT NULL,
+    "booking_id" "uuid",
+    "source" "text" DEFAULT 'ical'::"text" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "turnover_opportunities_status_check" CHECK (("status" = ANY (ARRAY['needs_review'::"text", 'ready_to_book'::"text", 'booked'::"text", 'ignored'::"text", 'cancelled'::"text", 'conflict'::"text"]))),
+    CONSTRAINT "turnover_opportunities_window_order_check" CHECK ((("next_checkin_at" IS NULL) OR ("next_checkin_at" > "checkout_at")))
+);
+
+
+ALTER TABLE "public"."turnover_opportunities" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."user_login_sessions" (
@@ -19870,6 +20398,31 @@ ALTER TABLE ONLY "public"."promotions"
 
 
 
+ALTER TABLE ONLY "public"."properties"
+    ADD CONSTRAINT "properties_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."property_calendar_events"
+    ADD CONSTRAINT "property_calendar_events_calendar_feed_id_external_uid_key" UNIQUE ("calendar_feed_id", "external_uid");
+
+
+
+ALTER TABLE ONLY "public"."property_calendar_events"
+    ADD CONSTRAINT "property_calendar_events_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."property_calendar_feeds"
+    ADD CONSTRAINT "property_calendar_feeds_owner_hash_unique" UNIQUE ("owner_id", "feed_url_hash");
+
+
+
+ALTER TABLE ONLY "public"."property_calendar_feeds"
+    ADD CONSTRAINT "property_calendar_feeds_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."psk_transaction"
     ADD CONSTRAINT "psk_transaction_pkey" PRIMARY KEY ("id");
 
@@ -19951,6 +20504,16 @@ ALTER TABLE ONLY "public"."transactions"
 
 ALTER TABLE ONLY "public"."transactions"
     ADD CONSTRAINT "transactions_reference_key" UNIQUE ("reference");
+
+
+
+ALTER TABLE ONLY "public"."turnover_opportunities"
+    ADD CONSTRAINT "turnover_opportunities_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."turnover_opportunities"
+    ADD CONSTRAINT "turnover_opportunities_property_departing_uidx" UNIQUE ("property_id", "departing_event_id");
 
 
 
@@ -20896,6 +21459,34 @@ CREATE INDEX "promotion_redemptions_expired_reservations_idx" ON "public"."promo
 
 
 
+CREATE INDEX "properties_customer_id_idx" ON "public"."properties" USING "btree" ("customer_id");
+
+
+
+CREATE UNIQUE INDEX "properties_one_default_per_customer_idx" ON "public"."properties" USING "btree" ("customer_id") WHERE ("is_default" = true);
+
+
+
+CREATE INDEX "property_calendar_events_property_ends_idx" ON "public"."property_calendar_events" USING "btree" ("property_id", "ends_at");
+
+
+
+CREATE INDEX "property_calendar_events_property_starts_idx" ON "public"."property_calendar_events" USING "btree" ("property_id", "starts_at");
+
+
+
+CREATE UNIQUE INDEX "property_calendar_feeds_one_active_per_property_idx" ON "public"."property_calendar_feeds" USING "btree" ("property_id") WHERE ("sync_enabled" = true);
+
+
+
+CREATE INDEX "property_calendar_feeds_property_id_idx" ON "public"."property_calendar_feeds" USING "btree" ("property_id");
+
+
+
+CREATE INDEX "property_calendar_feeds_sync_due_idx" ON "public"."property_calendar_feeds" USING "btree" ("last_synced_at") WHERE ("sync_enabled" = true);
+
+
+
 CREATE UNIQUE INDEX "reviews_booking_reviewer_key" ON "public"."reviews" USING "btree" ("booking_id", "reviewer_id") WHERE ("booking_id" IS NOT NULL);
 
 
@@ -20905,6 +21496,14 @@ CREATE UNIQUE INDEX "service_types_specialty_slug_key" ON "public"."service_type
 
 
 CREATE INDEX "timezones_geom_idx" ON "public"."timezones" USING "gist" ("geom");
+
+
+
+CREATE INDEX "turnover_opportunities_checkout_idx" ON "public"."turnover_opportunities" USING "btree" ("checkout_at");
+
+
+
+CREATE INDEX "turnover_opportunities_property_status_idx" ON "public"."turnover_opportunities" USING "btree" ("property_id", "status");
 
 
 
@@ -20956,7 +21555,15 @@ CREATE OR REPLACE TRIGGER "bookings_guard_payment_status" BEFORE UPDATE ON "publ
 
 
 
+CREATE OR REPLACE TRIGGER "bookings_link_turnover_opportunity" AFTER INSERT OR UPDATE OF "turnover_opportunity_id" ON "public"."bookings" FOR EACH ROW WHEN (("new"."turnover_opportunity_id" IS NOT NULL)) EXECUTE FUNCTION "public"."link_turnover_opportunity_to_booking"();
+
+
+
 CREATE OR REPLACE TRIGGER "bookings_refresh_customer_review_eligibility" AFTER INSERT OR UPDATE OF "status" ON "public"."bookings" FOR EACH ROW EXECUTE FUNCTION "public"."trg_bookings_refresh_customer_review_eligibility"();
+
+
+
+CREATE OR REPLACE TRIGGER "bookings_validate_turnover_fields" BEFORE INSERT OR UPDATE ON "public"."bookings" FOR EACH ROW EXECUTE FUNCTION "public"."validate_turnover_booking_fields"();
 
 
 
@@ -21172,6 +21779,11 @@ ALTER TABLE ONLY "public"."bookings"
 
 
 ALTER TABLE ONLY "public"."bookings"
+    ADD CONSTRAINT "bookings_property_id_fkey" FOREIGN KEY ("property_id") REFERENCES "public"."properties"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."bookings"
     ADD CONSTRAINT "bookings_service_duration_option_id_fkey" FOREIGN KEY ("service_duration_option_id") REFERENCES "public"."service_duration_options"("id") ON DELETE SET NULL;
 
 
@@ -21183,6 +21795,11 @@ ALTER TABLE ONLY "public"."bookings"
 
 ALTER TABLE ONLY "public"."bookings"
     ADD CONSTRAINT "bookings_subscription_id_fkey" FOREIGN KEY ("subscription_id") REFERENCES "public"."subscriptions"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."bookings"
+    ADD CONSTRAINT "bookings_turnover_opportunity_id_fkey" FOREIGN KEY ("turnover_opportunity_id") REFERENCES "public"."turnover_opportunities"("id") ON DELETE SET NULL;
 
 
 
@@ -21546,6 +22163,31 @@ ALTER TABLE ONLY "public"."promotion_redemptions"
 
 
 
+ALTER TABLE ONLY "public"."properties"
+    ADD CONSTRAINT "properties_customer_id_fkey" FOREIGN KEY ("customer_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."property_calendar_events"
+    ADD CONSTRAINT "property_calendar_events_calendar_feed_id_fkey" FOREIGN KEY ("calendar_feed_id") REFERENCES "public"."property_calendar_feeds"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."property_calendar_events"
+    ADD CONSTRAINT "property_calendar_events_property_id_fkey" FOREIGN KEY ("property_id") REFERENCES "public"."properties"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."property_calendar_feeds"
+    ADD CONSTRAINT "property_calendar_feeds_owner_id_fkey" FOREIGN KEY ("owner_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."property_calendar_feeds"
+    ADD CONSTRAINT "property_calendar_feeds_property_id_fkey" FOREIGN KEY ("property_id") REFERENCES "public"."properties"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."psk_transaction"
     ADD CONSTRAINT "psk_transaction_booking_id_fkey" FOREIGN KEY ("booking_id") REFERENCES "public"."bookings"("id") ON DELETE CASCADE;
 
@@ -21608,6 +22250,26 @@ ALTER TABLE ONLY "public"."transactions"
 
 ALTER TABLE ONLY "public"."transactions"
     ADD CONSTRAINT "transactions_user_id_fkey" FOREIGN KEY ("cleaner_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."turnover_opportunities"
+    ADD CONSTRAINT "turnover_opportunities_arriving_event_id_fkey" FOREIGN KEY ("arriving_event_id") REFERENCES "public"."property_calendar_events"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."turnover_opportunities"
+    ADD CONSTRAINT "turnover_opportunities_booking_id_fkey" FOREIGN KEY ("booking_id") REFERENCES "public"."bookings"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."turnover_opportunities"
+    ADD CONSTRAINT "turnover_opportunities_departing_event_id_fkey" FOREIGN KEY ("departing_event_id") REFERENCES "public"."property_calendar_events"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."turnover_opportunities"
+    ADD CONSTRAINT "turnover_opportunities_property_id_fkey" FOREIGN KEY ("property_id") REFERENCES "public"."properties"("id") ON DELETE CASCADE;
 
 
 
@@ -22528,6 +23190,45 @@ ALTER TABLE "public"."promotion_redemptions" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."promotions" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."properties" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "properties_delete_own" ON "public"."properties" FOR DELETE TO "authenticated" USING (("customer_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "properties_insert_own" ON "public"."properties" FOR INSERT TO "authenticated" WITH CHECK (("customer_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "properties_select_own" ON "public"."properties" FOR SELECT TO "authenticated" USING (("customer_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "properties_update_own" ON "public"."properties" FOR UPDATE TO "authenticated" USING (("customer_id" = "auth"."uid"())) WITH CHECK (("customer_id" = "auth"."uid"()));
+
+
+
+ALTER TABLE "public"."property_calendar_events" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "property_calendar_events_select_own" ON "public"."property_calendar_events" FOR SELECT TO "authenticated" USING ((EXISTS ( SELECT 1
+   FROM "public"."properties" "p"
+  WHERE (("p"."id" = "property_calendar_events"."property_id") AND ("p"."customer_id" = "auth"."uid"())))));
+
+
+
+ALTER TABLE "public"."property_calendar_feeds" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "property_calendar_feeds_select_own" ON "public"."property_calendar_feeds" FOR SELECT TO "authenticated" USING (("owner_id" = "auth"."uid"()));
+
+
+
+CREATE POLICY "property_calendar_feeds_update_own" ON "public"."property_calendar_feeds" FOR UPDATE TO "authenticated" USING (("owner_id" = "auth"."uid"())) WITH CHECK (("owner_id" = "auth"."uid"()));
+
+
+
 ALTER TABLE "public"."psk_transaction" ENABLE ROW LEVEL SECURITY;
 
 
@@ -22585,6 +23286,23 @@ CREATE POLICY "transactions_cleaner_select" ON "public"."transactions" FOR SELEC
 
 
 CREATE POLICY "transactions_customer_select" ON "public"."transactions" FOR SELECT TO "authenticated" USING (("customer_id" = "auth"."uid"()));
+
+
+
+ALTER TABLE "public"."turnover_opportunities" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "turnover_opportunities_select_own" ON "public"."turnover_opportunities" FOR SELECT TO "authenticated" USING ((EXISTS ( SELECT 1
+   FROM "public"."properties" "p"
+  WHERE (("p"."id" = "turnover_opportunities"."property_id") AND ("p"."customer_id" = "auth"."uid"())))));
+
+
+
+CREATE POLICY "turnover_opportunities_update_own" ON "public"."turnover_opportunities" FOR UPDATE TO "authenticated" USING ((EXISTS ( SELECT 1
+   FROM "public"."properties" "p"
+  WHERE (("p"."id" = "turnover_opportunities"."property_id") AND ("p"."customer_id" = "auth"."uid"()))))) WITH CHECK ((EXISTS ( SELECT 1
+   FROM "public"."properties" "p"
+  WHERE (("p"."id" = "turnover_opportunities"."property_id") AND ("p"."customer_id" = "auth"."uid"())))));
 
 
 
@@ -23867,6 +24585,24 @@ GRANT ALL ON FUNCTION "public"."advance_subscription_recurrence_dates"("p_subscr
 
 
 
+REVOKE ALL ON FUNCTION "public"."airbnb_turnover_payment_requirements_met"("p_booking_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."airbnb_turnover_payment_requirements_met"("p_booking_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."airbnb_turnover_payment_requirements_met"("p_booking_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."airbnb_turnover_schedule_fits_window"("p_checkout" timestamp with time zone, "p_checkin" timestamp with time zone, "p_scheduled_at" timestamp with time zone, "p_duration_hours" numeric, "p_guest_ready_buffer_minutes" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."airbnb_turnover_schedule_fits_window"("p_checkout" timestamp with time zone, "p_checkin" timestamp with time zone, "p_scheduled_at" timestamp with time zone, "p_duration_hours" numeric, "p_guest_ready_buffer_minutes" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."airbnb_turnover_schedule_fits_window"("p_checkout" timestamp with time zone, "p_checkin" timestamp with time zone, "p_scheduled_at" timestamp with time zone, "p_duration_hours" numeric, "p_guest_ready_buffer_minutes" integer) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."airbnb_turnover_window_hours"("p_checkout" timestamp with time zone, "p_checkin" timestamp with time zone) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."airbnb_turnover_window_hours"("p_checkout" timestamp with time zone, "p_checkin" timestamp with time zone) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."airbnb_turnover_window_hours"("p_checkout" timestamp with time zone, "p_checkin" timestamp with time zone) TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."apply_referral_code"("p_code" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."apply_referral_code"("p_code" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."apply_referral_code"("p_code" "text") TO "authenticated";
@@ -23908,6 +24644,12 @@ GRANT ALL ON FUNCTION "public"."assign_user_role"("target_user_id" "uuid", "targ
 GRANT ALL ON FUNCTION "public"."assign_user_role"("target_user_id" "uuid", "target_role_id" "text", "is_verified" boolean) TO "anon";
 GRANT ALL ON FUNCTION "public"."assign_user_role"("target_user_id" "uuid", "target_role_id" "text", "is_verified" boolean) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."assign_user_role"("target_user_id" "uuid", "target_role_id" "text", "is_verified" boolean) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."authorize_airbnb_turnover_payment"("p_booking_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."authorize_airbnb_turnover_payment"("p_booking_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."authorize_airbnb_turnover_payment"("p_booking_id" "uuid") TO "service_role";
 
 
 
@@ -27153,6 +27895,12 @@ GRANT ALL ON FUNCTION "public"."leave_co_cleaner_team"() TO "service_role";
 
 
 
+GRANT ALL ON FUNCTION "public"."link_turnover_opportunity_to_booking"() TO "anon";
+GRANT ALL ON FUNCTION "public"."link_turnover_opportunity_to_booking"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."link_turnover_opportunity_to_booking"() TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."list_broadcast_assignments_for_cleaner"("p_cleaner_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."list_broadcast_assignments_for_cleaner"("p_cleaner_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."list_broadcast_assignments_for_cleaner"("p_cleaner_id" "uuid") TO "authenticated";
@@ -27164,6 +27912,12 @@ REVOKE ALL ON FUNCTION "public"."list_cleaner_assignment_offers"("p_cleaner_id" 
 GRANT ALL ON FUNCTION "public"."list_cleaner_assignment_offers"("p_cleaner_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."list_cleaner_assignment_offers"("p_cleaner_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."list_cleaner_assignment_offers"("p_cleaner_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."list_turnover_opportunities_for_customer"("p_limit" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."list_turnover_opportunities_for_customer"("p_limit" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."list_turnover_opportunities_for_customer"("p_limit" integer) TO "service_role";
 
 
 
@@ -28235,6 +28989,18 @@ GRANT ALL ON FUNCTION "public"."set_booking_timezone"() TO "service_role";
 GRANT ALL ON FUNCTION "public"."set_cleaner_assigned_at_for_hold"() TO "anon";
 GRANT ALL ON FUNCTION "public"."set_cleaner_assigned_at_for_hold"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."set_cleaner_assigned_at_for_hold"() TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."properties" TO "anon";
+GRANT ALL ON TABLE "public"."properties" TO "authenticated";
+GRANT ALL ON TABLE "public"."properties" TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."set_default_customer_property"("p_property_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."set_default_customer_property"("p_property_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."set_default_customer_property"("p_property_id" "uuid") TO "service_role";
 
 
 
@@ -31523,6 +32289,12 @@ GRANT ALL ON FUNCTION "public"."validate_promotion_code"("p_code" "text", "p_cus
 
 
 
+GRANT ALL ON FUNCTION "public"."validate_turnover_booking_fields"() TO "anon";
+GRANT ALL ON FUNCTION "public"."validate_turnover_booking_fields"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."validate_turnover_booking_fields"() TO "service_role";
+
+
+
 
 
 
@@ -32166,6 +32938,75 @@ GRANT ALL ON TABLE "public"."promotion_redemptions" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."property_calendar_events" TO "service_role";
+GRANT SELECT ON TABLE "public"."property_calendar_events" TO "authenticated";
+
+
+
+GRANT ALL ON TABLE "public"."property_calendar_feeds" TO "service_role";
+
+
+
+GRANT SELECT("id") ON TABLE "public"."property_calendar_feeds" TO "authenticated";
+
+
+
+GRANT SELECT("property_id") ON TABLE "public"."property_calendar_feeds" TO "authenticated";
+
+
+
+GRANT SELECT("owner_id") ON TABLE "public"."property_calendar_feeds" TO "authenticated";
+
+
+
+GRANT SELECT("provider") ON TABLE "public"."property_calendar_feeds" TO "authenticated";
+
+
+
+GRANT SELECT("timezone"),UPDATE("timezone") ON TABLE "public"."property_calendar_feeds" TO "authenticated";
+
+
+
+GRANT SELECT("sync_enabled"),UPDATE("sync_enabled") ON TABLE "public"."property_calendar_feeds" TO "authenticated";
+
+
+
+GRANT SELECT("auto_create_turnovers"),UPDATE("auto_create_turnovers") ON TABLE "public"."property_calendar_feeds" TO "authenticated";
+
+
+
+GRANT SELECT("default_checkin_time"),UPDATE("default_checkin_time") ON TABLE "public"."property_calendar_feeds" TO "authenticated";
+
+
+
+GRANT SELECT("default_checkout_time"),UPDATE("default_checkout_time") ON TABLE "public"."property_calendar_feeds" TO "authenticated";
+
+
+
+GRANT SELECT("minimum_turnover_minutes"),UPDATE("minimum_turnover_minutes") ON TABLE "public"."property_calendar_feeds" TO "authenticated";
+
+
+
+GRANT SELECT("last_synced_at") ON TABLE "public"."property_calendar_feeds" TO "authenticated";
+
+
+
+GRANT SELECT("last_successful_sync_at") ON TABLE "public"."property_calendar_feeds" TO "authenticated";
+
+
+
+GRANT SELECT("last_sync_error") ON TABLE "public"."property_calendar_feeds" TO "authenticated";
+
+
+
+GRANT SELECT("created_at") ON TABLE "public"."property_calendar_feeds" TO "authenticated";
+
+
+
+GRANT SELECT("updated_at"),UPDATE("updated_at") ON TABLE "public"."property_calendar_feeds" TO "authenticated";
+
+
+
 GRANT ALL ON TABLE "public"."reviewer_permissions" TO "anon";
 GRANT ALL ON TABLE "public"."reviewer_permissions" TO "authenticated";
 GRANT ALL ON TABLE "public"."reviewer_permissions" TO "service_role";
@@ -32247,6 +33088,11 @@ GRANT ALL ON SEQUENCE "public"."timezones_gid_seq" TO "service_role";
 GRANT ALL ON TABLE "public"."transactions" TO "anon";
 GRANT ALL ON TABLE "public"."transactions" TO "authenticated";
 GRANT ALL ON TABLE "public"."transactions" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."turnover_opportunities" TO "service_role";
+GRANT SELECT,UPDATE ON TABLE "public"."turnover_opportunities" TO "authenticated";
 
 
 
