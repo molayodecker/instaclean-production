@@ -2992,7 +2992,9 @@ DECLARE
   v_claimed_at timestamptz := now();
 BEGIN
   UPDATE public.bookings b
-  SET review_request_sent_at = v_claimed_at
+  SET
+    review_request_sent_at = v_claimed_at,
+    review_request_token = COALESCE(b.review_request_token, gen_random_uuid())
   WHERE b.id = p_booking_id
     AND b.review_request_sent_at IS NULL
     AND b.payment_status = 'paid'
@@ -8459,6 +8461,98 @@ $$;
 
 
 ALTER FUNCTION "public"."get_booking_payment_snapshot"("p_booking_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."get_booking_review_by_token"("p_token" "uuid") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_booking public.bookings%ROWTYPE;
+  v_cleaner_name text;
+  v_cleaner_avatar text;
+  v_service_name text;
+  v_existing public.reviews%ROWTYPE;
+  v_booking_day date;
+  v_today date;
+  v_review_status text;
+  v_can_review boolean := false;
+BEGIN
+  IF p_token IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_token');
+  END IF;
+
+  SELECT * INTO v_booking
+  FROM public.bookings b
+  WHERE b.review_request_token = p_token;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_token');
+  END IF;
+
+  SELECT NULLIF(BTRIM(COALESCE(p.fullname, CONCAT_WS(' ', p.firstname, p.lastname), '')), ''),
+         p.avatar_url
+  INTO v_cleaner_name, v_cleaner_avatar
+  FROM public.profiles p
+  WHERE p.id = v_booking.cleaner_id;
+
+  SELECT st.name INTO v_service_name
+  FROM public.service_types st
+  WHERE st.id = v_booking.service_id;
+
+  SELECT * INTO v_existing
+  FROM public.reviews r
+  WHERE r.booking_id = v_booking.id
+    AND r.reviewer_id = v_booking.customer_id
+  LIMIT 1;
+
+  v_today := (now() AT TIME ZONE COALESCE(v_booking.timezone_name, 'Africa/Accra'))::date;
+  v_booking_day := COALESCE(
+    (v_booking.completed_at AT TIME ZONE COALESCE(v_booking.timezone_name, 'Africa/Accra'))::date,
+    v_booking.scheduled_date::date,
+    v_booking.created_at::date
+  );
+
+  IF v_existing.id IS NOT NULL THEN
+    v_review_status := 'already_reviewed';
+  ELSIF v_booking.status = 'cancelled' THEN
+    v_review_status := 'booking_cancelled';
+  ELSIF v_booking.cleaner_id IS NULL THEN
+    v_review_status := 'no_cleaner_assigned';
+  ELSIF v_booking.status IS DISTINCT FROM 'completed' THEN
+    v_review_status := 'booking_not_finished';
+  ELSIF v_booking_day IS NOT NULL AND v_booking_day + 7 < v_today THEN
+    v_review_status := 'window_closed';
+  ELSE
+    v_review_status := 'available';
+    v_can_review := true;
+  END IF;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'cleaner_name', COALESCE(v_cleaner_name, 'Your cleaner'),
+    'cleaner_avatar_url', v_cleaner_avatar,
+    'service_name', COALESCE(
+      NULLIF(BTRIM(COALESCE(v_service_name, '')), ''),
+      NULLIF(BTRIM(COALESCE(v_booking.title, '')), ''),
+      'Cleaning service'
+    ),
+    'scheduled_date', v_booking.scheduled_date,
+    'can_review', v_can_review,
+    'review_status', v_review_status,
+    'existing_review', CASE
+      WHEN v_existing.id IS NULL THEN NULL
+      ELSE jsonb_build_object(
+        'rating', v_existing.rating,
+        'created_at', v_existing.created_at
+      )
+    END
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."get_booking_review_by_token"("p_token" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."get_cleaner_assignment_offer"("p_booking_id" "uuid") RETURNS "jsonb"
@@ -15344,6 +15438,111 @@ $$;
 ALTER FUNCTION "public"."submit_booking_review"("p_booking_id" "uuid", "p_rating" integer, "p_comment" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."submit_booking_review_by_token"("p_token" "uuid", "p_rating" integer, "p_comment" "text" DEFAULT NULL::"text") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_booking public.bookings%ROWTYPE;
+  v_booking_day date;
+  v_today date;
+  v_stored_rating numeric;
+  v_review_count integer;
+  v_comment text := NULLIF(BTRIM(COALESCE(p_comment, '')), '');
+BEGIN
+  IF p_token IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_token');
+  END IF;
+
+  IF p_rating IS NULL OR p_rating < 1 OR p_rating > 5 THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_rating');
+  END IF;
+
+  IF char_length(COALESCE(p_comment, '')) > 500 THEN
+    RETURN jsonb_build_object('success', false, 'error', 'comment_too_long');
+  END IF;
+
+  SELECT * INTO v_booking
+  FROM public.bookings b
+  WHERE b.review_request_token = p_token
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_token');
+  END IF;
+
+  IF v_booking.cleaner_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'no_cleaner_assigned');
+  END IF;
+
+  IF v_booking.status = 'cancelled' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'booking_cancelled');
+  END IF;
+
+  IF v_booking.status IS DISTINCT FROM 'completed' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'booking_not_finished');
+  END IF;
+
+  v_today := (now() AT TIME ZONE COALESCE(v_booking.timezone_name, 'Africa/Accra'))::date;
+  v_booking_day := COALESCE(
+    (v_booking.completed_at AT TIME ZONE COALESCE(v_booking.timezone_name, 'Africa/Accra'))::date,
+    v_booking.scheduled_date::date,
+    v_booking.created_at::date
+  );
+
+  IF v_booking_day IS NOT NULL AND v_booking_day + 7 < v_today THEN
+    RETURN jsonb_build_object('success', false, 'error', 'review_window_closed');
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM public.reviews r
+    WHERE r.booking_id = v_booking.id
+      AND r.reviewer_id = v_booking.customer_id
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'already_reviewed');
+  END IF;
+
+  INSERT INTO public.reviews (booking_id, reviewer_id, reviewee_id, rating, comment)
+  VALUES (
+    v_booking.id,
+    v_booking.customer_id,
+    v_booking.cleaner_id,
+    p_rating,
+    v_comment
+  )
+  ON CONFLICT (booking_id, reviewer_id) WHERE booking_id IS NOT NULL DO NOTHING;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'already_reviewed');
+  END IF;
+
+  UPDATE public.bookings
+  SET review_request_token = NULL
+  WHERE id = v_booking.id
+    AND review_request_token = p_token;
+
+  PERFORM public.recompute_cleaner_review_stats(v_booking.cleaner_id);
+
+  SELECT cd.rating, cd.review_count
+  INTO v_stored_rating, v_review_count
+  FROM public.cleaner_data cd
+  WHERE cd.user_id = v_booking.cleaner_id;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'rating', p_rating,
+    'cleaner_rating', v_stored_rating,
+    'cleaner_review_count', COALESCE(v_review_count, 0),
+    'cleaner_display_rating', public.cleaner_display_rating(v_stored_rating, v_review_count)
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."submit_booking_review_by_token"("p_token" "uuid", "p_rating" integer, "p_comment" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."submit_customer_review"("p_booking_id" "uuid", "p_rating" integer, "p_comment" "text" DEFAULT NULL::"text") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -17727,6 +17926,7 @@ CREATE TABLE IF NOT EXISTS "public"."bookings" (
     "turnover_source" "text",
     "turnover_opportunity_id" "uuid",
     "property_id" "uuid",
+    "review_request_token" "uuid",
     CONSTRAINT "bookings_assignment_phase_check" CHECK ((("assignment_phase" IS NULL) OR ("assignment_phase" = ANY (ARRAY['exclusive'::"text", 'broadcast'::"text", 'accepted'::"text"])))),
     CONSTRAINT "bookings_cancellation_tier_check" CHECK ((("cancellation_tier" IS NULL) OR ("cancellation_tier" = ANY (ARRAY['full_refund'::"text", 'partial_refund'::"text", 'no_refund'::"text"])))),
     CONSTRAINT "bookings_cancelled_by_role_check" CHECK ((("cancelled_by_role" IS NULL) OR ("cancelled_by_role" = ANY (ARRAY['customer'::"text", 'cleaner'::"text", 'admin'::"text", 'platform'::"text"])))),
@@ -17942,6 +18142,10 @@ COMMENT ON COLUMN "public"."bookings"."turnover_opportunity_id" IS 'Calendar-der
 
 
 COMMENT ON COLUMN "public"."bookings"."property_id" IS 'Host property/listing associated with this turnover booking.';
+
+
+
+COMMENT ON COLUMN "public"."bookings"."review_request_token" IS 'Opaque token for public /review/<token> links. Issued when a review request is claimed. Cleared after a successful public submit.';
 
 
 
@@ -18938,7 +19142,11 @@ CREATE TABLE IF NOT EXISTS "public"."kyc_profiles" (
 ALTER TABLE "public"."kyc_profiles" OWNER TO "postgres";
 
 
-COMMENT ON COLUMN "public"."kyc_profiles"."subject_type" IS 'Canonical values: customer, cleaner. ''user'' is a legacy alias kept temporarily; remove once no writers emit it.';
+COMMENT ON TABLE "public"."kyc_profiles" IS 'User-level identity verification (Sumsub). One approved verification covers both consumer booking trust and cleaner payout eligibility. subject_type records which flow created/last touched the row; it is not an identity partition — never filter payout or trust lookups to subject_type = ''cleaner'' only.';
+
+
+
+COMMENT ON COLUMN "public"."kyc_profiles"."subject_type" IS 'Context label: customer or cleaner (legacy user alias). Not an identity boundary — Sumsub webhooks may keep customer while cleaner_application_id is set. Identity gates use user_id only.';
 
 
 
@@ -20664,6 +20872,10 @@ CREATE INDEX "bookings_promotion_code_id_idx" ON "public"."bookings" USING "btre
 
 
 CREATE INDEX "bookings_review_request_pending_idx" ON "public"."bookings" USING "btree" ("completed_at") WHERE (("review_request_sent_at" IS NULL) AND ("payment_status" = 'paid'::"text") AND ("status" = 'completed'::"public"."booking_status") AND ("cleaner_id" IS NOT NULL) AND ("completed_at" IS NOT NULL));
+
+
+
+CREATE UNIQUE INDEX "bookings_review_request_token_uidx" ON "public"."bookings" USING "btree" ("review_request_token") WHERE ("review_request_token" IS NOT NULL);
 
 
 
@@ -27455,6 +27667,13 @@ GRANT ALL ON FUNCTION "public"."get_booking_payment_snapshot"("p_booking_id" "uu
 
 
 
+REVOKE ALL ON FUNCTION "public"."get_booking_review_by_token"("p_token" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."get_booking_review_by_token"("p_token" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."get_booking_review_by_token"("p_token" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."get_booking_review_by_token"("p_token" "uuid") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."get_cleaner_assignment_offer"("p_booking_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."get_cleaner_assignment_offer"("p_booking_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."get_cleaner_assignment_offer"("p_booking_id" "uuid") TO "authenticated";
@@ -31971,6 +32190,13 @@ GRANT ALL ON FUNCTION "public"."strpos"("public"."citext", "public"."citext") TO
 REVOKE ALL ON FUNCTION "public"."submit_booking_review"("p_booking_id" "uuid", "p_rating" integer, "p_comment" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."submit_booking_review"("p_booking_id" "uuid", "p_rating" integer, "p_comment" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."submit_booking_review"("p_booking_id" "uuid", "p_rating" integer, "p_comment" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."submit_booking_review_by_token"("p_token" "uuid", "p_rating" integer, "p_comment" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."submit_booking_review_by_token"("p_token" "uuid", "p_rating" integer, "p_comment" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."submit_booking_review_by_token"("p_token" "uuid", "p_rating" integer, "p_comment" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."submit_booking_review_by_token"("p_token" "uuid", "p_rating" integer, "p_comment" "text") TO "service_role";
 
 
 

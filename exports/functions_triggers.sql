@@ -3580,7 +3580,9 @@ DECLARE
   v_claimed_at timestamptz := now();
 BEGIN
   UPDATE public.bookings b
-  SET review_request_sent_at = v_claimed_at
+  SET
+    review_request_sent_at = v_claimed_at,
+    review_request_token = COALESCE(b.review_request_token, gen_random_uuid())
   WHERE b.id = p_booking_id
     AND b.review_request_sent_at IS NULL
     AND b.payment_status = 'paid'
@@ -11263,6 +11265,97 @@ AS $function$
       )
     )
   LIMIT 1;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.get_booking_review_by_token(p_token uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_booking public.bookings%ROWTYPE;
+  v_cleaner_name text;
+  v_cleaner_avatar text;
+  v_service_name text;
+  v_existing public.reviews%ROWTYPE;
+  v_booking_day date;
+  v_today date;
+  v_review_status text;
+  v_can_review boolean := false;
+BEGIN
+  IF p_token IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_token');
+  END IF;
+
+  SELECT * INTO v_booking
+  FROM public.bookings b
+  WHERE b.review_request_token = p_token;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_token');
+  END IF;
+
+  SELECT NULLIF(BTRIM(COALESCE(p.fullname, CONCAT_WS(' ', p.firstname, p.lastname), '')), ''),
+         p.avatar_url
+  INTO v_cleaner_name, v_cleaner_avatar
+  FROM public.profiles p
+  WHERE p.id = v_booking.cleaner_id;
+
+  SELECT st.name INTO v_service_name
+  FROM public.service_types st
+  WHERE st.id = v_booking.service_id;
+
+  SELECT * INTO v_existing
+  FROM public.reviews r
+  WHERE r.booking_id = v_booking.id
+    AND r.reviewer_id = v_booking.customer_id
+  LIMIT 1;
+
+  v_today := (now() AT TIME ZONE COALESCE(v_booking.timezone_name, 'Africa/Accra'))::date;
+  v_booking_day := COALESCE(
+    (v_booking.completed_at AT TIME ZONE COALESCE(v_booking.timezone_name, 'Africa/Accra'))::date,
+    v_booking.scheduled_date::date,
+    v_booking.created_at::date
+  );
+
+  IF v_existing.id IS NOT NULL THEN
+    v_review_status := 'already_reviewed';
+  ELSIF v_booking.status = 'cancelled' THEN
+    v_review_status := 'booking_cancelled';
+  ELSIF v_booking.cleaner_id IS NULL THEN
+    v_review_status := 'no_cleaner_assigned';
+  ELSIF v_booking.status IS DISTINCT FROM 'completed' THEN
+    v_review_status := 'booking_not_finished';
+  ELSIF v_booking_day IS NOT NULL AND v_booking_day + 7 < v_today THEN
+    v_review_status := 'window_closed';
+  ELSE
+    v_review_status := 'available';
+    v_can_review := true;
+  END IF;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'cleaner_name', COALESCE(v_cleaner_name, 'Your cleaner'),
+    'cleaner_avatar_url', v_cleaner_avatar,
+    'service_name', COALESCE(
+      NULLIF(BTRIM(COALESCE(v_service_name, '')), ''),
+      NULLIF(BTRIM(COALESCE(v_booking.title, '')), ''),
+      'Cleaning service'
+    ),
+    'scheduled_date', v_booking.scheduled_date,
+    'can_review', v_can_review,
+    'review_status', v_review_status,
+    'existing_review', CASE
+      WHEN v_existing.id IS NULL THEN NULL
+      ELSE jsonb_build_object(
+        'rating', v_existing.rating,
+        'created_at', v_existing.created_at
+      )
+    END
+  );
+END;
 $function$
 
 
@@ -22456,6 +22549,110 @@ BEGIN
   RETURN jsonb_build_object(
     'success', true,
     'booking_id', p_booking_id,
+    'rating', p_rating,
+    'cleaner_rating', v_stored_rating,
+    'cleaner_review_count', COALESCE(v_review_count, 0),
+    'cleaner_display_rating', public.cleaner_display_rating(v_stored_rating, v_review_count)
+  );
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.submit_booking_review_by_token(p_token uuid, p_rating integer, p_comment text DEFAULT NULL::text)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_booking public.bookings%ROWTYPE;
+  v_booking_day date;
+  v_today date;
+  v_stored_rating numeric;
+  v_review_count integer;
+  v_comment text := NULLIF(BTRIM(COALESCE(p_comment, '')), '');
+BEGIN
+  IF p_token IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_token');
+  END IF;
+
+  IF p_rating IS NULL OR p_rating < 1 OR p_rating > 5 THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_rating');
+  END IF;
+
+  IF char_length(COALESCE(p_comment, '')) > 500 THEN
+    RETURN jsonb_build_object('success', false, 'error', 'comment_too_long');
+  END IF;
+
+  SELECT * INTO v_booking
+  FROM public.bookings b
+  WHERE b.review_request_token = p_token
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_token');
+  END IF;
+
+  IF v_booking.cleaner_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'no_cleaner_assigned');
+  END IF;
+
+  IF v_booking.status = 'cancelled' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'booking_cancelled');
+  END IF;
+
+  IF v_booking.status IS DISTINCT FROM 'completed' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'booking_not_finished');
+  END IF;
+
+  v_today := (now() AT TIME ZONE COALESCE(v_booking.timezone_name, 'Africa/Accra'))::date;
+  v_booking_day := COALESCE(
+    (v_booking.completed_at AT TIME ZONE COALESCE(v_booking.timezone_name, 'Africa/Accra'))::date,
+    v_booking.scheduled_date::date,
+    v_booking.created_at::date
+  );
+
+  IF v_booking_day IS NOT NULL AND v_booking_day + 7 < v_today THEN
+    RETURN jsonb_build_object('success', false, 'error', 'review_window_closed');
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM public.reviews r
+    WHERE r.booking_id = v_booking.id
+      AND r.reviewer_id = v_booking.customer_id
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'already_reviewed');
+  END IF;
+
+  INSERT INTO public.reviews (booking_id, reviewer_id, reviewee_id, rating, comment)
+  VALUES (
+    v_booking.id,
+    v_booking.customer_id,
+    v_booking.cleaner_id,
+    p_rating,
+    v_comment
+  )
+  ON CONFLICT (booking_id, reviewer_id) WHERE booking_id IS NOT NULL DO NOTHING;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'already_reviewed');
+  END IF;
+
+  UPDATE public.bookings
+  SET review_request_token = NULL
+  WHERE id = v_booking.id
+    AND review_request_token = p_token;
+
+  PERFORM public.recompute_cleaner_review_stats(v_booking.cleaner_id);
+
+  SELECT cd.rating, cd.review_count
+  INTO v_stored_rating, v_review_count
+  FROM public.cleaner_data cd
+  WHERE cd.user_id = v_booking.cleaner_id;
+
+  RETURN jsonb_build_object(
+    'success', true,
     'rating', p_rating,
     'cleaner_rating', v_stored_rating,
     'cleaner_review_count', COALESCE(v_review_count, 0),
