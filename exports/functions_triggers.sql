@@ -4448,6 +4448,24 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.cleanup_old_edge_function_failures()
+ RETURNS integer
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_deleted integer;
+BEGIN
+  DELETE FROM public.edge_function_failures
+  WHERE last_seen_at < now() - interval '90 days';
+
+  GET DIAGNOSTICS v_deleted = ROW_COUNT;
+  RETURN v_deleted;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.cleanup_orphaned_pending_subscription(p_subscription_id uuid)
  RETURNS boolean
  LANGUAGE plpgsql
@@ -16992,6 +17010,75 @@ BEGIN
     'new_balance_subunit', v_balance - p_amount_subunit,
     'amount_subunit', p_amount_subunit
   );
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.record_edge_function_failure(p_function_name text, p_fingerprint text, p_error_message text, p_status_code integer DEFAULT NULL::integer, p_error_code text DEFAULT NULL::text, p_request_id text DEFAULT NULL::text, p_execution_id text DEFAULT NULL::text, p_user_id uuid DEFAULT NULL::uuid, p_booking_id uuid DEFAULT NULL::uuid, p_payment_reference text DEFAULT NULL::text, p_environment text DEFAULT NULL::text, p_metadata jsonb DEFAULT '{}'::jsonb)
+ RETURNS TABLE(id uuid, deduplicated boolean)
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  RETURN QUERY
+  INSERT INTO public.edge_function_failures (
+    function_name,
+    fingerprint,
+    error_message,
+    status_code,
+    error_code,
+    request_id,
+    execution_id,
+    user_id,
+    booking_id,
+    payment_reference,
+    environment,
+    metadata,
+    occurred_at,
+    first_seen_at,
+    last_seen_at,
+    occurrence_count
+  )
+  VALUES (
+    p_function_name,
+    p_fingerprint,
+    p_error_message,
+    p_status_code,
+    p_error_code,
+    p_request_id,
+    p_execution_id,
+    p_user_id,
+    p_booking_id,
+    p_payment_reference,
+    p_environment,
+    COALESCE(p_metadata, '{}'::jsonb),
+    now(),
+    now(),
+    now(),
+    1
+  )
+  ON CONFLICT (fingerprint)
+  DO UPDATE SET
+    occurrence_count =
+      public.edge_function_failures.occurrence_count + 1,
+    last_seen_at = now(),
+    error_message = EXCLUDED.error_message,
+    status_code = EXCLUDED.status_code,
+    error_code = EXCLUDED.error_code,
+    request_id = EXCLUDED.request_id,
+    execution_id = EXCLUDED.execution_id,
+    user_id = COALESCE(EXCLUDED.user_id, public.edge_function_failures.user_id),
+    booking_id = COALESCE(EXCLUDED.booking_id, public.edge_function_failures.booking_id),
+    payment_reference = COALESCE(
+      EXCLUDED.payment_reference,
+      public.edge_function_failures.payment_reference
+    ),
+    environment = COALESCE(EXCLUDED.environment, public.edge_function_failures.environment),
+    metadata = EXCLUDED.metadata
+  RETURNING
+    public.edge_function_failures.id,
+    (public.edge_function_failures.occurrence_count > 1) AS deduplicated;
 END;
 $function$
 

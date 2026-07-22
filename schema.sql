@@ -3905,6 +3905,29 @@ $$;
 ALTER FUNCTION "public"."cleanup_expired_welcome_promotion_reservations"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."cleanup_old_edge_function_failures"() RETURNS integer
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_deleted integer;
+BEGIN
+  DELETE FROM public.edge_function_failures
+  WHERE last_seen_at < now() - interval '90 days';
+
+  GET DIAGNOSTICS v_deleted = ROW_COUNT;
+  RETURN v_deleted;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."cleanup_old_edge_function_failures"() OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."cleanup_old_edge_function_failures"() IS 'Delete edge_function_failures whose last_seen_at is older than 90 days. Scheduled daily via pg_cron.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."cleanup_orphaned_pending_subscription"("p_subscription_id" "uuid") RETURNS boolean
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public', 'pg_temp'
@@ -13100,6 +13123,80 @@ COMMENT ON FUNCTION "public"."record_admin_cash_payout"("p_cleaner_id" "uuid", "
 
 
 
+CREATE OR REPLACE FUNCTION "public"."record_edge_function_failure"("p_function_name" "text", "p_fingerprint" "text", "p_error_message" "text", "p_status_code" integer DEFAULT NULL::integer, "p_error_code" "text" DEFAULT NULL::"text", "p_request_id" "text" DEFAULT NULL::"text", "p_execution_id" "text" DEFAULT NULL::"text", "p_user_id" "uuid" DEFAULT NULL::"uuid", "p_booking_id" "uuid" DEFAULT NULL::"uuid", "p_payment_reference" "text" DEFAULT NULL::"text", "p_environment" "text" DEFAULT NULL::"text", "p_metadata" "jsonb" DEFAULT '{}'::"jsonb") RETURNS TABLE("id" "uuid", "deduplicated" boolean)
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  RETURN QUERY
+  INSERT INTO public.edge_function_failures (
+    function_name,
+    fingerprint,
+    error_message,
+    status_code,
+    error_code,
+    request_id,
+    execution_id,
+    user_id,
+    booking_id,
+    payment_reference,
+    environment,
+    metadata,
+    occurred_at,
+    first_seen_at,
+    last_seen_at,
+    occurrence_count
+  )
+  VALUES (
+    p_function_name,
+    p_fingerprint,
+    p_error_message,
+    p_status_code,
+    p_error_code,
+    p_request_id,
+    p_execution_id,
+    p_user_id,
+    p_booking_id,
+    p_payment_reference,
+    p_environment,
+    COALESCE(p_metadata, '{}'::jsonb),
+    now(),
+    now(),
+    now(),
+    1
+  )
+  ON CONFLICT (fingerprint)
+  DO UPDATE SET
+    occurrence_count =
+      public.edge_function_failures.occurrence_count + 1,
+    last_seen_at = now(),
+    error_message = EXCLUDED.error_message,
+    status_code = EXCLUDED.status_code,
+    error_code = EXCLUDED.error_code,
+    request_id = EXCLUDED.request_id,
+    execution_id = EXCLUDED.execution_id,
+    user_id = COALESCE(EXCLUDED.user_id, public.edge_function_failures.user_id),
+    booking_id = COALESCE(EXCLUDED.booking_id, public.edge_function_failures.booking_id),
+    payment_reference = COALESCE(
+      EXCLUDED.payment_reference,
+      public.edge_function_failures.payment_reference
+    ),
+    environment = COALESCE(EXCLUDED.environment, public.edge_function_failures.environment),
+    metadata = EXCLUDED.metadata
+  RETURNING
+    public.edge_function_failures.id,
+    (public.edge_function_failures.occurrence_count > 1) AS deduplicated;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."record_edge_function_failure"("p_function_name" "text", "p_fingerprint" "text", "p_error_message" "text", "p_status_code" integer, "p_error_code" "text", "p_request_id" "text", "p_execution_id" "text", "p_user_id" "uuid", "p_booking_id" "uuid", "p_payment_reference" "text", "p_environment" "text", "p_metadata" "jsonb") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."record_edge_function_failure"("p_function_name" "text", "p_fingerprint" "text", "p_error_message" "text", "p_status_code" integer, "p_error_code" "text", "p_request_id" "text", "p_execution_id" "text", "p_user_id" "uuid", "p_booking_id" "uuid", "p_payment_reference" "text", "p_environment" "text", "p_metadata" "jsonb") IS 'Atomically insert or increment a sanitized edge function failure row by fingerprint.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."record_lookup_attempt"("p_scope" "text", "p_key" "text", "p_max_attempts" integer, "p_window_seconds" integer) RETURNS boolean
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -18761,6 +18858,43 @@ ALTER SEQUENCE "public"."discounts_id_seq" OWNED BY "public"."discounts"."id";
 
 
 
+CREATE TABLE IF NOT EXISTS "public"."edge_function_failures" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "function_name" "text" NOT NULL,
+    "fingerprint" "text" NOT NULL,
+    "request_id" "text",
+    "execution_id" "text",
+    "status_code" integer,
+    "error_code" "text",
+    "error_message" "text" NOT NULL,
+    "user_id" "uuid",
+    "booking_id" "uuid",
+    "payment_reference" "text",
+    "environment" "text",
+    "occurred_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "first_seen_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "last_seen_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "occurrence_count" integer DEFAULT 1 NOT NULL,
+    "metadata" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    CONSTRAINT "edge_function_failures_error_message_nonempty" CHECK (("btrim"("error_message") <> ''::"text")),
+    CONSTRAINT "edge_function_failures_function_name_nonempty" CHECK (("btrim"("function_name") <> ''::"text")),
+    CONSTRAINT "edge_function_failures_metadata_object" CHECK (("jsonb_typeof"("metadata") = 'object'::"text")),
+    CONSTRAINT "edge_function_failures_occurrence_count_positive" CHECK (("occurrence_count" >= 1)),
+    CONSTRAINT "edge_function_failures_status_code_check" CHECK ((("status_code" IS NULL) OR (("status_code" >= 100) AND ("status_code" <= 599))))
+);
+
+
+ALTER TABLE "public"."edge_function_failures" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."edge_function_failures" IS 'Sanitized edge function failure records for admin operational diagnostics (Rosey). No secrets or raw provider payloads.';
+
+
+
+COMMENT ON COLUMN "public"."edge_function_failures"."fingerprint" IS 'Stable key from function_name, error_code, stage metadata, booking_id, and payment_reference for deduplication.';
+
+
+
 CREATE TABLE IF NOT EXISTS "public"."email_signup_tokens" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "user_id" "uuid" NOT NULL,
@@ -20398,6 +20532,11 @@ ALTER TABLE ONLY "public"."discounts"
 
 
 
+ALTER TABLE ONLY "public"."edge_function_failures"
+    ADD CONSTRAINT "edge_function_failures_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."email_signup_tokens"
     ADD CONSTRAINT "email_signup_tokens_pkey" PRIMARY KEY ("id");
 
@@ -20981,6 +21120,30 @@ CREATE INDEX "customer_risk_admin_actions_customer_id_created_at_idx" ON "public
 
 
 CREATE INDEX "customer_risk_admin_notes_customer_id_created_at_idx" ON "public"."customer_risk_admin_notes" USING "btree" ("customer_id", "created_at" DESC);
+
+
+
+CREATE INDEX "edge_function_failures_booking_id_idx" ON "public"."edge_function_failures" USING "btree" ("booking_id") WHERE ("booking_id" IS NOT NULL);
+
+
+
+CREATE UNIQUE INDEX "edge_function_failures_fingerprint_uidx" ON "public"."edge_function_failures" USING "btree" ("fingerprint");
+
+
+
+CREATE INDEX "edge_function_failures_function_name_idx" ON "public"."edge_function_failures" USING "btree" ("function_name", "occurred_at" DESC);
+
+
+
+CREATE INDEX "edge_function_failures_last_seen_at_idx" ON "public"."edge_function_failures" USING "btree" ("last_seen_at" DESC);
+
+
+
+CREATE INDEX "edge_function_failures_occurred_at_idx" ON "public"."edge_function_failures" USING "btree" ("occurred_at" DESC);
+
+
+
+CREATE INDEX "edge_function_failures_user_id_idx" ON "public"."edge_function_failures" USING "btree" ("user_id") WHERE ("user_id" IS NOT NULL);
 
 
 
@@ -23244,6 +23407,9 @@ ALTER TABLE "public"."device_tokens" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."discounts" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."edge_function_failures" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."email_signup_tokens" ENABLE ROW LEVEL SECURITY;
 
 
@@ -25347,6 +25513,11 @@ REVOKE ALL ON FUNCTION "public"."cleanup_expired_welcome_promotion_reservations"
 GRANT ALL ON FUNCTION "public"."cleanup_expired_welcome_promotion_reservations"() TO "anon";
 GRANT ALL ON FUNCTION "public"."cleanup_expired_welcome_promotion_reservations"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."cleanup_expired_welcome_promotion_reservations"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."cleanup_old_edge_function_failures"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."cleanup_old_edge_function_failures"() TO "service_role";
 
 
 
@@ -28923,6 +29094,11 @@ GRANT ALL ON FUNCTION "public"."recompute_customer_review_stats"("p_customer_id"
 
 REVOKE ALL ON FUNCTION "public"."record_admin_cash_payout"("p_cleaner_id" "uuid", "p_amount_subunit" integer, "p_recorded_by" "uuid", "p_booking_id" "uuid", "p_notes" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."record_admin_cash_payout"("p_cleaner_id" "uuid", "p_amount_subunit" integer, "p_recorded_by" "uuid", "p_booking_id" "uuid", "p_notes" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."record_edge_function_failure"("p_function_name" "text", "p_fingerprint" "text", "p_error_message" "text", "p_status_code" integer, "p_error_code" "text", "p_request_id" "text", "p_execution_id" "text", "p_user_id" "uuid", "p_booking_id" "uuid", "p_payment_reference" "text", "p_environment" "text", "p_metadata" "jsonb") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."record_edge_function_failure"("p_function_name" "text", "p_fingerprint" "text", "p_error_message" "text", "p_status_code" integer, "p_error_code" "text", "p_request_id" "text", "p_execution_id" "text", "p_user_id" "uuid", "p_booking_id" "uuid", "p_payment_reference" "text", "p_environment" "text", "p_metadata" "jsonb") TO "service_role";
 
 
 
@@ -32990,6 +33166,10 @@ GRANT ALL ON TABLE "public"."discounts" TO "service_role";
 GRANT ALL ON SEQUENCE "public"."discounts_id_seq" TO "anon";
 GRANT ALL ON SEQUENCE "public"."discounts_id_seq" TO "authenticated";
 GRANT ALL ON SEQUENCE "public"."discounts_id_seq" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."edge_function_failures" TO "service_role";
 
 
 
