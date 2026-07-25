@@ -7422,15 +7422,7 @@ DECLARE
   v_in_transit numeric;
   v_estimated numeric;
   v_total numeric;
-  v_uid uuid := auth.uid();
 BEGIN
-  -- Authenticated JWT callers may only read their own earnings.
-  -- service_role / SQL runners (auth.uid() NULL) remain allowed for ops/tests.
-  IF v_uid IS NOT NULL AND v_uid IS DISTINCT FROM p_user_id THEN
-    RAISE EXCEPTION 'Not authorized'
-      USING ERRCODE = '42501';
-  END IF;
-
   -- Paid jobs not yet completed: sum authoritative cleaner payout snapshot.
   SELECT COALESCE(
     SUM(
@@ -7455,24 +7447,15 @@ BEGIN
   FROM public.wallets
   WHERE user_id = p_user_id;
 
-  -- Period total: job earnings only (booking-linked credits).
-  -- Exclude withdrawal refund/reversal credits and other non-job credits.
-  -- Half-open range avoids missing or double-counting boundary timestamps.
-  SELECT COALESCE(SUM(wt.amount_subunit), 0)
-  INTO v_total
-  FROM public.wallet_transactions wt
-  JOIN public.wallets w
-    ON w.id = wt.wallet_id
-  WHERE w.user_id = p_user_id
-    AND wt.type = 'credit'
-    AND wt.booking_id IS NOT NULL
-    AND wt.withdrawal_request_id IS NULL
-    AND wt.created_at >= p_start_date
-    AND wt.created_at < p_end_date;
+  SELECT COALESCE(SUM(amount_subunit), 0) INTO v_total
+  FROM public.wallet_transactions
+  WHERE wallet_id = (SELECT id FROM public.wallets WHERE user_id = p_user_id)
+    AND type = 'credit'
+    AND created_at BETWEEN p_start_date AND p_end_date;
 
   RETURN json_build_object(
     'inTransit', ROUND(v_in_transit),
-    'estimatedPayout', COALESCE(v_estimated, 0),
+    'estimatedPayout', v_estimated,
     'total', v_total
   );
 END;
@@ -10800,115 +10783,6 @@ BEGIN
   FROM unioned u
   ORDER BY u.sort_key NULLS LAST;
 
-END;
-$function$
-
-
-CREATE OR REPLACE FUNCTION public.get_best_available_cleaners(p_date date, p_time time without time zone, p_duration numeric, p_lat double precision, p_lng double precision, p_max_distance_meters integer, p_requested_services text[])
- RETURNS TABLE(cleaner_id uuid, cleaner_name text, avatar_url text, bio text, hourly_rate numeric, rating double precision, distance_meters double precision, final_score double precision)
- LANGUAGE plpgsql
- STABLE
-AS $function$
-DECLARE
-  v_cust_id uuid := auth.uid();
-  v_booking_range tstzrange;
-  v_cust_loc geography := ST_SetSRID(ST_MakePoint(p_lng, p_lat), 4326)::geography;
-BEGIN
-  IF v_cust_id IS NULL THEN
-    RAISE EXCEPTION 'Not authorized';
-  END IF;
-
-  v_booking_range := tstzrange(
-    (p_date + p_time)::timestamptz,
-    (p_date + p_time + (p_duration || ' hours')::interval)::timestamptz,
-    '[)'
-  );
-
-  RETURN QUERY
-  WITH available_cleaners AS (
-    SELECT
-      cd.user_id AS cleaner_user_id,
-      p.fullname AS cleaner_fullname,
-      p.avatar_url AS profile_avatar_url,
-      COALESCE(cd.bio, p.bio) AS profile_bio,
-      cd.hourly_rate AS cleaner_hourly_rate,
-      cd.rating AS cleaner_rating,
-      cd.skills AS cleaner_skills,
-      cd.specialties AS cleaner_specialties,
-      COALESCE(cd.base_location::geography, p.location_wkt) AS effective_location,
-      ST_Distance(
-        COALESCE(cd.base_location::geography, p.location_wkt),
-        v_cust_loc
-      )::float AS dist
-    FROM public.cleaner_data cd
-    JOIN public.profiles p ON p.user_id = cd.user_id
-    WHERE cd.status = 'active'
-      AND cd.verified = true
-      AND COALESCE(cd.base_location::geography, p.location_wkt) IS NOT NULL
-      AND (
-        auth.uid() = cd.user_id
-        OR public.is_profile_discoverable_by_others(p)
-      )
-      AND ST_DWithin(
-        COALESCE(cd.base_location::geography, p.location_wkt),
-        v_cust_loc,
-        LEAST(
-          COALESCE(cd.max_travel_distance_meters, p_max_distance_meters),
-          p_max_distance_meters
-        )
-      )
-      AND NOT EXISTS (
-        SELECT 1
-        FROM public.bookings b
-        WHERE b.cleaner_id = cd.user_id
-          AND b.booking_period && v_booking_range
-          AND b.status != 'cancelled'
-      )
-      AND NOT EXISTS (
-        SELECT 1
-        FROM public.cleaner_availability_exceptions cae
-        WHERE cae.cleaner_id = cd.user_id
-          AND cae.exception_date = p_date
-      )
-  ),
-  scored_cleaners AS (
-    SELECT
-      ac.cleaner_user_id,
-      ac.cleaner_fullname,
-      ac.profile_avatar_url,
-      ac.profile_bio,
-      ac.cleaner_hourly_rate,
-      ac.cleaner_rating,
-      ac.cleaner_skills,
-      ac.cleaner_specialties,
-      ac.dist,
-      CASE
-        WHEN cardinality(COALESCE(p_requested_services, ARRAY[]::text[])) > 0
-        THEN (
-          SELECT count(*)::float / cardinality(p_requested_services)
-          FROM unnest(p_requested_services) s
-          WHERE s = ANY(COALESCE(ac.cleaner_skills, ARRAY[]::text[]))
-             OR s = ANY(COALESCE(ac.cleaner_specialties, ARRAY[]::text[]))
-        ) * 40
-        ELSE 20
-      END AS s_score
-    FROM available_cleaners ac
-  )
-  SELECT
-    sc.cleaner_user_id AS cleaner_id,
-    sc.cleaner_fullname AS cleaner_name,
-    sc.profile_avatar_url AS avatar_url,
-    sc.profile_bio AS bio,
-    sc.cleaner_hourly_rate AS hourly_rate,
-    sc.cleaner_rating::float AS rating,
-    sc.dist::float AS distance_meters,
-    (
-      (GREATEST(0, (1.0 - (sc.dist / p_max_distance_meters))) * 30)
-      + (COALESCE(sc.cleaner_rating, 0) / 5.0 * 30)
-      + sc.s_score
-    )::float AS final_score
-  FROM scored_cleaners sc
-  ORDER BY final_score DESC, sc.dist ASC;
 END;
 $function$
 
@@ -16524,6 +16398,54 @@ AS $function$
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.properties_guard_auto_booking_enabled()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.auto_booking_enabled IS TRUE
+       AND coalesce(current_setting('instaclean.allow_auto_booking_toggle', true), '')
+           IS DISTINCT FROM 'on' THEN
+      NEW.auto_booking_enabled := false;
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  IF NEW.auto_booking_enabled IS DISTINCT FROM OLD.auto_booking_enabled
+     AND coalesce(current_setting('instaclean.allow_auto_booking_toggle', true), '')
+         IS DISTINCT FROM 'on' THEN
+    RAISE EXCEPTION 'auto_booking_enabled must be changed via set_property_auto_booking_enabled'
+      USING ERRCODE = '42501';
+  END IF;
+
+  RETURN NEW;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.property_preferred_cleaners_require_approved()
+ RETURNS trigger
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM public.cleaner_data cd
+    WHERE cd.user_id = NEW.cleaner_id
+      AND cd.status = 'active'::public.cleaner_status
+  ) THEN
+    RAISE EXCEPTION 'cleaner_not_eligible'
+      USING ERRCODE = 'check_violation';
+  END IF;
+  RETURN NEW;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.psk_transaction(p_booking_id uuid, p_user_id uuid, p_reference text, p_paystack_id bigint, p_amount numeric, p_fee_amount numeric, p_total_captured numeric, p_currency text, p_metadata jsonb)
  RETURNS psk_transaction
  LANGUAGE plpgsql
@@ -18781,6 +18703,73 @@ AS $function$
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.save_property_information(p_property_id uuid, p_trash_notes text DEFAULT NULL::text, p_supplies_notes text DEFAULT NULL::text, p_other_notes text DEFAULT NULL::text, p_access_notes text DEFAULT NULL::text, p_wifi_network text DEFAULT NULL::text, p_wifi_password text DEFAULT NULL::text, p_parking_notes text DEFAULT NULL::text)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  IF p_property_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'property_required');
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM public.properties
+    WHERE id = p_property_id
+      AND customer_id = v_uid
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'property_not_found');
+  END IF;
+
+  UPDATE public.properties
+  SET
+    trash_notes = nullif(btrim(COALESCE(p_trash_notes, '')), ''),
+    supplies_notes = nullif(btrim(COALESCE(p_supplies_notes, '')), ''),
+    other_notes = nullif(btrim(COALESCE(p_other_notes, '')), ''),
+    updated_at = now()
+  WHERE id = p_property_id
+    AND customer_id = v_uid;
+
+  INSERT INTO public.property_private_instructions (
+    property_id,
+    owner_id,
+    access_notes,
+    wifi_network,
+    wifi_password,
+    parking_notes,
+    updated_at
+  )
+  VALUES (
+    p_property_id,
+    v_uid,
+    nullif(btrim(COALESCE(p_access_notes, '')), ''),
+    nullif(btrim(COALESCE(p_wifi_network, '')), ''),
+    nullif(btrim(COALESCE(p_wifi_password, '')), ''),
+    nullif(btrim(COALESCE(p_parking_notes, '')), ''),
+    now()
+  )
+  ON CONFLICT (property_id)
+  DO UPDATE SET
+    owner_id = EXCLUDED.owner_id,
+    access_notes = EXCLUDED.access_notes,
+    wifi_network = EXCLUDED.wifi_network,
+    wifi_password = EXCLUDED.wifi_password,
+    parking_notes = EXCLUDED.parking_notes,
+    updated_at = now();
+
+  RETURN jsonb_build_object('success', true);
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.search_available_cleaners(p_lat double precision, p_lng double precision, p_date date, p_time time without time zone, p_duration double precision, p_requested_services text[] DEFAULT '{}'::text[], p_max_distance_meters double precision DEFAULT 50000)
  RETURNS TABLE(cleaner_id uuid, cleaner_name text, avatar_url text, rating double precision, distance_meters double precision, matching_skills_count integer, total_skills_count integer)
  LANGUAGE plpgsql
@@ -19148,6 +19137,88 @@ AS $function$
 BEGIN
   NEW.updated_at := now();
   RETURN NEW;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.set_property_auto_booking_enabled(p_property_id uuid, p_enabled boolean)
+ RETURNS json
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_property public.properties%ROWTYPE;
+  v_has_active_feed boolean := false;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN json_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  IF p_property_id IS NULL THEN
+    RETURN json_build_object('success', false, 'error', 'property_required');
+  END IF;
+
+  SELECT *
+  INTO v_property
+  FROM public.properties
+  WHERE id = p_property_id
+    AND customer_id = v_uid
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN json_build_object('success', false, 'error', 'property_not_found');
+  END IF;
+
+  IF p_enabled IS TRUE THEN
+    IF v_property.turnover_defaults_confirmed IS NOT TRUE THEN
+      RETURN json_build_object('success', false, 'error', 'defaults_unconfirmed');
+    END IF;
+
+    SELECT EXISTS (
+      SELECT 1
+      FROM public.property_calendar_feeds f
+      WHERE f.property_id = p_property_id
+        AND f.owner_id = v_uid
+        AND f.sync_enabled IS TRUE
+    )
+    INTO v_has_active_feed;
+
+    IF v_has_active_feed IS NOT TRUE THEN
+      RETURN json_build_object('success', false, 'error', 'calendar_required');
+    END IF;
+  END IF;
+
+  PERFORM set_config('instaclean.allow_auto_booking_toggle', 'on', true);
+
+  UPDATE public.properties
+  SET
+    auto_booking_enabled = coalesce(p_enabled, false),
+    auto_booking_starts_on = CASE
+      WHEN coalesce(p_enabled, false) THEN
+        coalesce(
+          auto_booking_starts_on,
+          (
+            timezone(
+              coalesce(nullif(v_property.timezone, ''), 'Africa/Accra'),
+              now()
+            )
+          )::date
+        )
+      ELSE NULL
+    END,
+    updated_at = now()
+  WHERE id = p_property_id
+    AND customer_id = v_uid
+  RETURNING * INTO v_property;
+
+  RETURN json_build_object(
+    'success', true,
+    'property_id', v_property.id,
+    'auto_booking_enabled', v_property.auto_booking_enabled,
+    'auto_booking_starts_on', v_property.auto_booking_starts_on
+  );
 END;
 $function$
 
@@ -25109,6 +25180,10 @@ CREATE TRIGGER trg_profiles_fullname BEFORE INSERT OR UPDATE OF firstname, middl
 CREATE TRIGGER promotion_config_audit_no_delete BEFORE DELETE ON promotion_config_audit FOR EACH ROW EXECUTE FUNCTION prevent_promotion_config_audit_mutation();
 
 CREATE TRIGGER promotion_config_audit_no_update BEFORE UPDATE ON promotion_config_audit FOR EACH ROW EXECUTE FUNCTION prevent_promotion_config_audit_mutation();
+
+CREATE TRIGGER properties_guard_auto_booking_enabled BEFORE INSERT OR UPDATE OF auto_booking_enabled ON properties FOR EACH ROW EXECUTE FUNCTION properties_guard_auto_booking_enabled();
+
+CREATE TRIGGER property_preferred_cleaners_require_approved BEFORE INSERT OR UPDATE OF cleaner_id ON property_preferred_cleaners FOR EACH ROW EXECUTE FUNCTION property_preferred_cleaners_require_approved();
 
 
 -- === EVENT TRIGGERS (summary; DDL in schema.sql) ===

@@ -6706,15 +6706,7 @@ DECLARE
   v_in_transit numeric;
   v_estimated numeric;
   v_total numeric;
-  v_uid uuid := auth.uid();
 BEGIN
-  -- Authenticated JWT callers may only read their own earnings.
-  -- service_role / SQL runners (auth.uid() NULL) remain allowed for ops/tests.
-  IF v_uid IS NOT NULL AND v_uid IS DISTINCT FROM p_user_id THEN
-    RAISE EXCEPTION 'Not authorized'
-      USING ERRCODE = '42501';
-  END IF;
-
   -- Paid jobs not yet completed: sum authoritative cleaner payout snapshot.
   SELECT COALESCE(
     SUM(
@@ -6739,24 +6731,15 @@ BEGIN
   FROM public.wallets
   WHERE user_id = p_user_id;
 
-  -- Period total: job earnings only (booking-linked credits).
-  -- Exclude withdrawal refund/reversal credits and other non-job credits.
-  -- Half-open range avoids missing or double-counting boundary timestamps.
-  SELECT COALESCE(SUM(wt.amount_subunit), 0)
-  INTO v_total
-  FROM public.wallet_transactions wt
-  JOIN public.wallets w
-    ON w.id = wt.wallet_id
-  WHERE w.user_id = p_user_id
-    AND wt.type = 'credit'
-    AND wt.booking_id IS NOT NULL
-    AND wt.withdrawal_request_id IS NULL
-    AND wt.created_at >= p_start_date
-    AND wt.created_at < p_end_date;
+  SELECT COALESCE(SUM(amount_subunit), 0) INTO v_total
+  FROM public.wallet_transactions
+  WHERE wallet_id = (SELECT id FROM public.wallets WHERE user_id = p_user_id)
+    AND type = 'credit'
+    AND created_at BETWEEN p_start_date AND p_end_date;
 
   RETURN json_build_object(
     'inTransit', ROUND(v_in_transit),
-    'estimatedPayout', COALESCE(v_estimated, 0),
+    'estimatedPayout', v_estimated,
     'total', v_total
   );
 END;
@@ -7997,116 +7980,6 @@ $$;
 
 
 ALTER FUNCTION "public"."get_available_timeslots_old"("p_booking_date" "date", "p_timezone" "text", "p_duration_hours" numeric) OWNER TO "postgres";
-
-
-CREATE OR REPLACE FUNCTION "public"."get_best_available_cleaners"("p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer, "p_requested_services" "text"[]) RETURNS TABLE("cleaner_id" "uuid", "cleaner_name" "text", "avatar_url" "text", "bio" "text", "hourly_rate" numeric, "rating" double precision, "distance_meters" double precision, "final_score" double precision)
-    LANGUAGE "plpgsql" STABLE
-    AS $$
-DECLARE
-  v_cust_id uuid := auth.uid();
-  v_booking_range tstzrange;
-  v_cust_loc geography := ST_SetSRID(ST_MakePoint(p_lng, p_lat), 4326)::geography;
-BEGIN
-  IF v_cust_id IS NULL THEN
-    RAISE EXCEPTION 'Not authorized';
-  END IF;
-
-  v_booking_range := tstzrange(
-    (p_date + p_time)::timestamptz,
-    (p_date + p_time + (p_duration || ' hours')::interval)::timestamptz,
-    '[)'
-  );
-
-  RETURN QUERY
-  WITH available_cleaners AS (
-    SELECT
-      cd.user_id AS cleaner_user_id,
-      p.fullname AS cleaner_fullname,
-      p.avatar_url AS profile_avatar_url,
-      COALESCE(cd.bio, p.bio) AS profile_bio,
-      cd.hourly_rate AS cleaner_hourly_rate,
-      cd.rating AS cleaner_rating,
-      cd.skills AS cleaner_skills,
-      cd.specialties AS cleaner_specialties,
-      COALESCE(cd.base_location::geography, p.location_wkt) AS effective_location,
-      ST_Distance(
-        COALESCE(cd.base_location::geography, p.location_wkt),
-        v_cust_loc
-      )::float AS dist
-    FROM public.cleaner_data cd
-    JOIN public.profiles p ON p.user_id = cd.user_id
-    WHERE cd.status = 'active'
-      AND cd.verified = true
-      AND COALESCE(cd.base_location::geography, p.location_wkt) IS NOT NULL
-      AND (
-        auth.uid() = cd.user_id
-        OR public.is_profile_discoverable_by_others(p)
-      )
-      AND ST_DWithin(
-        COALESCE(cd.base_location::geography, p.location_wkt),
-        v_cust_loc,
-        LEAST(
-          COALESCE(cd.max_travel_distance_meters, p_max_distance_meters),
-          p_max_distance_meters
-        )
-      )
-      AND NOT EXISTS (
-        SELECT 1
-        FROM public.bookings b
-        WHERE b.cleaner_id = cd.user_id
-          AND b.booking_period && v_booking_range
-          AND b.status != 'cancelled'
-      )
-      AND NOT EXISTS (
-        SELECT 1
-        FROM public.cleaner_availability_exceptions cae
-        WHERE cae.cleaner_id = cd.user_id
-          AND cae.exception_date = p_date
-      )
-  ),
-  scored_cleaners AS (
-    SELECT
-      ac.cleaner_user_id,
-      ac.cleaner_fullname,
-      ac.profile_avatar_url,
-      ac.profile_bio,
-      ac.cleaner_hourly_rate,
-      ac.cleaner_rating,
-      ac.cleaner_skills,
-      ac.cleaner_specialties,
-      ac.dist,
-      CASE
-        WHEN cardinality(COALESCE(p_requested_services, ARRAY[]::text[])) > 0
-        THEN (
-          SELECT count(*)::float / cardinality(p_requested_services)
-          FROM unnest(p_requested_services) s
-          WHERE s = ANY(COALESCE(ac.cleaner_skills, ARRAY[]::text[]))
-             OR s = ANY(COALESCE(ac.cleaner_specialties, ARRAY[]::text[]))
-        ) * 40
-        ELSE 20
-      END AS s_score
-    FROM available_cleaners ac
-  )
-  SELECT
-    sc.cleaner_user_id AS cleaner_id,
-    sc.cleaner_fullname AS cleaner_name,
-    sc.profile_avatar_url AS avatar_url,
-    sc.profile_bio AS bio,
-    sc.cleaner_hourly_rate AS hourly_rate,
-    sc.cleaner_rating::float AS rating,
-    sc.dist::float AS distance_meters,
-    (
-      (GREATEST(0, (1.0 - (sc.dist / p_max_distance_meters))) * 30)
-      + (COALESCE(sc.cleaner_rating, 0) / 5.0 * 30)
-      + sc.s_score
-    )::float AS final_score
-  FROM scored_cleaners sc
-  ORDER BY final_score DESC, sc.dist ASC;
-END;
-$$;
-
-
-ALTER FUNCTION "public"."get_best_available_cleaners"("p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer, "p_requested_services" "text"[]) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."get_best_available_cleaners"("p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer, "p_requested_services" "text"[], "p_exclude_booking_id" "uuid" DEFAULT NULL::"uuid", "p_requested_category" "public"."service_category" DEFAULT NULL::"public"."service_category") RETURNS TABLE("cleaner_id" "uuid", "cleaner_name" "text", "avatar_url" "text", "bio" "text", "hourly_rate" numeric, "rating" double precision, "review_count" integer, "completed_jobs" integer, "distance_meters" double precision, "final_score" double precision, "company_name" "text", "team_size" integer, "team_role" "text", "specialties" "text"[])
@@ -12623,6 +12496,57 @@ $$;
 ALTER FUNCTION "public"."promotion_row_audit_snapshot"("p_slug" "text", "p_headline" "text", "p_terms_markdown" "text", "p_type" "text", "p_value" numeric, "p_max_duration_hours" numeric, "p_eligible_service_ids" integer[], "p_exclude_extra_tasks" boolean, "p_requires_service_area" boolean, "p_active" boolean, "p_valid_from" timestamp with time zone, "p_valid_to" timestamp with time zone, "p_requires_new_customer" boolean, "p_max_redemptions" integer, "p_max_redemptions_per_user" integer, "p_allow_recurring" boolean) OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."properties_guard_auto_booking_enabled"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.auto_booking_enabled IS TRUE
+       AND coalesce(current_setting('instaclean.allow_auto_booking_toggle', true), '')
+           IS DISTINCT FROM 'on' THEN
+      NEW.auto_booking_enabled := false;
+    END IF;
+    RETURN NEW;
+  END IF;
+
+  IF NEW.auto_booking_enabled IS DISTINCT FROM OLD.auto_booking_enabled
+     AND coalesce(current_setting('instaclean.allow_auto_booking_toggle', true), '')
+         IS DISTINCT FROM 'on' THEN
+    RAISE EXCEPTION 'auto_booking_enabled must be changed via set_property_auto_booking_enabled'
+      USING ERRCODE = '42501';
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."properties_guard_auto_booking_enabled"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."property_preferred_cleaners_require_approved"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM public.cleaner_data cd
+    WHERE cd.user_id = NEW.cleaner_id
+      AND cd.status = 'active'::public.cleaner_status
+  ) THEN
+    RAISE EXCEPTION 'cleaner_not_eligible'
+      USING ERRCODE = 'check_violation';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."property_preferred_cleaners_require_approved"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."psk_transaction"("p_booking_id" "uuid", "p_user_id" "uuid", "p_reference" "text", "p_paystack_id" bigint, "p_amount" numeric, "p_fee_amount" numeric, "p_total_captured" numeric, "p_currency" "text", "p_metadata" "jsonb") RETURNS "public"."psk_transaction"
     LANGUAGE "plpgsql" SECURITY DEFINER
     AS $$
@@ -14952,6 +14876,78 @@ $$;
 ALTER FUNCTION "public"."sanitize_cleaner_search_query"("p_search_query" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."save_property_information"("p_property_id" "uuid", "p_trash_notes" "text" DEFAULT NULL::"text", "p_supplies_notes" "text" DEFAULT NULL::"text", "p_other_notes" "text" DEFAULT NULL::"text", "p_access_notes" "text" DEFAULT NULL::"text", "p_wifi_network" "text" DEFAULT NULL::"text", "p_wifi_password" "text" DEFAULT NULL::"text", "p_parking_notes" "text" DEFAULT NULL::"text") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_uid uuid := auth.uid();
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  IF p_property_id IS NULL THEN
+    RETURN jsonb_build_object('success', false, 'error', 'property_required');
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM public.properties
+    WHERE id = p_property_id
+      AND customer_id = v_uid
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'property_not_found');
+  END IF;
+
+  UPDATE public.properties
+  SET
+    trash_notes = nullif(btrim(COALESCE(p_trash_notes, '')), ''),
+    supplies_notes = nullif(btrim(COALESCE(p_supplies_notes, '')), ''),
+    other_notes = nullif(btrim(COALESCE(p_other_notes, '')), ''),
+    updated_at = now()
+  WHERE id = p_property_id
+    AND customer_id = v_uid;
+
+  INSERT INTO public.property_private_instructions (
+    property_id,
+    owner_id,
+    access_notes,
+    wifi_network,
+    wifi_password,
+    parking_notes,
+    updated_at
+  )
+  VALUES (
+    p_property_id,
+    v_uid,
+    nullif(btrim(COALESCE(p_access_notes, '')), ''),
+    nullif(btrim(COALESCE(p_wifi_network, '')), ''),
+    nullif(btrim(COALESCE(p_wifi_password, '')), ''),
+    nullif(btrim(COALESCE(p_parking_notes, '')), ''),
+    now()
+  )
+  ON CONFLICT (property_id)
+  DO UPDATE SET
+    owner_id = EXCLUDED.owner_id,
+    access_notes = EXCLUDED.access_notes,
+    wifi_network = EXCLUDED.wifi_network,
+    wifi_password = EXCLUDED.wifi_password,
+    parking_notes = EXCLUDED.parking_notes,
+    updated_at = now();
+
+  RETURN jsonb_build_object('success', true);
+END;
+$$;
+
+
+ALTER FUNCTION "public"."save_property_information"("p_property_id" "uuid", "p_trash_notes" "text", "p_supplies_notes" "text", "p_other_notes" "text", "p_access_notes" "text", "p_wifi_network" "text", "p_wifi_password" "text", "p_parking_notes" "text") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."save_property_information"("p_property_id" "uuid", "p_trash_notes" "text", "p_supplies_notes" "text", "p_other_notes" "text", "p_access_notes" "text", "p_wifi_network" "text", "p_wifi_password" "text", "p_parking_notes" "text") IS 'Atomically save general property notes and private credential vault for the signed-in owner.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."search_available_cleaners"("p_lat" double precision, "p_lng" double precision, "p_date" "date", "p_time" time without time zone, "p_duration" double precision, "p_requested_services" "text"[] DEFAULT '{}'::"text"[], "p_max_distance_meters" double precision DEFAULT 50000) RETURNS TABLE("cleaner_id" "uuid", "cleaner_name" "text", "avatar_url" "text", "rating" double precision, "distance_meters" double precision, "matching_skills_count" integer, "total_skills_count" integer)
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     AS $$
@@ -15253,7 +15249,24 @@ CREATE TABLE IF NOT EXISTS "public"."properties" (
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "is_default" boolean DEFAULT false NOT NULL,
-    CONSTRAINT "properties_name_not_blank" CHECK (("char_length"("btrim"("name")) > 0))
+    "bedroom_count" integer DEFAULT 2 NOT NULL,
+    "bathroom_count" integer DEFAULT 3 NOT NULL,
+    "default_duration_hours" numeric(4,2) DEFAULT 2.50 NOT NULL,
+    "provides_cleaning_supplies" boolean DEFAULT false NOT NULL,
+    "wash_dry_linen" boolean DEFAULT false NOT NULL,
+    "auto_booking_enabled" boolean DEFAULT false NOT NULL,
+    "auto_booking_starts_on" "date",
+    "turnover_defaults_confirmed" boolean DEFAULT false NOT NULL,
+    "trash_notes" "text",
+    "supplies_notes" "text",
+    "other_notes" "text",
+    CONSTRAINT "properties_bathroom_count_range" CHECK ((("bathroom_count" >= 1) AND ("bathroom_count" <= 10))),
+    CONSTRAINT "properties_bedroom_count_range" CHECK ((("bedroom_count" >= 1) AND ("bedroom_count" <= 10))),
+    CONSTRAINT "properties_default_duration_hours_range" CHECK ((("default_duration_hours" >= (1)::numeric) AND ("default_duration_hours" <= (16)::numeric))),
+    CONSTRAINT "properties_name_not_blank" CHECK (("char_length"("btrim"("name")) > 0)),
+    CONSTRAINT "properties_other_notes_len" CHECK ((("other_notes" IS NULL) OR ("char_length"("other_notes") <= 2000))),
+    CONSTRAINT "properties_supplies_notes_len" CHECK ((("supplies_notes" IS NULL) OR ("char_length"("supplies_notes") <= 2000))),
+    CONSTRAINT "properties_trash_notes_len" CHECK ((("trash_notes" IS NULL) OR ("char_length"("trash_notes") <= 2000)))
 );
 
 
@@ -15265,6 +15278,50 @@ COMMENT ON TABLE "public"."properties" IS 'Customer-owned rental properties used
 
 
 COMMENT ON COLUMN "public"."properties"."is_default" IS 'When true, this property is suggested on the booking location step.';
+
+
+
+COMMENT ON COLUMN "public"."properties"."bedroom_count" IS 'Provisional bedroom/room default for turnover duration until confirmed by the host.';
+
+
+
+COMMENT ON COLUMN "public"."properties"."bathroom_count" IS 'Provisional bathroom default for turnover duration until confirmed by the host.';
+
+
+
+COMMENT ON COLUMN "public"."properties"."default_duration_hours" IS 'Provisional visit duration (hours) for auto-booked turnovers until confirmed by the host.';
+
+
+
+COMMENT ON COLUMN "public"."properties"."provides_cleaning_supplies" IS 'Host provides cleaning supplies for turnovers at this property.';
+
+
+
+COMMENT ON COLUMN "public"."properties"."wash_dry_linen" IS 'Default: wash and dry linen/towels for turnovers at this property.';
+
+
+
+COMMENT ON COLUMN "public"."properties"."auto_booking_enabled" IS 'When true (via set_property_auto_booking_enabled), checkout windows may auto-create turnover bookings.';
+
+
+
+COMMENT ON COLUMN "public"."properties"."auto_booking_starts_on" IS 'Optional date after which auto-booking may create jobs (null = from next eligible checkout).';
+
+
+
+COMMENT ON COLUMN "public"."properties"."turnover_defaults_confirmed" IS 'True after the host saves turnover configuration. Required before enabling auto-booking.';
+
+
+
+COMMENT ON COLUMN "public"."properties"."trash_notes" IS 'Trash and recycling instructions for this property.';
+
+
+
+COMMENT ON COLUMN "public"."properties"."supplies_notes" IS 'Where cleaning supplies are kept, or notes when the host provides them.';
+
+
+
+COMMENT ON COLUMN "public"."properties"."other_notes" IS 'Additional non-credential host notes for cleaners at this property.';
 
 
 
@@ -15369,6 +15426,93 @@ $$;
 
 
 ALTER FUNCTION "public"."set_platform_config_updated_at"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."set_property_auto_booking_enabled"("p_property_id" "uuid", "p_enabled" boolean) RETURNS json
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_property public.properties%ROWTYPE;
+  v_has_active_feed boolean := false;
+BEGIN
+  IF v_uid IS NULL THEN
+    RETURN json_build_object('success', false, 'error', 'not_authenticated');
+  END IF;
+
+  IF p_property_id IS NULL THEN
+    RETURN json_build_object('success', false, 'error', 'property_required');
+  END IF;
+
+  SELECT *
+  INTO v_property
+  FROM public.properties
+  WHERE id = p_property_id
+    AND customer_id = v_uid
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN json_build_object('success', false, 'error', 'property_not_found');
+  END IF;
+
+  IF p_enabled IS TRUE THEN
+    IF v_property.turnover_defaults_confirmed IS NOT TRUE THEN
+      RETURN json_build_object('success', false, 'error', 'defaults_unconfirmed');
+    END IF;
+
+    SELECT EXISTS (
+      SELECT 1
+      FROM public.property_calendar_feeds f
+      WHERE f.property_id = p_property_id
+        AND f.owner_id = v_uid
+        AND f.sync_enabled IS TRUE
+    )
+    INTO v_has_active_feed;
+
+    IF v_has_active_feed IS NOT TRUE THEN
+      RETURN json_build_object('success', false, 'error', 'calendar_required');
+    END IF;
+  END IF;
+
+  PERFORM set_config('instaclean.allow_auto_booking_toggle', 'on', true);
+
+  UPDATE public.properties
+  SET
+    auto_booking_enabled = coalesce(p_enabled, false),
+    auto_booking_starts_on = CASE
+      WHEN coalesce(p_enabled, false) THEN
+        coalesce(
+          auto_booking_starts_on,
+          (
+            timezone(
+              coalesce(nullif(v_property.timezone, ''), 'Africa/Accra'),
+              now()
+            )
+          )::date
+        )
+      ELSE NULL
+    END,
+    updated_at = now()
+  WHERE id = p_property_id
+    AND customer_id = v_uid
+  RETURNING * INTO v_property;
+
+  RETURN json_build_object(
+    'success', true,
+    'property_id', v_property.id,
+    'auto_booking_enabled', v_property.auto_booking_enabled,
+    'auto_booking_starts_on', v_property.auto_booking_starts_on
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."set_property_auto_booking_enabled"("p_property_id" "uuid", "p_enabled" boolean) OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."set_property_auto_booking_enabled"("p_property_id" "uuid", "p_enabled" boolean) IS 'Enable/disable property auto-booking only when the host owns the property, defaults are confirmed, and an active calendar feed exists.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."set_updated_at"() RETURNS "trigger"
@@ -17723,6 +17867,53 @@ COMMENT ON TABLE "public"."account_merges" IS 'Audit log when an admin merges tw
 
 
 
+CREATE TABLE IF NOT EXISTS "public"."admin_broadcasts" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "created_by" "uuid" NOT NULL,
+    "idempotency_key" "text" NOT NULL,
+    "segment" "text" NOT NULL,
+    "purpose" "text" NOT NULL,
+    "notification_type" "text" NOT NULL,
+    "title" "text" NOT NULL,
+    "message" "text" NOT NULL,
+    "screen" "text",
+    "channels" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    "whatsapp_content_sid" "text",
+    "requires_marketing_consent" boolean DEFAULT false NOT NULL,
+    "status" "text" DEFAULT 'pending'::"text" NOT NULL,
+    "segment_total_count" integer DEFAULT 0 NOT NULL,
+    "selected_for_run_count" integer DEFAULT 0 NOT NULL,
+    "eligible_count" integer DEFAULT 0 NOT NULL,
+    "skipped_prefs_count" integer DEFAULT 0 NOT NULL,
+    "stats" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    "error_message" "text",
+    "started_at" timestamp with time zone,
+    "completed_at" timestamp with time zone,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "delivery_mode" "text" DEFAULT 'sync'::"text" NOT NULL,
+    "process_offset" integer DEFAULT 0 NOT NULL,
+    "recipient_user_ids" "jsonb" DEFAULT '[]'::"jsonb" NOT NULL,
+    CONSTRAINT "admin_broadcasts_delivery_mode_check" CHECK (("delivery_mode" = ANY (ARRAY['sync'::"text", 'worker'::"text"]))),
+    CONSTRAINT "admin_broadcasts_purpose_check" CHECK (("purpose" = ANY (ARRAY['transactional'::"text", 'service_update'::"text", 'marketing'::"text"]))),
+    CONSTRAINT "admin_broadcasts_status_check" CHECK (("status" = ANY (ARRAY['pending'::"text", 'queued'::"text", 'sending'::"text", 'completed'::"text", 'failed'::"text", 'duplicate'::"text"])))
+);
+
+
+ALTER TABLE "public"."admin_broadcasts" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."admin_broadcasts"."delivery_mode" IS 'sync = delivered in the admin server action; worker = chunked edge function delivery.';
+
+
+
+COMMENT ON COLUMN "public"."admin_broadcasts"."process_offset" IS 'Worker progress index into recipient_user_ids.';
+
+
+
+COMMENT ON COLUMN "public"."admin_broadcasts"."recipient_user_ids" IS 'Ordered snapshot of target user ids for worker delivery (json array of uuid strings).';
+
+
+
 CREATE TABLE IF NOT EXISTS "public"."admin_cash_payouts" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "cleaner_id" "uuid" NOT NULL,
@@ -19710,6 +19901,72 @@ COMMENT ON COLUMN "public"."property_calendar_feeds"."feed_url_hash" IS 'SHA-256
 
 
 
+CREATE TABLE IF NOT EXISTS "public"."property_media" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "property_id" "uuid" NOT NULL,
+    "owner_id" "uuid" NOT NULL,
+    "media_type" "text" DEFAULT 'photo'::"text" NOT NULL,
+    "storage_path" "text" NOT NULL,
+    "caption" "text",
+    "sort_order" integer DEFAULT 0 NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "property_media_caption_len" CHECK ((("caption" IS NULL) OR ("char_length"("caption") <= 500))),
+    CONSTRAINT "property_media_type_check" CHECK (("media_type" = ANY (ARRAY['photo'::"text", 'video'::"text"])))
+);
+
+
+ALTER TABLE "public"."property_media" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."property_media_cleanup_failures" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "media_id" "uuid",
+    "property_id" "uuid",
+    "owner_id" "uuid",
+    "storage_path" "text" NOT NULL,
+    "error_message" "text",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."property_media_cleanup_failures" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."property_preferred_cleaners" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "property_id" "uuid" NOT NULL,
+    "owner_id" "uuid" NOT NULL,
+    "cleaner_id" "uuid" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."property_preferred_cleaners" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."property_private_instructions" (
+    "property_id" "uuid" NOT NULL,
+    "owner_id" "uuid" NOT NULL,
+    "access_notes" "text",
+    "wifi_network" "text",
+    "wifi_password" "text",
+    "parking_notes" "text",
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "property_private_instructions_access_notes_len" CHECK ((("access_notes" IS NULL) OR ("char_length"("access_notes") <= 2000))),
+    CONSTRAINT "property_private_instructions_parking_notes_len" CHECK ((("parking_notes" IS NULL) OR ("char_length"("parking_notes") <= 2000))),
+    CONSTRAINT "property_private_instructions_wifi_network_len" CHECK ((("wifi_network" IS NULL) OR ("char_length"("wifi_network") <= 255))),
+    CONSTRAINT "property_private_instructions_wifi_password_len" CHECK ((("wifi_password" IS NULL) OR ("char_length"("wifi_password") <= 255)))
+);
+
+
+ALTER TABLE "public"."property_private_instructions" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."property_private_instructions" IS 'Owner-only vault for access codes, Wi‑Fi credentials, and parking notes. Not on the broad properties row.';
+
+
+
 CREATE TABLE IF NOT EXISTS "public"."reviewer_permissions" (
     "user_id" "uuid" NOT NULL,
     "permission_key" "text" NOT NULL,
@@ -20272,6 +20529,16 @@ ALTER TABLE ONLY "public"."account_merges"
 
 
 
+ALTER TABLE ONLY "public"."admin_broadcasts"
+    ADD CONSTRAINT "admin_broadcasts_idempotency_key_unique" UNIQUE ("idempotency_key");
+
+
+
+ALTER TABLE ONLY "public"."admin_broadcasts"
+    ADD CONSTRAINT "admin_broadcasts_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."admin_cash_payouts"
     ADD CONSTRAINT "admin_cash_payouts_pkey" PRIMARY KEY ("id");
 
@@ -20787,6 +21054,36 @@ ALTER TABLE ONLY "public"."property_calendar_feeds"
 
 
 
+ALTER TABLE ONLY "public"."property_media_cleanup_failures"
+    ADD CONSTRAINT "property_media_cleanup_failures_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."property_media"
+    ADD CONSTRAINT "property_media_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."property_media"
+    ADD CONSTRAINT "property_media_storage_path_unique" UNIQUE ("storage_path");
+
+
+
+ALTER TABLE ONLY "public"."property_preferred_cleaners"
+    ADD CONSTRAINT "property_preferred_cleaners_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."property_preferred_cleaners"
+    ADD CONSTRAINT "property_preferred_cleaners_unique" UNIQUE ("property_id", "cleaner_id");
+
+
+
+ALTER TABLE ONLY "public"."property_private_instructions"
+    ADD CONSTRAINT "property_private_instructions_pkey" PRIMARY KEY ("property_id");
+
+
+
 ALTER TABLE ONLY "public"."psk_transaction"
     ADD CONSTRAINT "psk_transaction_pkey" PRIMARY KEY ("id");
 
@@ -21172,6 +21469,18 @@ CREATE INDEX "gha_staging_geom_idx" ON "public"."gha_staging" USING "gist" ("geo
 
 
 CREATE INDEX "idx_active_rules" ON "public"."deduction_rules" USING "btree" ("is_active", "start_date") WHERE (("is_active" = true) AND ("end_date" IS NULL));
+
+
+
+CREATE INDEX "idx_admin_broadcasts_created_at" ON "public"."admin_broadcasts" USING "btree" ("created_at" DESC);
+
+
+
+CREATE INDEX "idx_admin_broadcasts_created_by" ON "public"."admin_broadcasts" USING "btree" ("created_by", "created_at" DESC);
+
+
+
+CREATE INDEX "idx_admin_broadcasts_worker_queue" ON "public"."admin_broadcasts" USING "btree" ("created_at") WHERE ("status" = ANY (ARRAY['queued'::"text", 'sending'::"text"]));
 
 
 
@@ -21879,6 +22188,18 @@ CREATE INDEX "property_calendar_feeds_sync_due_idx" ON "public"."property_calend
 
 
 
+CREATE INDEX "property_media_property_id_idx" ON "public"."property_media" USING "btree" ("property_id", "sort_order", "created_at");
+
+
+
+CREATE INDEX "property_preferred_cleaners_owner_id_idx" ON "public"."property_preferred_cleaners" USING "btree" ("owner_id");
+
+
+
+CREATE INDEX "property_preferred_cleaners_property_id_idx" ON "public"."property_preferred_cleaners" USING "btree" ("property_id");
+
+
+
 CREATE UNIQUE INDEX "reviews_booking_reviewer_key" ON "public"."reviews" USING "btree" ("booking_id", "reviewer_id") WHERE ("booking_id" IS NOT NULL);
 
 
@@ -21991,6 +22312,14 @@ CREATE OR REPLACE TRIGGER "promotion_config_audit_no_update" BEFORE UPDATE ON "p
 
 
 
+CREATE OR REPLACE TRIGGER "properties_guard_auto_booking_enabled" BEFORE INSERT OR UPDATE OF "auto_booking_enabled" ON "public"."properties" FOR EACH ROW EXECUTE FUNCTION "public"."properties_guard_auto_booking_enabled"();
+
+
+
+CREATE OR REPLACE TRIGGER "property_preferred_cleaners_require_approved" BEFORE INSERT OR UPDATE OF "cleaner_id" ON "public"."property_preferred_cleaners" FOR EACH ROW EXECUTE FUNCTION "public"."property_preferred_cleaners_require_approved"();
+
+
+
 CREATE OR REPLACE TRIGGER "release_promotion_on_booking_cancelled" AFTER UPDATE OF "status" ON "public"."bookings" FOR EACH ROW EXECUTE FUNCTION "public"."trg_release_promotion_on_booking_cancelled"();
 
 
@@ -22072,6 +22401,11 @@ CREATE OR REPLACE TRIGGER "trigger_update_cleaner_availability_exceptions_update
 
 
 CREATE OR REPLACE TRIGGER "update_platform_fees_updated_at" BEFORE UPDATE ON "public"."platform_fees" FOR EACH ROW EXECUTE FUNCTION "public"."update_platform_fees_updated_at"();
+
+
+
+ALTER TABLE ONLY "public"."admin_broadcasts"
+    ADD CONSTRAINT "admin_broadcasts_created_by_fkey" FOREIGN KEY ("created_by") REFERENCES "auth"."users"("id") ON DELETE RESTRICT;
 
 
 
@@ -22580,6 +22914,41 @@ ALTER TABLE ONLY "public"."property_calendar_feeds"
 
 
 
+ALTER TABLE ONLY "public"."property_media"
+    ADD CONSTRAINT "property_media_owner_id_fkey" FOREIGN KEY ("owner_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."property_media"
+    ADD CONSTRAINT "property_media_property_id_fkey" FOREIGN KEY ("property_id") REFERENCES "public"."properties"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."property_preferred_cleaners"
+    ADD CONSTRAINT "property_preferred_cleaners_cleaner_id_fkey" FOREIGN KEY ("cleaner_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."property_preferred_cleaners"
+    ADD CONSTRAINT "property_preferred_cleaners_owner_id_fkey" FOREIGN KEY ("owner_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."property_preferred_cleaners"
+    ADD CONSTRAINT "property_preferred_cleaners_property_id_fkey" FOREIGN KEY ("property_id") REFERENCES "public"."properties"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."property_private_instructions"
+    ADD CONSTRAINT "property_private_instructions_owner_id_fkey" FOREIGN KEY ("owner_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."property_private_instructions"
+    ADD CONSTRAINT "property_private_instructions_property_id_fkey" FOREIGN KEY ("property_id") REFERENCES "public"."properties"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."psk_transaction"
     ADD CONSTRAINT "psk_transaction_booking_id_fkey" FOREIGN KEY ("booking_id") REFERENCES "public"."bookings"("id") ON DELETE CASCADE;
 
@@ -22990,6 +23359,9 @@ CREATE POLICY "View_Own_Conversations" ON "public"."conversations" FOR SELECT US
 
 
 ALTER TABLE "public"."account_merges" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."admin_broadcasts" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."admin_cash_payouts" ENABLE ROW LEVEL SECURITY;
@@ -23621,6 +23993,84 @@ CREATE POLICY "property_calendar_feeds_select_own" ON "public"."property_calenda
 
 
 CREATE POLICY "property_calendar_feeds_update_own" ON "public"."property_calendar_feeds" FOR UPDATE TO "authenticated" USING (("owner_id" = "auth"."uid"())) WITH CHECK (("owner_id" = "auth"."uid"()));
+
+
+
+ALTER TABLE "public"."property_media" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."property_media_cleanup_failures" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "property_media_insert_own" ON "public"."property_media" FOR INSERT TO "authenticated" WITH CHECK ((("owner_id" = "auth"."uid"()) AND (EXISTS ( SELECT 1
+   FROM "public"."properties" "p"
+  WHERE (("p"."id" = "property_media"."property_id") AND ("p"."customer_id" = "auth"."uid"()))))));
+
+
+
+CREATE POLICY "property_media_select_own" ON "public"."property_media" FOR SELECT TO "authenticated" USING ((("owner_id" = "auth"."uid"()) AND (EXISTS ( SELECT 1
+   FROM "public"."properties" "p"
+  WHERE (("p"."id" = "property_media"."property_id") AND ("p"."customer_id" = "auth"."uid"()))))));
+
+
+
+CREATE POLICY "property_media_update_own" ON "public"."property_media" FOR UPDATE TO "authenticated" USING ((("owner_id" = "auth"."uid"()) AND (EXISTS ( SELECT 1
+   FROM "public"."properties" "p"
+  WHERE (("p"."id" = "property_media"."property_id") AND ("p"."customer_id" = "auth"."uid"())))))) WITH CHECK ((("owner_id" = "auth"."uid"()) AND (EXISTS ( SELECT 1
+   FROM "public"."properties" "p"
+  WHERE (("p"."id" = "property_media"."property_id") AND ("p"."customer_id" = "auth"."uid"()))))));
+
+
+
+ALTER TABLE "public"."property_preferred_cleaners" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "property_preferred_cleaners_delete_own" ON "public"."property_preferred_cleaners" FOR DELETE TO "authenticated" USING ((("owner_id" = "auth"."uid"()) AND (EXISTS ( SELECT 1
+   FROM "public"."properties" "p"
+  WHERE (("p"."id" = "property_preferred_cleaners"."property_id") AND ("p"."customer_id" = "auth"."uid"()))))));
+
+
+
+CREATE POLICY "property_preferred_cleaners_insert_own" ON "public"."property_preferred_cleaners" FOR INSERT TO "authenticated" WITH CHECK ((("owner_id" = "auth"."uid"()) AND (EXISTS ( SELECT 1
+   FROM "public"."properties" "p"
+  WHERE (("p"."id" = "property_preferred_cleaners"."property_id") AND ("p"."customer_id" = "auth"."uid"())))) AND (EXISTS ( SELECT 1
+   FROM "public"."cleaner_data" "cd"
+  WHERE (("cd"."user_id" = "property_preferred_cleaners"."cleaner_id") AND ("cd"."status" = 'active'::"public"."cleaner_status"))))));
+
+
+
+CREATE POLICY "property_preferred_cleaners_select_own" ON "public"."property_preferred_cleaners" FOR SELECT TO "authenticated" USING ((("owner_id" = "auth"."uid"()) AND (EXISTS ( SELECT 1
+   FROM "public"."properties" "p"
+  WHERE (("p"."id" = "property_preferred_cleaners"."property_id") AND ("p"."customer_id" = "auth"."uid"()))))));
+
+
+
+ALTER TABLE "public"."property_private_instructions" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "property_private_instructions_delete_own" ON "public"."property_private_instructions" FOR DELETE TO "authenticated" USING ((("owner_id" = "auth"."uid"()) AND (EXISTS ( SELECT 1
+   FROM "public"."properties" "p"
+  WHERE (("p"."id" = "property_private_instructions"."property_id") AND ("p"."customer_id" = "auth"."uid"()))))));
+
+
+
+CREATE POLICY "property_private_instructions_insert_own" ON "public"."property_private_instructions" FOR INSERT TO "authenticated" WITH CHECK ((("owner_id" = "auth"."uid"()) AND (EXISTS ( SELECT 1
+   FROM "public"."properties" "p"
+  WHERE (("p"."id" = "property_private_instructions"."property_id") AND ("p"."customer_id" = "auth"."uid"()))))));
+
+
+
+CREATE POLICY "property_private_instructions_select_own" ON "public"."property_private_instructions" FOR SELECT TO "authenticated" USING ((("owner_id" = "auth"."uid"()) AND (EXISTS ( SELECT 1
+   FROM "public"."properties" "p"
+  WHERE (("p"."id" = "property_private_instructions"."property_id") AND ("p"."customer_id" = "auth"."uid"()))))));
+
+
+
+CREATE POLICY "property_private_instructions_update_own" ON "public"."property_private_instructions" FOR UPDATE TO "authenticated" USING ((("owner_id" = "auth"."uid"()) AND (EXISTS ( SELECT 1
+   FROM "public"."properties" "p"
+  WHERE (("p"."id" = "property_private_instructions"."property_id") AND ("p"."customer_id" = "auth"."uid"())))))) WITH CHECK ((("owner_id" = "auth"."uid"()) AND (EXISTS ( SELECT 1
+   FROM "public"."properties" "p"
+  WHERE (("p"."id" = "property_private_instructions"."property_id") AND ("p"."customer_id" = "auth"."uid"()))))));
 
 
 
@@ -27823,12 +28273,6 @@ GRANT ALL ON FUNCTION "public"."get_available_timeslots_old"("p_booking_date" "d
 
 
 
-GRANT ALL ON FUNCTION "public"."get_best_available_cleaners"("p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer, "p_requested_services" "text"[]) TO "anon";
-GRANT ALL ON FUNCTION "public"."get_best_available_cleaners"("p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer, "p_requested_services" "text"[]) TO "authenticated";
-GRANT ALL ON FUNCTION "public"."get_best_available_cleaners"("p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer, "p_requested_services" "text"[]) TO "service_role";
-
-
-
 REVOKE ALL ON FUNCTION "public"."get_best_available_cleaners"("p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer, "p_requested_services" "text"[], "p_exclude_booking_id" "uuid", "p_requested_category" "public"."service_category") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."get_best_available_cleaners"("p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer, "p_requested_services" "text"[], "p_exclude_booking_id" "uuid", "p_requested_category" "public"."service_category") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."get_best_available_cleaners"("p_date" "date", "p_time" time without time zone, "p_duration" numeric, "p_lat" double precision, "p_lng" double precision, "p_max_distance_meters" integer, "p_requested_services" "text"[], "p_exclude_booking_id" "uuid", "p_requested_category" "public"."service_category") TO "service_role";
@@ -29064,6 +29508,18 @@ GRANT ALL ON FUNCTION "public"."promotion_row_audit_snapshot"("p_slug" "text", "
 
 
 
+GRANT ALL ON FUNCTION "public"."properties_guard_auto_booking_enabled"() TO "anon";
+GRANT ALL ON FUNCTION "public"."properties_guard_auto_booking_enabled"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."properties_guard_auto_booking_enabled"() TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."property_preferred_cleaners_require_approved"() TO "anon";
+GRANT ALL ON FUNCTION "public"."property_preferred_cleaners_require_approved"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."property_preferred_cleaners_require_approved"() TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."psk_transaction"("p_booking_id" "uuid", "p_user_id" "uuid", "p_reference" "text", "p_paystack_id" bigint, "p_amount" numeric, "p_fee_amount" numeric, "p_total_captured" numeric, "p_currency" "text", "p_metadata" "jsonb") TO "anon";
 GRANT ALL ON FUNCTION "public"."psk_transaction"("p_booking_id" "uuid", "p_user_id" "uuid", "p_reference" "text", "p_paystack_id" bigint, "p_amount" numeric, "p_fee_amount" numeric, "p_total_captured" numeric, "p_currency" "text", "p_metadata" "jsonb") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."psk_transaction"("p_booking_id" "uuid", "p_user_id" "uuid", "p_reference" "text", "p_paystack_id" bigint, "p_amount" numeric, "p_fee_amount" numeric, "p_total_captured" numeric, "p_currency" "text", "p_metadata" "jsonb") TO "service_role";
@@ -29362,6 +29818,12 @@ GRANT ALL ON FUNCTION "public"."sanitize_cleaner_search_query"("p_search_query" 
 
 
 
+REVOKE ALL ON FUNCTION "public"."save_property_information"("p_property_id" "uuid", "p_trash_notes" "text", "p_supplies_notes" "text", "p_other_notes" "text", "p_access_notes" "text", "p_wifi_network" "text", "p_wifi_password" "text", "p_parking_notes" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."save_property_information"("p_property_id" "uuid", "p_trash_notes" "text", "p_supplies_notes" "text", "p_other_notes" "text", "p_access_notes" "text", "p_wifi_network" "text", "p_wifi_password" "text", "p_parking_notes" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."save_property_information"("p_property_id" "uuid", "p_trash_notes" "text", "p_supplies_notes" "text", "p_other_notes" "text", "p_access_notes" "text", "p_wifi_network" "text", "p_wifi_password" "text", "p_parking_notes" "text") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."search_available_cleaners"("p_lat" double precision, "p_lng" double precision, "p_date" "date", "p_time" time without time zone, "p_duration" double precision, "p_requested_services" "text"[], "p_max_distance_meters" double precision) TO "anon";
 GRANT ALL ON FUNCTION "public"."search_available_cleaners"("p_lat" double precision, "p_lng" double precision, "p_date" "date", "p_time" time without time zone, "p_duration" double precision, "p_requested_services" "text"[], "p_max_distance_meters" double precision) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."search_available_cleaners"("p_lat" double precision, "p_lng" double precision, "p_date" "date", "p_time" time without time zone, "p_duration" double precision, "p_requested_services" "text"[], "p_max_distance_meters" double precision) TO "service_role";
@@ -29425,6 +29887,13 @@ GRANT ALL ON FUNCTION "public"."set_default_payout_method"("p_method_id" "uuid")
 GRANT ALL ON FUNCTION "public"."set_platform_config_updated_at"() TO "anon";
 GRANT ALL ON FUNCTION "public"."set_platform_config_updated_at"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."set_platform_config_updated_at"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."set_property_auto_booking_enabled"("p_property_id" "uuid", "p_enabled" boolean) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."set_property_auto_booking_enabled"("p_property_id" "uuid", "p_enabled" boolean) TO "anon";
+GRANT ALL ON FUNCTION "public"."set_property_auto_booking_enabled"("p_property_id" "uuid", "p_enabled" boolean) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."set_property_auto_booking_enabled"("p_property_id" "uuid", "p_enabled" boolean) TO "service_role";
 
 
 
@@ -32902,6 +33371,10 @@ GRANT ALL ON TABLE "public"."account_merges" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."admin_broadcasts" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."admin_cash_payouts" TO "service_role";
 
 
@@ -33427,6 +33900,29 @@ GRANT SELECT("created_at") ON TABLE "public"."property_calendar_feeds" TO "authe
 
 
 GRANT SELECT("updated_at"),UPDATE("updated_at") ON TABLE "public"."property_calendar_feeds" TO "authenticated";
+
+
+
+GRANT ALL ON TABLE "public"."property_media" TO "service_role";
+GRANT SELECT,INSERT,UPDATE ON TABLE "public"."property_media" TO "authenticated";
+
+
+
+GRANT ALL ON TABLE "public"."property_media_cleanup_failures" TO "anon";
+GRANT ALL ON TABLE "public"."property_media_cleanup_failures" TO "authenticated";
+GRANT ALL ON TABLE "public"."property_media_cleanup_failures" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."property_preferred_cleaners" TO "anon";
+GRANT ALL ON TABLE "public"."property_preferred_cleaners" TO "authenticated";
+GRANT ALL ON TABLE "public"."property_preferred_cleaners" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."property_private_instructions" TO "anon";
+GRANT ALL ON TABLE "public"."property_private_instructions" TO "authenticated";
+GRANT ALL ON TABLE "public"."property_private_instructions" TO "service_role";
 
 
 
