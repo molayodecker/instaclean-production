@@ -1744,6 +1744,82 @@ AS $function$
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.allocate_booking_customer_invoice_seq(p_booking_id uuid)
+ RETURNS integer
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_seq integer;
+BEGIN
+  IF p_booking_id IS NULL THEN
+    RAISE EXCEPTION 'booking_id required' USING ERRCODE = '22023';
+  END IF;
+
+  SELECT b.customer_invoice_seq
+  INTO v_seq
+  FROM public.bookings b
+  WHERE b.id = p_booking_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'booking not found: %', p_booking_id USING ERRCODE = 'P0002';
+  END IF;
+
+  IF v_seq IS NOT NULL THEN
+    RETURN v_seq;
+  END IF;
+
+  v_seq := nextval('public.customer_invoice_seq')::integer;
+
+  UPDATE public.bookings
+  SET customer_invoice_seq = v_seq
+  WHERE id = p_booking_id;
+
+  RETURN v_seq;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.allocate_schedule_group_customer_invoice_seq(p_group_id uuid)
+ RETURNS integer
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_seq integer;
+BEGIN
+  IF p_group_id IS NULL THEN
+    RAISE EXCEPTION 'group_id required' USING ERRCODE = '22023';
+  END IF;
+
+  SELECT g.customer_invoice_seq
+  INTO v_seq
+  FROM public.admin_booking_schedule_groups g
+  WHERE g.id = p_group_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'schedule group not found: %', p_group_id USING ERRCODE = 'P0002';
+  END IF;
+
+  IF v_seq IS NOT NULL THEN
+    RETURN v_seq;
+  END IF;
+
+  v_seq := nextval('public.customer_invoice_seq')::integer;
+
+  UPDATE public.admin_booking_schedule_groups
+  SET customer_invoice_seq = v_seq
+  WHERE id = p_group_id;
+
+  RETURN v_seq;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.apply_referral_code(p_code text)
  RETURNS jsonb
  LANGUAGE plpgsql
@@ -2048,6 +2124,96 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.assert_quick_tasks_cleaner_eligible(p_cleaner_id uuid, p_customer_id uuid, p_required_specialty_slugs jsonb)
+ RETURNS void
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_status public.cleaner_status;
+  v_verified boolean;
+  v_hourly_rate numeric;
+  v_specialties text[];
+  v_missing text;
+BEGIN
+  IF p_cleaner_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  IF p_cleaner_id = p_customer_id THEN
+    RAISE EXCEPTION 'Cannot book yourself as the cleaner' USING ERRCODE = 'check_violation';
+  END IF;
+
+  SELECT cd.status, cd.verified, cd.hourly_rate, cd.specialties
+  INTO v_status, v_verified, v_hourly_rate, v_specialties
+  FROM public.cleaner_data cd
+  WHERE cd.user_id = p_cleaner_id;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Selected cleaner was not found' USING ERRCODE = 'check_violation';
+  END IF;
+
+  IF v_status IS DISTINCT FROM 'active' THEN
+    RAISE EXCEPTION 'Selected cleaner is not available for booking' USING ERRCODE = 'check_violation';
+  END IF;
+
+  IF v_verified IS DISTINCT FROM true THEN
+    RAISE EXCEPTION 'Selected cleaner is not verified' USING ERRCODE = 'check_violation';
+  END IF;
+
+  IF v_hourly_rate IS NULL OR v_hourly_rate <= 0 THEN
+    RAISE EXCEPTION 'Selected cleaner does not have a valid hourly rate'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  SELECT req.slug
+  INTO v_missing
+  FROM jsonb_array_elements_text(COALESCE(p_required_specialty_slugs, '[]'::jsonb)) AS req(slug)
+  WHERE NULLIF(btrim(req.slug), '') IS NOT NULL
+    AND NOT EXISTS (
+      SELECT 1
+      FROM unnest(COALESCE(v_specialties, ARRAY[]::text[])) AS s(slug)
+      WHERE lower(btrim(s.slug)) = lower(btrim(req.slug))
+    )
+  LIMIT 1;
+
+  IF v_missing IS NOT NULL THEN
+    RAISE EXCEPTION
+      'Selected cleaner does not offer all required Quick Tasks specialties (missing: %)',
+      v_missing
+      USING ERRCODE = 'check_violation';
+  END IF;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.assert_quick_tasks_service_id(p_service_id integer)
+ RETURNS void
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+BEGIN
+  IF p_service_id IS NULL THEN
+    RAISE EXCEPTION 'Missing service_id' USING ERRCODE = 'check_violation';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM public.service_types st
+    INNER JOIN public.service_categories sc ON sc.id = st.category_id
+    WHERE st.id = p_service_id
+      AND COALESCE(st.active, true) = true
+      AND sc.slug = 'quick_tasks'
+  ) THEN
+    RAISE EXCEPTION 'service_id must be the Quick Tasks catalog service'
+      USING ERRCODE = 'check_violation';
+  END IF;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.assign_cleaner_after_payment(p_booking_id uuid)
  RETURNS jsonb
  LANGUAGE plpgsql
@@ -2318,6 +2484,149 @@ BEGIN
       verified = EXCLUDED.verified,
       status = 'active';
   END IF;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.attach_booking_micro_tasks(p_booking_id uuid, p_selected_tasks jsonb, p_equipment_provider text DEFAULT 'customer'::text, p_include_booking_cover boolean DEFAULT false, p_scope_acknowledged boolean DEFAULT false)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_booking public.bookings%ROWTYPE;
+  v_pricing jsonb;
+  v_line jsonb;
+  v_duration_hours numeric;
+  v_notes text;
+  v_claimed integer;
+  v_released integer;
+  v_include_cover boolean := COALESCE(p_include_booking_cover, false);
+  v_keep_paths text[];
+  v_cleaner_id uuid;
+BEGIN
+  IF v_uid IS NULL THEN
+    RAISE EXCEPTION 'Not authenticated' USING ERRCODE = '42501';
+  END IF;
+  IF p_scope_acknowledged IS DISTINCT FROM true THEN
+    RAISE EXCEPTION 'Quick Tasks scope acknowledgement is required' USING ERRCODE = 'check_violation';
+  END IF;
+
+  SELECT * INTO v_booking FROM public.bookings WHERE id = p_booking_id FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Booking not found' USING ERRCODE = 'no_data_found';
+  END IF;
+  IF v_booking.customer_id IS DISTINCT FROM v_uid AND NOT public.is_admin(v_uid) THEN
+    RAISE EXCEPTION 'Not allowed to attach Quick Tasks to this booking' USING ERRCODE = '42501';
+  END IF;
+  IF v_booking.status IS DISTINCT FROM 'pending' THEN
+    RAISE EXCEPTION 'Quick Tasks can only be attached to pending bookings' USING ERRCODE = 'check_violation';
+  END IF;
+
+  IF lower(COALESCE(v_booking.payment_status::text, 'pending')) NOT IN ('pending', 'failed') THEN
+    RAISE EXCEPTION 'Quick Tasks cannot be re-priced after payment has started'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  v_pricing := public.compute_micro_task_booking_pricing(
+    p_selected_tasks,
+    v_booking.scheduled_date,
+    COALESCE(v_booking.timezone_name, 'Africa/Accra'),
+    COALESCE(p_equipment_provider, 'customer'),
+    v_include_cover,
+    NULL,
+    true
+  );
+
+  v_cleaner_id := COALESCE(v_booking.cleaner_id, v_booking.direct_assigned_cleaner_id);
+  PERFORM public.assert_quick_tasks_cleaner_eligible(
+    v_cleaner_id,
+    v_booking.customer_id,
+    v_pricing->'required_specialty_slugs'
+  );
+
+  SELECT coalesce(array_agg(DISTINCT path), ARRAY[]::text[])
+  INTO v_keep_paths
+  FROM (
+    SELECT jsonb_array_elements_text(opt.value) AS path
+    FROM jsonb_array_elements(COALESCE(p_selected_tasks, '[]'::jsonb)) AS task(value),
+         LATERAL jsonb_each(COALESCE(task.value->'selected_options', '{}'::jsonb)) AS opt(key, value)
+    WHERE jsonb_typeof(opt.value) = 'array'
+  ) paths
+  WHERE path ~ '^[0-9a-f-]{36}/';
+
+  v_released := public.release_stale_quick_task_upload_claims(p_booking_id, v_keep_paths);
+
+  v_claimed := public.claim_quick_task_uploads_for_booking(p_booking_id, p_selected_tasks);
+
+  DELETE FROM public.booking_micro_tasks WHERE booking_id = p_booking_id;
+
+  FOR v_line IN
+    SELECT value FROM jsonb_array_elements(COALESCE(v_pricing->'line_items', '[]'::jsonb))
+  LOOP
+    v_notes := NULLIF(btrim(COALESCE(v_line->>'customer_notes', '')), '');
+    IF v_notes IS NOT NULL AND char_length(v_notes) > 2000 THEN
+      RAISE EXCEPTION 'customer_notes too long' USING ERRCODE = 'check_violation';
+    END IF;
+
+    INSERT INTO public.booking_micro_tasks (
+      booking_id,
+      micro_task_id,
+      quantity,
+      selected_options,
+      customer_notes,
+      estimated_duration_minutes,
+      unit_price_minor,
+      subtotal_minor,
+      status
+    )
+    VALUES (
+      p_booking_id,
+      (v_line->>'micro_task_id')::uuid,
+      COALESCE((v_line->>'quantity')::numeric, 1),
+      COALESCE(v_line->'selected_options', '{}'::jsonb),
+      v_notes,
+      COALESCE((v_line->>'estimated_duration_minutes')::integer, 0),
+      COALESCE((v_line->>'unit_price_minor')::integer, 0),
+      COALESCE((v_line->>'subtotal_minor')::integer, 0),
+      'pending'
+    );
+  END LOOP;
+
+  v_duration_hours := COALESCE((v_pricing->>'duration_hours')::numeric, 0.5);
+  IF v_duration_hours < 0.5 THEN
+    v_duration_hours := 0.5;
+  END IF;
+
+  UPDATE public.bookings
+  SET
+    is_quick_tasks = true,
+    quick_tasks_equipment_provider = COALESCE(p_equipment_provider, 'customer'),
+    quick_tasks_scope_ack_at = now(),
+    duration_hours = v_duration_hours,
+    core_amount_minor = COALESCE((v_pricing->>'core_amount_minor')::integer, 0),
+    final_amount_minor = COALESCE((v_pricing->>'final_amount_minor')::integer, 0),
+    same_day_surcharge_minor = COALESCE((v_pricing->>'same_day_surcharge_minor')::integer, 0),
+    weekend_surcharge_minor = COALESCE((v_pricing->>'weekend_surcharge_minor')::integer, 0),
+    is_same_day = COALESCE((v_pricing->>'is_same_day')::boolean, false),
+    is_weekend = COALESCE((v_pricing->>'is_weekend')::boolean, false),
+    platform_fee = COALESCE((v_pricing->>'platform_fee_major')::numeric, 0),
+    total_price = COALESCE((v_pricing->>'final_amount_minor')::integer, 0),
+    booking_cover = v_include_cover,
+    booking_cover_amount = COALESCE((v_pricing->>'booking_cover_major')::numeric, 0),
+    pricing_version = COALESCE(v_pricing->>'pricing_version', pricing_version),
+    currency = COALESCE(v_pricing->>'currency', currency)
+  WHERE id = p_booking_id;
+
+  RETURN jsonb_build_object(
+    'booking_id', p_booking_id,
+    'pricing', v_pricing,
+    'line_item_count', jsonb_array_length(COALESCE(v_pricing->'line_items', '[]'::jsonb)),
+    'claimed_uploads', v_claimed,
+    'released_uploads', v_released
+  );
 END;
 $function$
 
@@ -3570,6 +3879,59 @@ CREATE OR REPLACE FUNCTION public.citextsend(citext)
 AS $function$textsend$function$
 
 
+CREATE OR REPLACE FUNCTION public.claim_booking_reminder(p_booking_id uuid, p_kind text, p_claim_ttl_minutes integer DEFAULT 45)
+ RETURNS boolean
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_ttl integer := greatest(1, COALESCE(p_claim_ttl_minutes, 45));
+  v_id uuid;
+BEGIN
+  IF p_booking_id IS NULL THEN
+    RAISE EXCEPTION 'booking id required' USING ERRCODE = 'check_violation';
+  END IF;
+
+  IF p_kind = 'customer' THEN
+    UPDATE public.bookings b
+    SET
+      customer_reminder_claimed_at = now(),
+      customer_reminder_last_error = NULL,
+      updated_at = now()
+    WHERE b.id = p_booking_id
+      AND b.customer_reminder_sent_at IS NULL
+      AND (
+        b.customer_reminder_claimed_at IS NULL
+        OR b.customer_reminder_claimed_at
+          < now() - make_interval(mins => v_ttl)
+      )
+    RETURNING b.id INTO v_id;
+  ELSIF p_kind = 'cleaner' THEN
+    UPDATE public.bookings b
+    SET
+      cleaner_reminder_claimed_at = now(),
+      cleaner_reminder_last_error = NULL,
+      updated_at = now()
+    WHERE b.id = p_booking_id
+      AND b.cleaner_id IS NOT NULL
+      AND b.cleaner_reminder_sent_at IS NULL
+      AND (
+        b.cleaner_reminder_claimed_at IS NULL
+        OR b.cleaner_reminder_claimed_at
+          < now() - make_interval(mins => v_ttl)
+      )
+    RETURNING b.id INTO v_id;
+  ELSE
+    RAISE EXCEPTION 'invalid reminder kind (expected customer|cleaner)'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  RETURN v_id IS NOT NULL;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.claim_booking_review_request(p_booking_id uuid)
  RETURNS timestamp with time zone
  LANGUAGE plpgsql
@@ -3658,6 +4020,131 @@ BEGIN
     'success', true,
     'job', to_jsonb((SELECT j FROM jobs j WHERE j.id = p_job_id))
   );
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.claim_orphaned_quick_task_uploads_for_cleanup(p_older_than interval DEFAULT '24:00:00'::interval, p_limit integer DEFAULT 200)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_claim_id uuid := gen_random_uuid();
+  v_paths text[];
+  v_lim integer := greatest(1, least(COALESCE(p_limit, 200), 1000));
+  v_poison_count integer := 0;
+BEGIN
+  UPDATE public.quick_task_uploads
+  SET cleanup_claim_id = NULL, cleanup_claimed_at = NULL
+  WHERE claimed_at IS NULL
+    AND cleanup_claim_id IS NOT NULL
+    AND cleanup_claimed_at < now() - interval '30 minutes';
+
+  WITH picked AS (
+    SELECT u.id
+    FROM public.quick_task_uploads u
+    WHERE u.claimed_at IS NULL
+      AND u.cleanup_claim_id IS NULL
+      AND u.created_at < now() - p_older_than
+    ORDER BY u.created_at
+    LIMIT v_lim
+    FOR UPDATE SKIP LOCKED
+  ),
+  updated AS (
+    UPDATE public.quick_task_uploads u
+    SET
+      cleanup_claim_id = v_claim_id,
+      cleanup_claimed_at = now(),
+      cleanup_attempts = u.cleanup_attempts + 1
+    FROM picked p
+    WHERE u.id = p.id
+      AND u.claimed_at IS NULL
+      AND u.cleanup_claim_id IS NULL
+    RETURNING u.storage_path, u.cleanup_attempts
+  )
+  SELECT
+    coalesce(array_agg(storage_path), ARRAY[]::text[]),
+    count(*) FILTER (WHERE cleanup_attempts >= 5)::integer
+  INTO v_paths, v_poison_count
+  FROM updated;
+
+  RETURN jsonb_build_object(
+    'claim_id', v_claim_id,
+    'paths', to_jsonb(COALESCE(v_paths, ARRAY[]::text[])),
+    'path_count', coalesce(array_length(v_paths, 1), 0),
+    'high_attempt_row_count', COALESCE(v_poison_count, 0)
+  );
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.claim_quick_task_uploads_for_booking(p_booking_id uuid, p_selected_tasks jsonb)
+ RETURNS integer
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_paths text[];
+  v_claimed integer := 0;
+BEGIN
+  IF v_uid IS NULL THEN
+    RAISE EXCEPTION 'Not authenticated' USING ERRCODE = '42501';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM public.bookings b
+    WHERE b.id = p_booking_id
+      AND (b.customer_id = v_uid OR public.is_admin(v_uid))
+  ) THEN
+    RAISE EXCEPTION 'Not allowed to claim uploads for this booking'
+      USING ERRCODE = '42501';
+  END IF;
+
+  SELECT coalesce(array_agg(DISTINCT path), ARRAY[]::text[])
+  INTO v_paths
+  FROM (
+    SELECT jsonb_array_elements_text(opt.value) AS path
+    FROM jsonb_array_elements(COALESCE(p_selected_tasks, '[]'::jsonb)) AS task(value),
+         LATERAL jsonb_each(COALESCE(task.value->'selected_options', '{}'::jsonb)) AS opt(key, value)
+    WHERE jsonb_typeof(opt.value) = 'array'
+  ) paths
+  WHERE path ~ '^[0-9a-f-]{36}/';
+
+  IF coalesce(array_length(v_paths, 1), 0) = 0 THEN
+    RETURN 0;
+  END IF;
+
+  -- Reject any path not owned by caller or already claimed to another booking.
+  IF EXISTS (
+    SELECT 1
+    FROM unnest(v_paths) AS p(path)
+    WHERE NOT EXISTS (
+      SELECT 1
+      FROM public.quick_task_uploads u
+      WHERE u.storage_path = p.path
+        AND u.uploaded_by = v_uid
+        AND (u.claimed_at IS NULL OR u.booking_id = p_booking_id)
+    )
+  ) THEN
+    RAISE EXCEPTION 'One or more Quick Tasks photos are invalid or not owned by you'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  UPDATE public.quick_task_uploads u
+  SET
+    booking_id = p_booking_id,
+    claimed_at = COALESCE(u.claimed_at, now())
+  WHERE u.storage_path = ANY (v_paths)
+    AND u.uploaded_by = v_uid
+    AND (u.claimed_at IS NULL OR u.booking_id = p_booking_id);
+
+  GET DIAGNOSTICS v_claimed = ROW_COUNT;
+  RETURN v_claimed;
 END;
 $function$
 
@@ -4448,6 +4935,53 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.cleanup_failed_quick_tasks_booking(p_booking_id uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_booking public.bookings%ROWTYPE;
+BEGIN
+  IF v_uid IS NULL THEN
+    RAISE EXCEPTION 'Not authenticated'
+      USING ERRCODE = '42501';
+  END IF;
+
+  SELECT *
+  INTO v_booking
+  FROM public.bookings
+  WHERE id = p_booking_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', true, 'deleted', false, 'reason', 'not_found');
+  END IF;
+
+  IF v_booking.customer_id IS DISTINCT FROM v_uid AND NOT public.is_admin(v_uid) THEN
+    RAISE EXCEPTION 'Not allowed'
+      USING ERRCODE = '42501';
+  END IF;
+
+  IF COALESCE(v_booking.is_quick_tasks, false) IS NOT TRUE THEN
+    RETURN jsonb_build_object('success', true, 'deleted', false, 'reason', 'not_quick_tasks');
+  END IF;
+
+  IF v_booking.status IS DISTINCT FROM 'pending'
+     OR lower(COALESCE(v_booking.payment_status::text, 'pending')) NOT IN ('pending', 'failed') THEN
+    RETURN jsonb_build_object('success', true, 'deleted', false, 'reason', 'not_eligible');
+  END IF;
+
+  DELETE FROM public.booking_micro_tasks WHERE booking_id = p_booking_id;
+  DELETE FROM public.bookings WHERE id = p_booking_id;
+
+  RETURN jsonb_build_object('success', true, 'deleted', true, 'booking_id', p_booking_id);
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.cleanup_old_edge_function_failures()
  RETURNS integer
  LANGUAGE plpgsql
@@ -4462,6 +4996,44 @@ BEGIN
 
   GET DIAGNOSTICS v_deleted = ROW_COUNT;
   RETURN v_deleted;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.cleanup_orphan_quick_tasks_bookings(p_older_than interval DEFAULT '00:30:00'::interval, p_limit integer DEFAULT 50)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_ids uuid[];
+  v_deleted integer := 0;
+BEGIN
+  SELECT coalesce(array_agg(b.id), ARRAY[]::uuid[])
+  INTO v_ids
+  FROM (
+    SELECT b.id
+    FROM public.bookings b
+    WHERE b.is_quick_tasks = true
+      AND b.status = 'pending'
+      AND COALESCE(b.payment_status, 'pending') = 'pending'
+      AND b.created_at < now() - p_older_than
+      AND NOT EXISTS (
+        SELECT 1 FROM public.booking_micro_tasks bmt WHERE bmt.booking_id = b.id
+      )
+    ORDER BY b.created_at
+    LIMIT greatest(1, least(COALESCE(p_limit, 50), 200))
+  ) b;
+
+  IF coalesce(array_length(v_ids, 1), 0) = 0 THEN
+    RETURN jsonb_build_object('deleted_bookings', 0);
+  END IF;
+
+  DELETE FROM public.bookings WHERE id = ANY (v_ids);
+  GET DIAGNOSTICS v_deleted = ROW_COUNT;
+
+  RETURN jsonb_build_object('deleted_bookings', v_deleted, 'booking_ids', to_jsonb(v_ids));
 END;
 $function$
 
@@ -4488,6 +5060,144 @@ BEGIN
     );
 
   RETURN FOUND;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.cleanup_orphaned_quick_task_uploads(p_older_than interval DEFAULT '24:00:00'::interval, p_limit integer DEFAULT 200)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_listed jsonb;
+BEGIN
+  v_listed := public.list_orphaned_quick_task_uploads(p_older_than, p_limit);
+  RETURN jsonb_build_object(
+    'paths', COALESCE(v_listed->'paths', '[]'::jsonb),
+    'path_count', COALESCE((v_listed->>'path_count')::integer, 0),
+    'deleted_rows', 0,
+    'deleted_objects', 0,
+    'storage_delete_required', true
+  );
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.complete_booking_micro_task(p_booking_micro_task_id uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_line public.booking_micro_tasks%ROWTYPE;
+  v_booking public.bookings%ROWTYPE;
+  v_remaining integer;
+BEGIN
+  IF v_uid IS NULL THEN
+    RAISE EXCEPTION 'Not authenticated'
+      USING ERRCODE = '42501';
+  END IF;
+
+  SELECT * INTO v_line
+  FROM public.booking_micro_tasks
+  WHERE id = p_booking_micro_task_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Quick Task line item not found'
+      USING ERRCODE = 'no_data_found';
+  END IF;
+
+  SELECT * INTO v_booking
+  FROM public.bookings
+  WHERE id = v_line.booking_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Booking not found'
+      USING ERRCODE = 'no_data_found';
+  END IF;
+
+  IF NOT public.is_authorized_quick_tasks_worker(
+    v_booking.cleaner_id,
+    v_booking.direct_assigned_cleaner_id,
+    v_uid
+  ) THEN
+    RAISE EXCEPTION 'Not allowed to complete this Quick Task'
+      USING ERRCODE = '42501';
+  END IF;
+
+  IF v_booking.is_quick_tasks IS DISTINCT FROM true THEN
+    RAISE EXCEPTION 'Booking is not a Quick Tasks booking'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  IF v_booking.payment_status IS DISTINCT FROM 'paid' THEN
+    RAISE EXCEPTION 'Booking must be paid'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  IF v_booking.status NOT IN ('arrived', 'in_progress') THEN
+    RAISE EXCEPTION 'Booking is not eligible for task completion'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  SELECT count(*)::integer
+  INTO v_remaining
+  FROM public.booking_micro_tasks bmt
+  WHERE bmt.booking_id = v_booking.id
+    AND bmt.status NOT IN ('completed', 'cancelled', 'skipped');
+
+  IF v_line.status = 'completed' THEN
+    RETURN jsonb_build_object(
+      'booking_micro_task_id', v_line.id,
+      'status', v_line.status,
+      'booking_id', v_booking.id,
+      'booking_status', v_booking.status,
+      'remaining_required_tasks', v_remaining,
+      'already_completed', true,
+      'ready_for_booking_completion', v_remaining = 0
+    );
+  END IF;
+
+  IF v_line.status IN ('cancelled', 'skipped') THEN
+    RAISE EXCEPTION 'Cannot complete a % task', v_line.status
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  UPDATE public.booking_micro_tasks
+  SET
+    status = 'completed',
+    completed_at = now(),
+    updated_at = now()
+  WHERE id = v_line.id;
+
+  IF v_booking.status = 'arrived' THEN
+    UPDATE public.bookings
+    SET status = 'in_progress', updated_at = now(), last_updated = now()
+    WHERE id = v_booking.id;
+    v_booking.status := 'in_progress';
+  END IF;
+
+  SELECT count(*)::integer
+  INTO v_remaining
+  FROM public.booking_micro_tasks bmt
+  WHERE bmt.booking_id = v_booking.id
+    AND bmt.status NOT IN ('completed', 'cancelled', 'skipped');
+
+  RETURN jsonb_build_object(
+    'booking_micro_task_id', v_line.id,
+    'status', 'completed',
+    'booking_id', v_booking.id,
+    'booking_status', v_booking.status,
+    'remaining_required_tasks', v_remaining,
+    'already_completed', false,
+    'ready_for_booking_completion', v_remaining = 0
+  );
 END;
 $function$
 
@@ -4525,10 +5235,17 @@ BEGIN
   SELECT * INTO v_row
   FROM public.bookings
   WHERE id = p_booking_id
-    AND cleaner_id = v_uid
   FOR UPDATE;
 
   IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_found');
+  END IF;
+
+  IF NOT public.is_authorized_quick_tasks_worker(
+    v_row.cleaner_id,
+    v_row.direct_assigned_cleaner_id,
+    v_uid
+  ) THEN
     RETURN jsonb_build_object('success', false, 'error', 'not_found');
   END IF;
 
@@ -4536,13 +5253,29 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'error', 'invalid_transition');
   END IF;
 
-  v_missing := public._booking_job_photo_missing_required(p_booking_id);
-  IF array_length(v_missing, 1) IS NOT NULL THEN
+  IF v_row.is_quick_tasks
+     AND EXISTS (
+       SELECT 1
+       FROM public.booking_micro_tasks bmt
+       WHERE bmt.booking_id = v_row.id
+         AND bmt.status NOT IN ('completed', 'cancelled', 'skipped')
+     ) THEN
     RETURN jsonb_build_object(
       'success', false,
-      'error', 'JOB_PHOTOS_INCOMPLETE',
-      'missing_types', to_jsonb(v_missing)
+      'error', 'QUICK_TASKS_INCOMPLETE',
+      'message', 'All required Quick Tasks must be completed'
     );
+  END IF;
+
+  IF COALESCE(v_row.is_quick_tasks, false) IS NOT TRUE THEN
+    v_missing := public._booking_job_photo_missing_required(p_booking_id);
+    IF array_length(v_missing, 1) IS NOT NULL THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'JOB_PHOTOS_INCOMPLETE',
+        'missing_types', to_jsonb(v_missing)
+      );
+    END IF;
   END IF;
 
   IF p_customer_rating IS NOT NULL THEN
@@ -4774,6 +5507,118 @@ BEGIN
     'interval', v_interval,
     'recurrence_interval', v_sub.recurrence_interval
   );
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.compute_admin_monthly_schedule_split(p_amount_minor integer, p_weekdays integer[] DEFAULT NULL::integer[], p_period_start date DEFAULT NULL::date, p_period_end date DEFAULT NULL::date)
+ RETURNS TABLE(monthly_amount_minor integer, full_monthly_amount_minor integer, platform_fee_bps integer, platform_fee_minor integer, cleaner_earnings_minor integer, currency text, period_visit_count integer, full_month_visit_count integer, is_prorated boolean)
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  c_default_platform_fee_bps constant integer := 1500;
+  v_settings_platform_raw numeric;
+  v_platform_bps integer;
+  v_platform_fee_minor integer;
+  v_cleaner_earnings_minor integer;
+  v_full_amount integer;
+  v_charged integer;
+  v_period_visits integer;
+  v_full_month_visits integer;
+  v_month_start date;
+  v_month_end date;
+  v_prorate boolean := false;
+BEGIN
+  v_full_amount := greatest(0, COALESCE(p_amount_minor, 0));
+  IF v_full_amount <= 0 THEN
+    RAISE EXCEPTION 'monthly amount must be positive'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  v_charged := v_full_amount;
+  v_period_visits := NULL;
+  v_full_month_visits := NULL;
+
+  IF p_weekdays IS NOT NULL
+     OR p_period_start IS NOT NULL
+     OR p_period_end IS NOT NULL THEN
+    IF p_weekdays IS NULL OR p_period_start IS NULL OR p_period_end IS NULL THEN
+      RAISE EXCEPTION 'weekdays, period_start, and period_end are required together for proration'
+        USING ERRCODE = 'check_violation';
+    END IF;
+    IF p_period_start > p_period_end THEN
+      RAISE EXCEPTION 'period start must be on or before period end'
+        USING ERRCODE = 'check_violation';
+    END IF;
+    IF date_trunc('month', p_period_start::timestamp)
+       <> date_trunc('month', p_period_end::timestamp) THEN
+      RAISE EXCEPTION 'proration period must remain within one calendar month'
+        USING ERRCODE = 'check_violation';
+    END IF;
+
+    v_month_start := date_trunc('month', p_period_start::timestamp)::date;
+    v_month_end := (date_trunc('month', p_period_start::timestamp) + interval '1 month - 1 day')::date;
+
+    v_period_visits := public.count_admin_schedule_weekday_occurrences(
+      p_weekdays, p_period_start, p_period_end
+    );
+    v_full_month_visits := public.count_admin_schedule_weekday_occurrences(
+      p_weekdays, v_month_start, v_month_end
+    );
+
+    IF v_period_visits < 1 THEN
+      RAISE EXCEPTION 'no matching weekdays in the selected period'
+        USING ERRCODE = 'check_violation';
+    END IF;
+    IF v_full_month_visits < 1 THEN
+      RAISE EXCEPTION 'no matching weekdays in the reference month'
+        USING ERRCODE = 'check_violation';
+    END IF;
+
+    v_charged := round(
+      v_full_amount::numeric * v_period_visits / v_full_month_visits
+    )::integer;
+    IF v_charged < 1 THEN
+      v_charged := 1;
+    END IF;
+    -- Visit ratio, not rounded money (tiny amounts can round to full charge).
+    v_prorate := v_period_visits IS DISTINCT FROM v_full_month_visits;
+  END IF;
+
+  SELECT bs.value_numeric
+  INTO v_settings_platform_raw
+  FROM public.booking_settings bs
+  WHERE bs.key = 'platform_fee_percentage';
+
+  IF v_settings_platform_raw IS NULL OR v_settings_platform_raw < 0 THEN
+    v_platform_bps := c_default_platform_fee_bps;
+  ELSIF v_settings_platform_raw = 0 THEN
+    v_platform_bps := 0;
+  ELSIF v_settings_platform_raw <= 100 THEN
+    v_platform_bps := round(v_settings_platform_raw * 100)::integer;
+  ELSE
+    v_platform_bps := round(v_settings_platform_raw)::integer;
+  END IF;
+  v_platform_bps := greatest(0, least(10000, COALESCE(v_platform_bps, c_default_platform_fee_bps)));
+
+  v_platform_fee_minor := round(v_charged * v_platform_bps / 10000.0)::integer;
+  IF v_platform_fee_minor > v_charged THEN
+    v_platform_fee_minor := v_charged;
+  END IF;
+  v_cleaner_earnings_minor := v_charged - v_platform_fee_minor;
+
+  monthly_amount_minor := v_charged;
+  full_monthly_amount_minor := v_full_amount;
+  platform_fee_bps := v_platform_bps;
+  platform_fee_minor := v_platform_fee_minor;
+  cleaner_earnings_minor := v_cleaner_earnings_minor;
+  currency := 'GHS';
+  period_visit_count := v_period_visits;
+  full_month_visit_count := v_full_month_visits;
+  is_prorated := v_prorate;
+  RETURN NEXT;
 END;
 $function$
 
@@ -5953,6 +6798,450 @@ end;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.compute_micro_task_booking_pricing(p_selected_tasks jsonb, p_scheduled_date date DEFAULT NULL::date, p_service_timezone text DEFAULT 'Africa/Accra'::text, p_equipment_provider text DEFAULT 'customer'::text, p_include_booking_cover boolean DEFAULT false, p_client_claimed_final_minor integer DEFAULT NULL::integer, p_for_checkout boolean DEFAULT false)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  c_default_platform_fee_bps constant integer := 1500;
+  c_default_booking_cover_minor constant integer := 2100;
+
+  v_item jsonb;
+  v_task_id uuid;
+  v_quantity numeric;
+  v_selected_options jsonb;
+  v_task public.micro_tasks%ROWTYPE;
+
+  v_opt public.micro_task_options%ROWTYPE;
+  v_opt_value jsonb;
+  v_choice jsonb;
+  v_choice_value text;
+  v_bool boolean;
+  v_photo_path text;
+  v_photo_count integer;
+  v_min_photos integer;
+  v_known_keys text[];
+  v_unknown_key text;
+
+  v_unit_price_minor integer;
+  v_line_subtotal_minor integer;
+  v_line_duration_minutes integer;
+  v_price_adj integer;
+  v_duration_adj integer;
+
+  v_line_items jsonb := '[]'::jsonb;
+  v_required_specialties text[] := ARRAY[]::text[];
+
+  v_subtotal_minor integer := 0;
+  v_total_duration_minutes integer := 0;
+  v_equipment_fee_minor integer := 0;
+  v_min_subtotal_minor integer := 0;
+  v_min_duration_minutes integer := 0;
+  v_settings_min_subtotal numeric;
+  v_settings_min_duration numeric;
+  v_checkout_enabled numeric;
+
+  v_settings_platform_raw numeric;
+  v_platform_bps integer;
+  v_platform_fee_minor integer := 0;
+  v_cover_minor integer := 0;
+  v_settings_cover_raw numeric;
+
+  v_pricing_version text;
+  v_currency text;
+  v_same_day_bps integer;
+  v_weekend_bps integer;
+  v_same_day_minor integer := 0;
+  v_weekend_minor integer := 0;
+  v_is_same_day boolean := false;
+  v_is_weekend boolean := false;
+  v_service_timezone text;
+  v_today date;
+
+  v_core_amount_minor integer;
+  v_after_same_day integer;
+  v_final_amount_minor integer;
+  v_opt_qty_min numeric;
+  v_opt_qty_max numeric;
+  v_has_placeholder boolean := false;
+  v_seen_task_ids uuid[] := ARRAY[]::uuid[];
+BEGIN
+  IF p_selected_tasks IS NULL
+     OR jsonb_typeof(p_selected_tasks) <> 'array'
+     OR jsonb_array_length(p_selected_tasks) < 1 THEN
+    RAISE EXCEPTION 'At least one Quick Task is required'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  IF p_equipment_provider IS NOT NULL
+     AND p_equipment_provider NOT IN ('customer', 'provider', 'mixed') THEN
+    RAISE EXCEPTION 'Invalid equipment provider'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  SELECT bs.value_numeric INTO v_settings_min_subtotal
+  FROM public.booking_settings bs WHERE bs.key = 'micro_task_minimum_subtotal_minor';
+  v_min_subtotal_minor := greatest(0, COALESCE(round(v_settings_min_subtotal)::integer, 0));
+
+  SELECT bs.value_numeric INTO v_settings_min_duration
+  FROM public.booking_settings bs WHERE bs.key = 'micro_task_minimum_duration_minutes';
+  v_min_duration_minutes := greatest(0, COALESCE(round(v_settings_min_duration)::integer, 0));
+
+  v_equipment_fee_minor := 0;
+
+  FOR v_item IN SELECT value FROM jsonb_array_elements(p_selected_tasks)
+  LOOP
+    IF jsonb_typeof(v_item) <> 'object' THEN
+      RAISE EXCEPTION 'Invalid selected task payload' USING ERRCODE = 'check_violation';
+    END IF;
+
+    BEGIN
+      v_task_id := (v_item->>'micro_task_id')::uuid;
+    EXCEPTION WHEN others THEN
+      RAISE EXCEPTION 'Invalid micro_task_id' USING ERRCODE = 'check_violation';
+    END;
+
+    IF v_task_id = ANY (v_seen_task_ids) THEN
+      RAISE EXCEPTION 'Duplicate Quick Task line items are not supported'
+        USING ERRCODE = 'check_violation';
+    END IF;
+    v_seen_task_ids := array_append(v_seen_task_ids, v_task_id);
+
+    v_quantity := COALESCE((v_item->>'quantity')::numeric, 1);
+    IF v_quantity IS NULL OR v_quantity <> v_quantity OR v_quantity <= 0 THEN
+      RAISE EXCEPTION 'Invalid quantity for task %', v_task_id USING ERRCODE = 'check_violation';
+    END IF;
+
+    v_selected_options := COALESCE(v_item->'selected_options', '{}'::jsonb);
+    IF jsonb_typeof(v_selected_options) <> 'object' THEN
+      RAISE EXCEPTION 'selected_options must be an object' USING ERRCODE = 'check_violation';
+    END IF;
+
+    SELECT * INTO v_task FROM public.micro_tasks mt WHERE mt.id = v_task_id;
+    IF NOT FOUND THEN
+      RAISE EXCEPTION 'Unknown Quick Task id %', v_task_id USING ERRCODE = 'check_violation';
+    END IF;
+    IF v_task.is_active IS DISTINCT FROM true THEN
+      RAISE EXCEPTION 'Quick Task % is inactive', v_task.slug USING ERRCODE = 'check_violation';
+    END IF;
+    IF v_task.pricing_type = 'quote_required' THEN
+      RAISE EXCEPTION 'Quick Task % requires a custom quote', v_task.slug USING ERRCODE = 'check_violation';
+    END IF;
+    IF v_task.pricing_is_placeholder THEN
+      v_has_placeholder := true;
+    END IF;
+
+    SELECT coalesce(array_agg(o.option_key), ARRAY[]::text[])
+    INTO v_known_keys
+    FROM public.micro_task_options o
+    WHERE o.micro_task_id = v_task.id;
+
+    FOR v_unknown_key IN
+      SELECT k FROM jsonb_object_keys(v_selected_options) AS k
+      WHERE NOT (k = ANY (v_known_keys))
+    LOOP
+      RAISE EXCEPTION 'Unknown option % for %', v_unknown_key, v_task.slug
+        USING ERRCODE = 'check_violation';
+    END LOOP;
+
+    v_unit_price_minor := v_task.base_price_minor;
+    v_line_duration_minutes := v_task.estimated_minutes;
+
+    FOR v_opt IN
+      SELECT * FROM public.micro_task_options o
+      WHERE o.micro_task_id = v_task.id
+      ORDER BY o.display_order, o.option_key
+    LOOP
+      v_opt_value := v_selected_options -> v_opt.option_key;
+      v_price_adj := 0;
+      v_duration_adj := 0;
+
+      IF v_opt.is_required
+         AND (
+           v_opt_value IS NULL
+           OR v_opt_value = 'null'::jsonb
+           OR (jsonb_typeof(v_opt_value) = 'string' AND COALESCE(v_opt_value #>> '{}', '') = '')
+           OR (jsonb_typeof(v_opt_value) = 'array' AND jsonb_array_length(v_opt_value) = 0)
+         ) THEN
+        RAISE EXCEPTION 'Missing required option % for %', v_opt.option_key, v_task.slug
+          USING ERRCODE = 'check_violation';
+      END IF;
+
+      IF v_opt_value IS NULL OR v_opt_value = 'null'::jsonb THEN
+        CONTINUE;
+      END IF;
+
+      IF v_opt.input_type = 'boolean' THEN
+        IF jsonb_typeof(v_opt_value) <> 'boolean' THEN
+          RAISE EXCEPTION 'Option % must be boolean', v_opt.option_key USING ERRCODE = 'check_violation';
+        END IF;
+        v_bool := (v_opt_value #>> '{}')::boolean;
+        IF v_bool THEN
+          v_price_adj := v_opt.price_adjustment_minor;
+          v_duration_adj := v_opt.duration_adjustment_minutes;
+        END IF;
+
+      ELSIF v_opt.input_type = 'single_select' THEN
+        v_choice_value := v_opt_value #>> '{}';
+        SELECT c INTO v_choice
+        FROM jsonb_array_elements(COALESCE(v_opt.configuration->'choices', '[]'::jsonb)) AS c
+        WHERE c->>'value' = v_choice_value
+        LIMIT 1;
+        IF v_choice IS NULL THEN
+          RAISE EXCEPTION 'Invalid choice for option %', v_opt.option_key USING ERRCODE = 'check_violation';
+        END IF;
+        v_price_adj := COALESCE((v_choice->>'price_adjustment_minor')::integer, 0);
+        v_duration_adj := COALESCE((v_choice->>'duration_adjustment_minutes')::integer, 0);
+
+      ELSIF v_opt.input_type = 'quantity' THEN
+        IF jsonb_typeof(v_opt_value) <> 'number' THEN
+          RAISE EXCEPTION 'Option % must be a number', v_opt.option_key USING ERRCODE = 'check_violation';
+        END IF;
+        v_quantity := (v_opt_value #>> '{}')::numeric;
+        IF v_quantity IS NULL OR v_quantity <= 0 OR v_quantity <> trunc(v_quantity) THEN
+          RAISE EXCEPTION 'Quantity option % must be a positive whole number', v_opt.option_key
+            USING ERRCODE = 'check_violation';
+        END IF;
+        IF v_opt.configuration ? 'min' THEN
+          v_opt_qty_min := (v_opt.configuration->>'min')::numeric;
+          IF v_opt_qty_min IS NOT NULL AND v_quantity < v_opt_qty_min THEN
+            RAISE EXCEPTION 'Quantity option % below minimum %', v_opt.option_key, v_opt_qty_min
+              USING ERRCODE = 'check_violation';
+          END IF;
+        END IF;
+        IF v_opt.configuration ? 'max' THEN
+          v_opt_qty_max := (v_opt.configuration->>'max')::numeric;
+          IF v_opt_qty_max IS NOT NULL AND v_quantity > v_opt_qty_max THEN
+            RAISE EXCEPTION 'Quantity option % above maximum %', v_opt.option_key, v_opt_qty_max
+              USING ERRCODE = 'check_violation';
+          END IF;
+        END IF;
+
+      ELSIF v_opt.input_type = 'photo' THEN
+        IF jsonb_typeof(v_opt_value) = 'boolean' THEN
+          RAISE EXCEPTION 'Photo option % requires uploaded media references, not a boolean',
+            v_opt.option_key USING ERRCODE = 'check_violation';
+        END IF;
+        IF jsonb_typeof(v_opt_value) <> 'array' THEN
+          RAISE EXCEPTION 'Photo option % must be an array of storage paths', v_opt.option_key
+            USING ERRCODE = 'check_violation';
+        END IF;
+        v_photo_count := 0;
+        FOR v_photo_path IN SELECT jsonb_array_elements_text(v_opt_value)
+        LOOP
+          IF NOT public.validate_quick_task_photo_path(v_photo_path) THEN
+            RAISE EXCEPTION 'Photo option % has an invalid or unauthorized path', v_opt.option_key
+              USING ERRCODE = 'check_violation';
+          END IF;
+          v_photo_count := v_photo_count + 1;
+        END LOOP;
+        v_min_photos := COALESCE((v_opt.configuration->>'min_count')::integer, 1);
+        IF v_opt.is_required AND v_photo_count < greatest(1, v_min_photos) THEN
+          RAISE EXCEPTION 'Photo option % requires at least % upload(s)',
+            v_opt.option_key, greatest(1, v_min_photos)
+            USING ERRCODE = 'check_violation';
+        END IF;
+
+      ELSIF v_opt.input_type IN ('text', 'multi_select') THEN
+        IF v_opt.input_type = 'multi_select' THEN
+          IF jsonb_typeof(v_opt_value) <> 'array' THEN
+            RAISE EXCEPTION 'Option % must be an array', v_opt.option_key USING ERRCODE = 'check_violation';
+          END IF;
+          FOR v_choice IN
+            SELECT c
+            FROM jsonb_array_elements(COALESCE(v_opt.configuration->'choices', '[]'::jsonb)) AS c
+            WHERE c->>'value' IN (SELECT jsonb_array_elements_text(v_opt_value))
+          LOOP
+            v_price_adj := v_price_adj + COALESCE((v_choice->>'price_adjustment_minor')::integer, 0);
+            v_duration_adj := v_duration_adj + COALESCE((v_choice->>'duration_adjustment_minutes')::integer, 0);
+          END LOOP;
+        END IF;
+      END IF;
+
+      v_unit_price_minor := v_unit_price_minor + COALESCE(v_price_adj, 0);
+      v_line_duration_minutes := v_line_duration_minutes + COALESCE(v_duration_adj, 0);
+    END LOOP;
+
+    IF v_quantity < v_task.minimum_quantity
+       OR (v_task.maximum_quantity IS NOT NULL AND v_quantity > v_task.maximum_quantity) THEN
+      RAISE EXCEPTION 'Quantity out of range for %', v_task.slug USING ERRCODE = 'check_violation';
+    END IF;
+
+    IF v_task.pricing_type IN ('per_item', 'per_load', 'per_room', 'per_hour') THEN
+      IF v_quantity <> trunc(v_quantity) THEN
+        RAISE EXCEPTION 'Quantity for % must be a whole number', v_task.slug
+          USING ERRCODE = 'check_violation';
+      END IF;
+      -- Quantity options (load_count / basket_count) overwrite v_quantity above and are authoritative.
+      v_line_subtotal_minor := round(v_unit_price_minor * v_quantity)::integer;
+      v_line_duration_minutes := round(v_line_duration_minutes * v_quantity)::integer;
+    ELSE
+      v_line_subtotal_minor := v_unit_price_minor;
+    END IF;
+
+    v_subtotal_minor := v_subtotal_minor + v_line_subtotal_minor;
+    v_total_duration_minutes := v_total_duration_minutes + v_line_duration_minutes;
+
+    IF v_task.required_specialty_slug IS NOT NULL
+       AND NOT (v_task.required_specialty_slug = ANY (v_required_specialties)) THEN
+      v_required_specialties := array_append(v_required_specialties, v_task.required_specialty_slug);
+    END IF;
+
+    v_line_items := v_line_items || jsonb_build_array(
+      jsonb_build_object(
+        'micro_task_id', v_task.id,
+        'slug', v_task.slug,
+        'name', v_task.name,
+        'quantity', v_quantity,
+        'selected_options', v_selected_options,
+        'customer_notes', NULLIF(btrim(COALESCE(v_item->>'customer_notes', '')), ''),
+        'estimated_duration_minutes', v_line_duration_minutes,
+        'unit_price_minor', v_unit_price_minor,
+        'subtotal_minor', v_line_subtotal_minor,
+        'pricing_type', v_task.pricing_type,
+        'required_specialty_slug', v_task.required_specialty_slug,
+        'pricing_is_placeholder', v_task.pricing_is_placeholder
+      )
+    );
+  END LOOP;
+
+  IF p_for_checkout THEN
+    SELECT bs.value_numeric INTO v_checkout_enabled
+    FROM public.booking_settings bs WHERE bs.key = 'quick_tasks_checkout_enabled';
+    IF COALESCE(v_checkout_enabled, 0) = 0 THEN
+      RAISE EXCEPTION 'Quick Tasks checkout is disabled until pricing review is complete'
+        USING ERRCODE = 'check_violation';
+    END IF;
+    IF auth.uid() IS NULL THEN
+      RAISE EXCEPTION 'Sign in required for Quick Tasks checkout pricing'
+        USING ERRCODE = '42501';
+    END IF;
+    IF v_has_placeholder THEN
+      RAISE EXCEPTION 'Quick Tasks placeholder prices cannot be used for checkout'
+        USING ERRCODE = 'check_violation';
+    END IF;
+  END IF;
+
+  IF v_subtotal_minor < v_min_subtotal_minor THEN
+    RAISE EXCEPTION 'Quick Tasks minimum subtotal is % pesewas', v_min_subtotal_minor
+      USING ERRCODE = 'check_violation';
+  END IF;
+  IF v_total_duration_minutes < v_min_duration_minutes THEN
+    RAISE EXCEPTION 'Quick Tasks minimum duration is % minutes', v_min_duration_minutes
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  SELECT pr.pricing_version, pr.currency, pr.same_day_surcharge_bps, pr.weekend_surcharge_bps
+  INTO v_pricing_version, v_currency, v_same_day_bps, v_weekend_bps
+  FROM public.get_active_pricing_rule() pr LIMIT 1;
+
+  v_pricing_version := COALESCE(v_pricing_version, 'v1');
+  v_currency := COALESCE(v_currency, 'GHS');
+  v_same_day_bps := greatest(0, least(10000, COALESCE(v_same_day_bps, 500)));
+  v_weekend_bps := greatest(0, least(10000, COALESCE(v_weekend_bps, 500)));
+
+  SELECT bs.value_numeric INTO v_settings_platform_raw
+  FROM public.booking_settings bs WHERE bs.key = 'platform_fee_percentage';
+  IF v_settings_platform_raw IS NULL OR v_settings_platform_raw < 0 THEN
+    v_platform_bps := c_default_platform_fee_bps;
+  ELSIF v_settings_platform_raw = 0 THEN
+    v_platform_bps := 0;
+  ELSIF v_settings_platform_raw <= 100 THEN
+    v_platform_bps := round(v_settings_platform_raw * 100)::integer;
+  ELSE
+    v_platform_bps := round(v_settings_platform_raw)::integer;
+  END IF;
+  v_platform_bps := greatest(0, least(10000, COALESCE(v_platform_bps, c_default_platform_fee_bps)));
+
+  SELECT bs.value_numeric INTO v_settings_cover_raw
+  FROM public.booking_settings bs WHERE bs.key = 'booking_cover_amount';
+  IF p_include_booking_cover THEN
+    IF v_settings_cover_raw IS NULL OR v_settings_cover_raw < 0 THEN
+      v_cover_minor := c_default_booking_cover_minor;
+    ELSIF v_settings_cover_raw = 0 THEN
+      v_cover_minor := 0;
+    ELSIF v_settings_cover_raw <= 100 THEN
+      v_cover_minor := round(v_settings_cover_raw * 100)::integer;
+    ELSE
+      v_cover_minor := round(v_settings_cover_raw)::integer;
+    END IF;
+  ELSE
+    v_cover_minor := 0;
+  END IF;
+
+  IF v_platform_bps > 0 AND v_subtotal_minor > 0 THEN
+    v_platform_fee_minor := round(v_subtotal_minor * v_platform_bps / 10000.0)::integer;
+  END IF;
+
+  v_service_timezone := COALESCE(NULLIF(btrim(p_service_timezone), ''), 'Africa/Accra');
+  BEGIN
+    v_today := (now() AT TIME ZONE v_service_timezone)::date;
+  EXCEPTION WHEN others THEN
+    v_today := (now() AT TIME ZONE 'Africa/Accra')::date;
+  END;
+
+  IF p_scheduled_date IS NOT NULL THEN
+    v_is_same_day := (p_scheduled_date = v_today);
+    v_is_weekend := EXTRACT(ISODOW FROM p_scheduled_date) IN (6, 7);
+  END IF;
+
+  v_core_amount_minor := v_subtotal_minor + v_equipment_fee_minor + v_platform_fee_minor + v_cover_minor;
+
+  -- Match compute_booking_pricing: same-day on core, weekend on core + same-day surcharge.
+  IF v_is_same_day AND v_same_day_bps > 0 THEN
+    v_same_day_minor := round(v_core_amount_minor * v_same_day_bps / 10000.0)::integer;
+  END IF;
+  v_after_same_day := v_core_amount_minor + v_same_day_minor;
+  IF v_is_weekend AND v_weekend_bps > 0 THEN
+    v_weekend_minor := round(v_after_same_day * v_weekend_bps / 10000.0)::integer;
+  END IF;
+
+  v_final_amount_minor := v_core_amount_minor + v_same_day_minor + v_weekend_minor;
+
+  IF p_client_claimed_final_minor IS NOT NULL
+     AND p_client_claimed_final_minor IS DISTINCT FROM v_final_amount_minor THEN
+    RAISE EXCEPTION 'Client price does not match server pricing' USING ERRCODE = 'check_violation';
+  END IF;
+
+  RETURN jsonb_build_object(
+    'pricing_version', v_pricing_version,
+    'currency', v_currency,
+    'line_items', v_line_items,
+    'required_specialty_slugs', to_jsonb(v_required_specialties),
+    'total_estimated_duration_minutes', v_total_duration_minutes,
+    'duration_hours', round((v_total_duration_minutes / 60.0) * 2) / 2.0,
+    'subtotal_minor', v_subtotal_minor,
+    'equipment_fee_minor', v_equipment_fee_minor,
+    'platform_fee_minor', v_platform_fee_minor,
+    'platform_fee_major', (v_platform_fee_minor / 100.0),
+    'booking_cover_minor', v_cover_minor,
+    'booking_cover_major', (v_cover_minor / 100.0),
+    'same_day_surcharge_bps', v_same_day_bps,
+    'weekend_surcharge_bps', v_weekend_bps,
+    'same_day_surcharge_minor', v_same_day_minor,
+    'weekend_surcharge_minor', v_weekend_minor,
+    'core_amount_minor', v_core_amount_minor,
+    'final_amount_minor', v_final_amount_minor,
+    'is_same_day', v_is_same_day,
+    'is_weekend', v_is_weekend,
+    'minimum_subtotal_minor', v_min_subtotal_minor,
+    'minimum_duration_minutes', v_min_duration_minutes,
+    'equipment_provider', COALESCE(p_equipment_provider, 'customer'),
+    'has_placeholder_prices', v_has_placeholder,
+    'checkout_enabled', COALESCE(v_checkout_enabled, 0) = 1,
+    'pricing_snapshot', jsonb_build_object(
+      'kind', 'quick_tasks',
+      'final_amount_minor', v_final_amount_minor,
+      'line_items', v_line_items,
+      'computed_at', now()
+    )
+  );
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.compute_next_recurrence_date(p_current_date date, p_recurrence_interval text, p_recurrence_anchor_date date DEFAULT NULL::date)
  RETURNS date
  LANGUAGE plpgsql
@@ -6148,6 +7437,45 @@ CREATE OR REPLACE FUNCTION public.contains_2d(geometry, box2df)
 AS $function$SELECT $2 OPERATOR(public.@) $1;$function$
 
 
+CREATE OR REPLACE FUNCTION public.count_admin_schedule_weekday_occurrences(p_weekdays integer[], p_start date, p_end date)
+ RETURNS integer
+ LANGUAGE plpgsql
+ IMMUTABLE STRICT
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_count integer := 0;
+  v_day date;
+  v_wanted integer[];
+BEGIN
+  IF p_start > p_end THEN
+    RAISE EXCEPTION 'period start must be on or before period end'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  SELECT coalesce(array_agg(DISTINCT d ORDER BY d), ARRAY[]::integer[])
+  INTO v_wanted
+  FROM unnest(p_weekdays) AS d
+  WHERE d BETWEEN 1 AND 7;
+
+  IF coalesce(cardinality(v_wanted), 0) = 0 THEN
+    RAISE EXCEPTION 'select at least one weekday (ISO 1=Mon … 7=Sun)'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  v_day := p_start;
+  WHILE v_day <= p_end LOOP
+    IF extract(isodow FROM v_day)::integer = ANY (v_wanted) THEN
+      v_count := v_count + 1;
+    END IF;
+    v_day := v_day + 1;
+  END LOOP;
+
+  RETURN v_count;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.count_unread_messages_for_user(p_user_id uuid)
  RETURNS integer
  LANGUAGE sql
@@ -6233,6 +7561,282 @@ BEGIN
     'invite_id', v_id,
     'expires_at', v_expires
   );
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.create_quick_tasks_booking(p_booking jsonb, p_selected_tasks jsonb, p_equipment_provider text DEFAULT 'customer'::text, p_include_booking_cover boolean DEFAULT false, p_scope_acknowledged boolean DEFAULT false)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_booking_id uuid;
+  v_existing_id uuid;
+  v_service_id integer;
+  v_cleaner_id uuid;
+  v_title text;
+  v_scheduled_date date;
+  v_scheduled_time time;
+  v_address text;
+  v_timezone text;
+  v_idempotency_key text;
+  v_pricing jsonb;
+  v_duration_hours numeric;
+  v_point text;
+  v_attach jsonb;
+  v_existing_qt boolean;
+  v_replay jsonb;
+BEGIN
+  IF v_uid IS NULL THEN
+    RAISE EXCEPTION 'Not authenticated' USING ERRCODE = '42501';
+  END IF;
+  IF p_scope_acknowledged IS DISTINCT FROM true THEN
+    RAISE EXCEPTION 'Quick Tasks scope acknowledgement is required' USING ERRCODE = 'check_violation';
+  END IF;
+  IF p_booking IS NULL OR jsonb_typeof(p_booking) <> 'object' THEN
+    RAISE EXCEPTION 'Invalid booking payload' USING ERRCODE = 'check_violation';
+  END IF;
+
+  v_idempotency_key := NULLIF(btrim(COALESCE(p_booking->>'idempotency_key', '')), '');
+  IF v_idempotency_key IS NOT NULL THEN
+    SELECT b.id, COALESCE(b.is_quick_tasks, false)
+    INTO v_existing_id, v_existing_qt
+    FROM public.bookings b
+    WHERE b.customer_id = v_uid
+      AND b.idempotency_key = v_idempotency_key
+    LIMIT 1;
+    IF v_existing_id IS NOT NULL THEN
+      IF NOT v_existing_qt THEN
+        RAISE EXCEPTION 'Idempotency key already used for a non-Quick Tasks booking'
+          USING ERRCODE = 'check_violation';
+      END IF;
+      IF NOT EXISTS (
+        SELECT 1 FROM public.booking_micro_tasks bmt WHERE bmt.booking_id = v_existing_id
+      ) THEN
+        RAISE EXCEPTION 'Idempotency key replay missing Quick Tasks line items'
+          USING ERRCODE = 'check_violation';
+      END IF;
+      SELECT jsonb_build_object(
+        'pricing_version', b.pricing_version,
+        'currency', b.currency,
+        'final_amount_minor', b.final_amount_minor,
+        'core_amount_minor', b.core_amount_minor,
+        'line_item_count', (
+          SELECT count(*)::integer FROM public.booking_micro_tasks bmt WHERE bmt.booking_id = b.id
+        )
+      )
+      INTO v_replay
+      FROM public.bookings b
+      WHERE b.id = v_existing_id;
+      RETURN jsonb_build_object(
+        'booking_id', v_existing_id,
+        'idempotent_replay', true,
+        'pricing', v_replay
+      );
+    END IF;
+  END IF;
+
+  BEGIN
+    v_service_id := (p_booking->>'service_id')::integer;
+  EXCEPTION WHEN others THEN
+    RAISE EXCEPTION 'Invalid service_id' USING ERRCODE = 'check_violation';
+  END;
+
+  v_cleaner_id := NULLIF(p_booking->>'cleaner_id', '')::uuid;
+  v_title := NULLIF(btrim(COALESCE(p_booking->>'title', '')), '');
+  v_address := NULLIF(btrim(COALESCE(p_booking->>'address', '')), '');
+  v_timezone := COALESCE(NULLIF(btrim(COALESCE(p_booking->>'timezone_name', '')), ''), 'Africa/Accra');
+
+  BEGIN
+    v_scheduled_date := (p_booking->>'scheduled_date')::date;
+    v_scheduled_time := (p_booking->>'scheduled_time')::time;
+  EXCEPTION WHEN others THEN
+    RAISE EXCEPTION 'Invalid scheduled date/time' USING ERRCODE = 'check_violation';
+  END;
+
+  IF v_service_id IS NULL OR v_title IS NULL OR v_address IS NULL
+     OR v_scheduled_date IS NULL OR v_scheduled_time IS NULL THEN
+    RAISE EXCEPTION 'Missing required booking fields' USING ERRCODE = 'check_violation';
+  END IF;
+
+  PERFORM public.assert_quick_tasks_service_id(v_service_id);
+
+  IF v_cleaner_id IS NOT NULL AND v_cleaner_id = v_uid THEN
+    RAISE EXCEPTION 'Cannot book yourself as the cleaner' USING ERRCODE = 'check_violation';
+  END IF;
+
+  v_pricing := public.compute_micro_task_booking_pricing(
+    p_selected_tasks,
+    v_scheduled_date,
+    v_timezone,
+    COALESCE(p_equipment_provider, 'customer'),
+    COALESCE(p_include_booking_cover, false),
+    NULL,
+    true
+  );
+
+  -- Independent of client filters: chosen cleaner must cover every required specialty.
+  PERFORM public.assert_quick_tasks_cleaner_eligible(
+    v_cleaner_id,
+    v_uid,
+    v_pricing->'required_specialty_slugs'
+  );
+
+  v_duration_hours := COALESCE((v_pricing->>'duration_hours')::numeric, 0.5);
+  IF v_duration_hours < 0.5 THEN
+    v_duration_hours := 0.5;
+  END IF;
+
+  v_point := NULLIF(btrim(COALESCE(p_booking->>'location_coordinates', '')), '');
+
+  INSERT INTO public.bookings (
+    customer_id,
+    cleaner_id,
+    direct_assigned_cleaner_id,
+    service_id,
+    title,
+    scheduled_date,
+    scheduled_time,
+    duration_hours,
+    address,
+    special_instructions,
+    total_price,
+    final_amount_minor,
+    core_amount_minor,
+    same_day_surcharge_minor,
+    weekend_surcharge_minor,
+    is_same_day,
+    is_weekend,
+    pricing_version,
+    currency,
+    platform_fee,
+    booking_cover,
+    booking_cover_amount,
+    status,
+    payment_status,
+    location_coordinates,
+    timezone_name,
+    idempotency_key,
+    booking_source,
+    booking_for_self,
+    site_contact_name,
+    site_contact_phone,
+    site_contact_relationship,
+    property_type,
+    occupant_present,
+    requires_key_or_access_code,
+    access_instructions,
+    customer_contact_phone,
+    is_quick_tasks,
+    quick_tasks_equipment_provider,
+    quick_tasks_scope_ack_at,
+    home_size,
+    extra_task_ids
+  )
+  VALUES (
+    v_uid,
+    v_cleaner_id,
+    CASE WHEN COALESCE(p_booking->>'selection_mode', '') = 'manual' THEN v_cleaner_id ELSE NULL END,
+    v_service_id,
+    v_title,
+    v_scheduled_date,
+    v_scheduled_time,
+    v_duration_hours,
+    v_address,
+    NULLIF(btrim(COALESCE(p_booking->>'special_instructions', '')), ''),
+    COALESCE((v_pricing->>'final_amount_minor')::integer, 0),
+    COALESCE((v_pricing->>'final_amount_minor')::integer, 0),
+    COALESCE((v_pricing->>'core_amount_minor')::integer, 0),
+    COALESCE((v_pricing->>'same_day_surcharge_minor')::integer, 0),
+    COALESCE((v_pricing->>'weekend_surcharge_minor')::integer, 0),
+    COALESCE((v_pricing->>'is_same_day')::boolean, false),
+    COALESCE((v_pricing->>'is_weekend')::boolean, false),
+    COALESCE(v_pricing->>'pricing_version', 'v1'),
+    COALESCE(v_pricing->>'currency', 'GHS'),
+    COALESCE((v_pricing->>'platform_fee_major')::numeric, 0),
+    COALESCE(p_include_booking_cover, false),
+    COALESCE((v_pricing->>'booking_cover_major')::numeric, 0),
+    'pending',
+    'pending',
+    CASE
+      WHEN v_point IS NULL THEN NULL
+      ELSE ST_SetSRID(ST_GeomFromText(v_point), 4326)
+    END,
+    v_timezone,
+    v_idempotency_key,
+    NULLIF(btrim(COALESCE(p_booking->>'booking_source', '')), ''),
+    COALESCE((p_booking->>'booking_for_self')::boolean, true),
+    NULLIF(btrim(COALESCE(p_booking->>'site_contact_name', '')), ''),
+    NULLIF(btrim(COALESCE(p_booking->>'site_contact_phone', '')), ''),
+    NULLIF(btrim(COALESCE(p_booking->>'site_contact_relationship', '')), ''),
+    NULLIF(btrim(COALESCE(p_booking->>'property_type', '')), ''),
+    CASE
+      WHEN p_booking ? 'occupant_present' THEN (p_booking->>'occupant_present')::boolean
+      ELSE NULL
+    END,
+    COALESCE((p_booking->>'requires_key_or_access_code')::boolean, false),
+    NULLIF(btrim(COALESCE(p_booking->>'access_instructions', '')), ''),
+    NULLIF(btrim(COALESCE(p_booking->>'customer_contact_phone', '')), ''),
+    true,
+    COALESCE(p_equipment_provider, 'customer'),
+    now(),
+    NULLIF(btrim(COALESCE(p_booking->>'home_size', '')), ''),
+    CASE
+      WHEN jsonb_typeof(p_booking->'extra_task_ids') = 'array'
+        THEN ARRAY(SELECT jsonb_array_elements_text(p_booking->'extra_task_ids'))
+      ELSE ARRAY[]::text[]
+    END
+  )
+  RETURNING id INTO v_booking_id;
+
+  v_attach := public.attach_booking_micro_tasks(
+    v_booking_id,
+    p_selected_tasks,
+    COALESCE(p_equipment_provider, 'customer'),
+    COALESCE(p_include_booking_cover, false),
+    true
+  );
+
+  RETURN jsonb_build_object(
+    'booking_id', v_booking_id,
+    'idempotent_replay', false,
+    'pricing', v_attach->'pricing',
+    'line_item_count', v_attach->'line_item_count',
+    'claimed_uploads', v_attach->'claimed_uploads'
+  );
+EXCEPTION
+  WHEN unique_violation THEN
+    IF v_idempotency_key IS NOT NULL THEN
+      SELECT b.id, COALESCE(b.is_quick_tasks, false)
+      INTO v_existing_id, v_existing_qt
+      FROM public.bookings b
+      WHERE b.customer_id = v_uid
+        AND b.idempotency_key = v_idempotency_key
+      LIMIT 1;
+      IF v_existing_id IS NOT NULL AND v_existing_qt THEN
+        SELECT jsonb_build_object(
+          'pricing_version', b.pricing_version,
+          'currency', b.currency,
+          'final_amount_minor', b.final_amount_minor,
+          'core_amount_minor', b.core_amount_minor,
+          'line_item_count', (
+            SELECT count(*)::integer FROM public.booking_micro_tasks bmt WHERE bmt.booking_id = b.id
+          )
+        )
+        INTO v_replay
+        FROM public.bookings b
+        WHERE b.id = v_existing_id;
+        RETURN jsonb_build_object(
+          'booking_id', v_existing_id,
+          'idempotent_replay', true,
+          'pricing', v_replay
+        );
+      END IF;
+    END IF;
+    RAISE;
 END;
 $function$
 
@@ -6669,6 +8273,46 @@ BEGIN
     AND storage_path = v_path;
 
   RETURN jsonb_build_object('success', true);
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.delete_quick_task_upload(p_storage_path text)
+ RETURNS text
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_path text := NULLIF(btrim(COALESCE(p_storage_path, '')), '');
+BEGIN
+  IF v_uid IS NULL THEN
+    RAISE EXCEPTION 'Not authenticated' USING ERRCODE = '42501';
+  END IF;
+  IF v_path IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  DELETE FROM public.quick_task_uploads
+  WHERE storage_path = v_path
+    AND uploaded_by = v_uid
+    AND claimed_at IS NULL;
+
+  IF FOUND THEN
+    -- Caller must remove bytes via Storage API using the returned path.
+    RETURN v_path;
+  END IF;
+
+  IF EXISTS (
+    SELECT 1 FROM public.quick_task_uploads
+    WHERE storage_path = v_path AND uploaded_by = v_uid AND claimed_at IS NOT NULL
+  ) THEN
+    RAISE EXCEPTION 'Cannot delete a claimed Quick Tasks photo' USING ERRCODE = 'check_violation';
+  END IF;
+
+  -- Not owned / not found: no-op.
+  RETURN NULL;
 END;
 $function$
 
@@ -7458,6 +9102,38 @@ BEGIN
     'estimatedPayout', v_estimated,
     'total', v_total
   );
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.finalize_orphaned_quick_task_uploads(p_paths text[], p_claim_id uuid DEFAULT NULL::uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_deleted_rows integer := 0;
+BEGIN
+  IF p_paths IS NULL OR coalesce(array_length(p_paths, 1), 0) = 0 THEN
+    RETURN jsonb_build_object('deleted_rows', 0);
+  END IF;
+
+  IF p_claim_id IS NULL THEN
+    DELETE FROM public.quick_task_uploads
+    WHERE storage_path = ANY (p_paths)
+      AND claimed_at IS NULL
+      AND cleanup_claim_id IS NULL;
+  ELSE
+    DELETE FROM public.quick_task_uploads
+    WHERE storage_path = ANY (p_paths)
+      AND claimed_at IS NULL
+      AND cleanup_claim_id = p_claim_id;
+  END IF;
+
+  GET DIAGNOSTICS v_deleted_rows = ROW_COUNT;
+
+  RETURN jsonb_build_object('deleted_rows', v_deleted_rows, 'claim_id', p_claim_id);
 END;
 $function$
 
@@ -11080,7 +12756,7 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'error', 'booking_not_active');
   END IF;
 
-  IF lower(coalesce(v_row.payment_status::text, '')) NOT IN ('paid', 'success') THEN
+  IF lower(coalesce(v_row.payment_status::text, '')) NOT IN ('paid', 'success', 'post_paid') THEN
     RETURN jsonb_build_object('success', false, 'error', 'booking_not_active');
   END IF;
 
@@ -11482,7 +13158,8 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'error', 'not_authorized');
   END IF;
 
-  v_paid := lower(coalesce(v_row.payment_status::text, '')) IN ('paid', 'success');
+  -- post_paid = bill-later but operationally authorized (admin monthly schedules).
+  v_paid := lower(coalesce(v_row.payment_status::text, '')) IN ('paid', 'success', 'post_paid');
 
   v_unlocked := v_paid
     AND public.booking_cleaner_access_window_open(
@@ -13037,8 +14714,11 @@ BEGIN
     RETURN NEW;
   END IF;
 
-  -- Used only by confirm_zero_amount_booking() to mark paid for promo-covered zero totals.
   IF coalesce(nullif(current_setting('app.confirm_zero_amount', true), ''), '') = '1' THEN
+    RETURN NEW;
+  END IF;
+
+  IF coalesce(nullif(current_setting('app.settle_admin_monthly_schedule', true), ''), '') = '1' THEN
     RETURN NEW;
   END IF;
 
@@ -13341,6 +15021,25 @@ AS $function$
     SELECT 1 FROM public.user_roles
     WHERE user_id = user_uuid AND role_id = 'admin'
   );
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.is_authorized_quick_tasks_worker(p_cleaner_id uuid, p_direct_assigned_cleaner_id uuid, p_worker_id uuid)
+ RETURNS boolean
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+  SELECT
+    p_worker_id IS NOT NULL
+    AND (
+      public.is_admin(p_worker_id)
+      OR p_cleaner_id = p_worker_id
+      OR (
+        p_cleaner_id IS NULL
+        AND p_direct_assigned_cleaner_id = p_worker_id
+      )
+    );
 $function$
 
 
@@ -13695,6 +15394,35 @@ BEGIN
   END LOOP;
 
   RETURN v_offers;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.list_orphaned_quick_task_uploads(p_older_than interval DEFAULT '24:00:00'::interval, p_limit integer DEFAULT 200)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_paths text[];
+BEGIN
+  SELECT coalesce(array_agg(storage_path), ARRAY[]::text[])
+  INTO v_paths
+  FROM (
+    SELECT storage_path
+    FROM public.quick_task_uploads
+    WHERE claimed_at IS NULL
+      AND cleanup_claim_id IS NULL
+      AND created_at < now() - p_older_than
+    ORDER BY created_at
+    LIMIT greatest(1, least(COALESCE(p_limit, 200), 1000))
+  ) t;
+
+  RETURN jsonb_build_object(
+    'paths', to_jsonb(COALESCE(v_paths, ARRAY[]::text[])),
+    'path_count', coalesce(array_length(v_paths, 1), 0)
+  );
 END;
 $function$
 
@@ -17787,6 +19515,58 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.register_quick_task_upload(p_storage_path text)
+ RETURNS uuid
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public', 'storage'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_path text := NULLIF(btrim(COALESCE(p_storage_path, '')), '');
+  v_id uuid;
+BEGIN
+  IF v_uid IS NULL THEN
+    RAISE EXCEPTION 'Not authenticated' USING ERRCODE = '42501';
+  END IF;
+  IF v_path IS NULL
+     OR split_part(v_path, '/', 1) IS DISTINCT FROM v_uid::text
+     OR v_path !~ ('^' || v_uid::text || '/[A-Za-z0-9_.-]+\.(jpg|jpeg|png|webp)$') THEN
+    RAISE EXCEPTION 'Invalid Quick Tasks photo path' USING ERRCODE = 'check_violation';
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM storage.objects o
+    WHERE o.bucket_id = 'quick-task-photos' AND o.name = v_path
+  ) THEN
+    RAISE EXCEPTION 'Quick Tasks photo object not found' USING ERRCODE = 'check_violation';
+  END IF;
+
+  INSERT INTO public.quick_task_uploads (storage_path, uploaded_by)
+  VALUES (v_path, v_uid)
+  ON CONFLICT (storage_path) DO UPDATE
+    SET uploaded_by = EXCLUDED.uploaded_by
+  WHERE public.quick_task_uploads.uploaded_by = v_uid
+    AND public.quick_task_uploads.claimed_at IS NULL
+  RETURNING id INTO v_id;
+
+  IF v_id IS NULL THEN
+    SELECT id INTO v_id
+    FROM public.quick_task_uploads
+    WHERE storage_path = v_path
+      AND uploaded_by = v_uid
+      AND claimed_at IS NULL;
+  END IF;
+
+  IF v_id IS NULL THEN
+    RAISE EXCEPTION 'Quick Tasks photo path is not available' USING ERRCODE = 'check_violation';
+  END IF;
+
+  RETURN v_id;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.release_booking_to_broadcast(p_booking_id uuid)
  RETURNS jsonb
  LANGUAGE plpgsql
@@ -17914,15 +19694,16 @@ BEGIN
     cleaner_id = NULL,
     cleaner_hold_expires_at = NULL,
     status = CASE
-      WHEN status IN ('confirmed', 'pending') AND COALESCE(payment_status, 'pending') <> 'paid'
+      WHEN status IN ('confirmed', 'pending')
+           AND lower(COALESCE(payment_status, 'pending')) NOT IN ('paid', 'post_paid')
         THEN 'pending'::public.booking_status
       ELSE status
     END,
     updated_at = now(),
     last_updated = now()
   WHERE cleaner_id IS NOT NULL
-    AND COALESCE(payment_status, 'pending') <> 'paid'
-    AND status IN ('confirmed', 'pending') 
+    AND lower(COALESCE(payment_status, 'pending')) NOT IN ('paid', 'post_paid')
+    AND status IN ('confirmed', 'pending')
     AND (
       payment_status = 'failed'
       OR (
@@ -17956,14 +19737,15 @@ BEGIN
     cleaner_id = NULL,
     cleaner_hold_expires_at = NULL,
     status = CASE
-      WHEN status = 'confirmed' AND COALESCE(payment_status, 'pending') <> 'paid'
+      WHEN status = 'confirmed'
+           AND lower(COALESCE(payment_status, 'pending')) NOT IN ('paid', 'post_paid')
         THEN 'pending'::public.booking_status
       ELSE status
     END,
     updated_at = now(),
     last_updated = now()
   WHERE cleaner_id IS NOT NULL
-    AND COALESCE(payment_status, 'pending') <> 'paid'
+    AND lower(COALESCE(payment_status, 'pending')) NOT IN ('paid', 'post_paid')
     AND (
       payment_status = 'failed'
       OR (
@@ -17978,6 +19760,31 @@ BEGIN
     'ok', true,
     'released_count', released_count
   );
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.release_orphaned_quick_task_upload_claim(p_claim_id uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_released integer := 0;
+BEGIN
+  IF p_claim_id IS NULL THEN
+    RETURN jsonb_build_object('released_rows', 0);
+  END IF;
+
+  UPDATE public.quick_task_uploads
+  SET cleanup_claim_id = NULL, cleanup_claimed_at = NULL
+  WHERE cleanup_claim_id = p_claim_id
+    AND claimed_at IS NULL;
+
+  GET DIAGNOSTICS v_released = ROW_COUNT;
+
+  RETURN jsonb_build_object('released_rows', v_released, 'claim_id', p_claim_id);
 END;
 $function$
 
@@ -18015,6 +19822,26 @@ BEGIN
     'success', true,
     'released', v_updated > 0
   );
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.release_stale_quick_task_upload_claims(p_booking_id uuid, p_keep_paths text[] DEFAULT ARRAY[]::text[])
+ RETURNS integer
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_released integer := 0;
+BEGIN
+  UPDATE public.quick_task_uploads
+  SET booking_id = NULL, claimed_at = NULL
+  WHERE booking_id = p_booking_id
+    AND NOT (storage_path = ANY (COALESCE(p_keep_paths, ARRAY[]::text[])));
+
+  GET DIAGNOSTICS v_released = ROW_COUNT;
+  RETURN v_released;
 END;
 $function$
 
@@ -19018,14 +20845,14 @@ CREATE OR REPLACE FUNCTION public.set_cleaner_assigned_at_for_hold()
  LANGUAGE plpgsql
 AS $function$
 BEGIN
-  -- Paid bookings: only clear legacy expiry column; do not reset hold/assignment timestamps.
-  IF COALESCE(NEW.payment_status, 'pending') = 'paid' THEN
+  -- Paid / post-paid: sticky assignment, not a temporary unpaid hold.
+  IF lower(COALESCE(NEW.payment_status, 'pending')) IN ('paid', 'post_paid') THEN
     NEW.cleaner_hold_expires_at := NULL;
     RETURN NEW;
   END IF;
 
   IF NEW.cleaner_id IS NOT NULL
-     AND COALESCE(NEW.payment_status, 'pending') <> 'paid'
+     AND lower(COALESCE(NEW.payment_status, 'pending')) NOT IN ('paid', 'post_paid')
      AND (
        TG_OP = 'INSERT'
        OR OLD.cleaner_id IS NULL
@@ -19125,6 +20952,17 @@ BEGIN
     AND purpose = v_purpose;
 
   RETURN true;
+END;
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.set_micro_tasks_updated_at()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+BEGIN
+  NEW.updated_at := now();
+  RETURN NEW;
 END;
 $function$
 
@@ -19231,6 +21069,160 @@ begin
   new.updated_at = now();
   return new;
 end $function$
+
+
+CREATE OR REPLACE FUNCTION public.settle_admin_monthly_schedule_payment(p_group_id uuid, p_paystack_reference text, p_amount_minor integer)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_group public.admin_booking_schedule_groups%ROWTYPE;
+  v_booking_ids uuid[];
+  v_count integer;
+  v_share integer;
+  v_remainder integer;
+  v_idx integer := 0;
+  v_booking_id uuid;
+  v_earning integer;
+  v_fee_share integer;
+  v_fee_remainder integer;
+  v_price_share integer;
+  v_price_remainder integer;
+  v_price_minor integer;
+  v_fee_minor integer;
+  v_ref text;
+BEGIN
+  IF p_group_id IS NULL THEN
+    RAISE EXCEPTION 'group id required' USING ERRCODE = 'check_violation';
+  END IF;
+
+  v_ref := trim(COALESCE(p_paystack_reference, ''));
+  IF length(v_ref) = 0 THEN
+    RAISE EXCEPTION 'payment reference required' USING ERRCODE = 'check_violation';
+  END IF;
+
+  SELECT *
+  INTO v_group
+  FROM public.admin_booking_schedule_groups g
+  WHERE g.id = p_group_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'schedule group not found' USING ERRCODE = 'no_data_found';
+  END IF;
+
+  -- Always validate amount before any success path (including idempotent replay).
+  IF p_amount_minor IS NULL OR p_amount_minor <> v_group.monthly_amount_minor THEN
+    RAISE EXCEPTION 'paid amount does not match monthly_amount_minor'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  IF v_group.status = 'paid' THEN
+    IF v_group.paystack_reference IS NOT NULL
+       AND v_group.paystack_reference = v_ref THEN
+      RETURN jsonb_build_object(
+        'ok', true,
+        'idempotent', true,
+        'group_id', v_group.id,
+        'status', v_group.status,
+        'monthly_amount_minor', v_group.monthly_amount_minor,
+        'platform_fee_minor', v_group.platform_fee_minor,
+        'cleaner_earnings_minor', v_group.cleaner_earnings_minor
+      );
+    END IF;
+    RAISE EXCEPTION 'schedule group already settled'
+      USING ERRCODE = 'unique_violation';
+  END IF;
+
+  IF v_group.status <> 'open' THEN
+    RAISE EXCEPTION 'schedule group is not open for payment'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  -- Local-only bypass for payment_status guard (needed when JWT role is absent, e.g. psql).
+  PERFORM set_config('app.settle_admin_monthly_schedule', '1', true);
+
+  -- Fail closed if any non-cancelled visit already has terminal payment state.
+  IF EXISTS (
+    SELECT 1
+    FROM public.bookings b
+    WHERE b.schedule_group_id = v_group.id
+      AND b.status IS DISTINCT FROM 'cancelled'::public.booking_status
+      AND b.payment_status IN ('paid', 'refunded', 'partially_refunded')
+  ) THEN
+    RAISE EXCEPTION
+      'schedule group contains an already paid or refunded booking'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  -- Lock child rows in scheduled order so concurrent cancel/update cannot race allocation.
+  SELECT array_agg(q.id ORDER BY q.scheduled_date, q.id)
+  INTO v_booking_ids
+  FROM (
+    SELECT b.id, b.scheduled_date
+    FROM public.bookings b
+    WHERE b.schedule_group_id = v_group.id
+      AND b.status IS DISTINCT FROM 'cancelled'::public.booking_status
+    FOR UPDATE
+  ) q;
+
+  v_count := coalesce(cardinality(v_booking_ids), 0);
+  IF v_count < 1 THEN
+    RAISE EXCEPTION 'schedule group has no bookings to settle'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  v_share := v_group.cleaner_earnings_minor / v_count;
+  v_remainder := v_group.cleaner_earnings_minor - (v_share * v_count);
+  v_fee_share := v_group.platform_fee_minor / v_count;
+  v_fee_remainder := v_group.platform_fee_minor - (v_fee_share * v_count);
+  v_price_share := v_group.monthly_amount_minor / v_count;
+  v_price_remainder := v_group.monthly_amount_minor - (v_price_share * v_count);
+
+  FOREACH v_booking_id IN ARRAY v_booking_ids LOOP
+    v_idx := v_idx + 1;
+    v_earning := v_share + CASE WHEN v_idx = v_count THEN v_remainder ELSE 0 END;
+    v_fee_minor := v_fee_share + CASE WHEN v_idx = v_count THEN v_fee_remainder ELSE 0 END;
+    -- total_price / final_amount_minor / core_amount_minor: minor (pesewas)
+    -- platform_fee: major GHS (existing bookings convention)
+    v_price_minor := v_price_share
+      + CASE WHEN v_idx = v_count THEN v_price_remainder ELSE 0 END;
+
+    UPDATE public.bookings b
+    SET
+      payment_status = 'paid',
+      cleaner_earnings_minor = v_earning,
+      platform_fee = (v_fee_minor::numeric / 100.0),
+      total_price = v_price_minor,
+      final_amount_minor = v_price_minor,
+      core_amount_minor = v_price_minor,
+      updated_at = now()
+    WHERE b.id = v_booking_id;
+  END LOOP;
+
+  UPDATE public.admin_booking_schedule_groups g
+  SET
+    status = 'paid',
+    paystack_reference = v_ref,
+    settled_at = now(),
+    updated_at = now()
+  WHERE g.id = v_group.id;
+
+  RETURN jsonb_build_object(
+    'ok', true,
+    'idempotent', false,
+    'group_id', v_group.id,
+    'status', 'paid',
+    'booking_count', v_count,
+    'monthly_amount_minor', v_group.monthly_amount_minor,
+    'platform_fee_minor', v_group.platform_fee_minor,
+    'cleaner_earnings_minor', v_group.cleaner_earnings_minor,
+    'paystack_reference', v_ref
+  );
+END;
+$function$
 
 
 CREATE OR REPLACE FUNCTION public.spheroid_in(cstring)
@@ -22558,6 +24550,80 @@ CREATE OR REPLACE FUNCTION public.st_zmin(box3d)
 AS '$libdir/postgis-3', $function$BOX3D_zmin$function$
 
 
+CREATE OR REPLACE FUNCTION public.start_booking_micro_task(p_booking_micro_task_id uuid)
+ RETURNS jsonb
+ LANGUAGE plpgsql
+ SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_line public.booking_micro_tasks%ROWTYPE;
+  v_booking public.bookings%ROWTYPE;
+BEGIN
+  IF v_uid IS NULL THEN
+    RAISE EXCEPTION 'Not authenticated'
+      USING ERRCODE = '42501';
+  END IF;
+
+  SELECT * INTO v_line
+  FROM public.booking_micro_tasks
+  WHERE id = p_booking_micro_task_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Quick Task line item not found'
+      USING ERRCODE = 'no_data_found';
+  END IF;
+
+  SELECT * INTO v_booking
+  FROM public.bookings
+  WHERE id = v_line.booking_id
+  FOR UPDATE;
+
+  IF NOT public.is_authorized_quick_tasks_worker(
+    v_booking.cleaner_id,
+    v_booking.direct_assigned_cleaner_id,
+    v_uid
+  ) THEN
+    RAISE EXCEPTION 'Not allowed'
+      USING ERRCODE = '42501';
+  END IF;
+
+  IF v_booking.is_quick_tasks IS DISTINCT FROM true THEN
+    RAISE EXCEPTION 'Booking is not a Quick Tasks booking'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  IF v_booking.payment_status IS DISTINCT FROM 'paid' THEN
+    RAISE EXCEPTION 'Booking must be paid'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  IF v_booking.status NOT IN ('arrived', 'in_progress') THEN
+    RAISE EXCEPTION 'Booking is not eligible for task work'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  IF v_line.status IN ('completed', 'cancelled', 'skipped') THEN
+    RAISE EXCEPTION 'Cannot start a % task', v_line.status
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  UPDATE public.booking_micro_tasks
+  SET status = 'in_progress', updated_at = now()
+  WHERE id = v_line.id
+    AND status = 'pending';
+
+  RETURN jsonb_build_object(
+    'booking_micro_task_id', v_line.id,
+    'status', 'in_progress',
+    'booking_id', v_booking.id
+  );
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.start_cleaner_booking(p_booking_id uuid)
  RETURNS jsonb
  LANGUAGE plpgsql
@@ -24961,6 +27027,56 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.validate_quick_task_photo_path(p_path text)
+ RETURNS boolean
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public', 'storage'
+AS $function$
+DECLARE
+  v_uid uuid := auth.uid();
+  v_path text := NULLIF(btrim(COALESCE(p_path, '')), '');
+BEGIN
+  IF v_path IS NULL THEN
+    RETURN false;
+  END IF;
+
+  IF v_uid IS NULL THEN
+    RETURN v_path ~ '^[A-Za-z0-9_./-]+$';
+  END IF;
+
+  IF split_part(v_path, '/', 1) IS DISTINCT FROM v_uid::text THEN
+    RETURN false;
+  END IF;
+
+  IF v_path !~ ('^' || v_uid::text || '/[A-Za-z0-9_.-]+\.(jpg|jpeg|png|webp)$') THEN
+    RETURN false;
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM storage.objects o
+    WHERE o.bucket_id = 'quick-task-photos' AND o.name = v_path
+  ) THEN
+    RETURN false;
+  END IF;
+
+  RETURN EXISTS (
+    SELECT 1
+    FROM public.quick_task_uploads u
+    WHERE u.storage_path = v_path
+      AND u.uploaded_by = v_uid
+      AND (
+        u.claimed_at IS NULL
+        OR EXISTS (
+          SELECT 1 FROM public.bookings b
+          WHERE b.id = u.booking_id AND b.customer_id = v_uid
+        )
+      )
+  );
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.validate_turnover_booking_fields()
  RETURNS trigger
  LANGUAGE plpgsql
@@ -25113,6 +27229,8 @@ CREATE TRIGGER on_auth_user_identity_lookup_sync AFTER INSERT OR DELETE OR UPDAT
 
 CREATE TRIGGER on_auth_user_updated_sync_public AFTER UPDATE ON auth.users FOR EACH ROW EXECUTE FUNCTION sync_auth_user_to_public_user();
 
+CREATE TRIGGER trg_booking_micro_tasks_updated_at BEFORE UPDATE ON booking_micro_tasks FOR EACH ROW EXECUTE FUNCTION set_micro_tasks_updated_at();
+
 CREATE TRIGGER trg_booking_refunds_updated_at BEFORE UPDATE ON booking_refunds FOR EACH ROW EXECUTE FUNCTION touch_booking_refunds_updated_at();
 
 CREATE TRIGGER bookings_compute_scheduled_at_utc BEFORE INSERT OR UPDATE OF scheduled_date, scheduled_time, timezone_name ON bookings FOR EACH ROW EXECUTE FUNCTION compute_booking_scheduled_at_utc();
@@ -25164,6 +27282,8 @@ CREATE TRIGGER trg_message_delivery_attempts_updated_at BEFORE UPDATE ON message
 CREATE TRIGGER trigger_notify_new_message AFTER INSERT ON messages FOR EACH ROW EXECUTE FUNCTION notify_new_message_trigger();
 
 CREATE TRIGGER trigger_sync_convo_time AFTER INSERT ON messages FOR EACH ROW EXECUTE FUNCTION update_conversation_timestamp();
+
+CREATE TRIGGER trg_micro_tasks_updated_at BEFORE UPDATE ON micro_tasks FOR EACH ROW EXECUTE FUNCTION set_micro_tasks_updated_at();
 
 CREATE TRIGGER trigger_notify_inbox_notification_push AFTER INSERT ON notifications FOR EACH ROW EXECUTE FUNCTION notify_inbox_notification_push();
 
