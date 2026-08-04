@@ -9066,7 +9066,15 @@ DECLARE
   v_in_transit numeric;
   v_estimated numeric;
   v_total numeric;
+  v_uid uuid := auth.uid();
 BEGIN
+  -- Authenticated JWT callers may only read their own earnings.
+  -- service_role / SQL runners (auth.uid() NULL) remain allowed for ops/tests.
+  IF v_uid IS NOT NULL AND v_uid IS DISTINCT FROM p_user_id THEN
+    RAISE EXCEPTION 'Not authorized'
+      USING ERRCODE = '42501';
+  END IF;
+
   -- Paid jobs not yet completed: sum authoritative cleaner payout snapshot.
   SELECT COALESCE(
     SUM(
@@ -9091,15 +9099,24 @@ BEGIN
   FROM public.wallets
   WHERE user_id = p_user_id;
 
-  SELECT COALESCE(SUM(amount_subunit), 0) INTO v_total
-  FROM public.wallet_transactions
-  WHERE wallet_id = (SELECT id FROM public.wallets WHERE user_id = p_user_id)
-    AND type = 'credit'
-    AND created_at BETWEEN p_start_date AND p_end_date;
+  -- Period total: job earnings only (booking-linked credits).
+  -- Exclude withdrawal refund/reversal credits and other non-job credits.
+  -- Half-open range avoids missing or double-counting boundary timestamps.
+  SELECT COALESCE(SUM(wt.amount_subunit), 0)
+  INTO v_total
+  FROM public.wallet_transactions wt
+  JOIN public.wallets w
+    ON w.id = wt.wallet_id
+  WHERE w.user_id = p_user_id
+    AND wt.type = 'credit'
+    AND wt.booking_id IS NOT NULL
+    AND wt.withdrawal_request_id IS NULL
+    AND wt.created_at >= p_start_date
+    AND wt.created_at < p_end_date;
 
   RETURN json_build_object(
     'inTransit', ROUND(v_in_transit),
-    'estimatedPayout', v_estimated,
+    'estimatedPayout', COALESCE(v_estimated, 0),
     'total', v_total
   );
 END;
