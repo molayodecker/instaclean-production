@@ -13016,46 +13016,6 @@ END;
 $function$
 
 
-CREATE OR REPLACE FUNCTION public.get_cleaner_availability_by_id(p_cleaner_id uuid, p_date date, p_time time without time zone, p_duration numeric, p_timezone text DEFAULT 'UTC'::text)
- RETURNS TABLE(id uuid, fullname text, avatar_url text, hourly_rate numeric, is_available boolean)
- LANGUAGE plpgsql
- STABLE
-AS $function$
-DECLARE
-    v_start_local timestamp;
-    v_end_local   timestamp;
-    v_requested_range tstzrange;
-BEGIN
-    v_start_local := (p_date + p_time)::timestamp;
-    v_end_local   := v_start_local + (p_duration * interval '1 hour') + interval '1 hour';
-
-    v_requested_range := tstzrange(
-        (v_start_local AT TIME ZONE p_timezone),
-        (v_end_local   AT TIME ZONE p_timezone),
-        '[)'
-    );
-
-    RETURN QUERY
-    SELECT
-        cd.user_id,
-        p.fullname,
-        p.avatar_url,
-        cd.hourly_rate,
-        NOT EXISTS (
-            SELECT 1
-            FROM public.bookings b
-            WHERE b.cleaner_id = p_cleaner_id
-              AND b.booking_period && v_requested_range
-              AND b.status IS DISTINCT FROM 'cancelled'
-        ) AS is_available
-    FROM public.cleaner_data cd
-    JOIN public.profiles p ON p.id = cd.user_id
-    WHERE cd.user_id = p_cleaner_id
-      AND cd.status = 'active';
-END;
-$function$
-
-
 CREATE OR REPLACE FUNCTION public.get_cleaner_availability_by_id(p_cleaner_id uuid, p_date date, p_time time without time zone, p_duration numeric, p_timezone text DEFAULT 'UTC'::text, p_exclude_booking_id uuid DEFAULT NULL::uuid)
  RETURNS TABLE(id uuid, fullname text, avatar_url text, hourly_rate numeric, is_available boolean)
  LANGUAGE plpgsql
