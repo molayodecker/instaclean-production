@@ -6802,19 +6802,41 @@ BEGIN
     v_extra_hours := 0;
   ELSE
     v_extra_hours := COALESCE(public._extra_task_hours_total(p_extra_task_ids), 0);
-    v_base_duration_raw := greatest(0, p_duration_hours_raw - v_extra_hours);
-    v_rounded_base :=
-      round(v_base_duration_raw / v_duration_increment_hours) * v_duration_increment_hours;
 
-    IF v_rounded_base < v_min_duration_hours THEN
+    -- Authenticated callers can invoke this SECURITY DEFINER RPC. Reject
+    -- impossible totals that would zero out base service labor via
+    -- greatest(0, total - extras) while extras alone meet the minimum.
+    IF p_duration_hours_raw < v_extra_hours THEN
+      RAISE EXCEPTION 'Total duration cannot be less than extra-task duration';
+    END IF;
+
+    -- Validate the client-supplied TOTAL before base-duration rounding.
+    -- Rounding base to the service increment can shrink/grow recomposed total
+    -- (e.g. 2.0 total − 0.3 extras → base 1.7 → rounded 1.5 → 1.8) and must
+    -- not reject a cart that already meets the service minimum.
+    IF p_duration_hours_raw < v_min_duration_hours THEN
       RAISE EXCEPTION 'Minimum duration for this service is % hours', v_min_duration_hours;
     END IF;
 
-    v_duration_hours := v_rounded_base + v_extra_hours;
-
-    IF v_duration_hours > v_max_duration_hours THEN
+    IF p_duration_hours_raw > v_max_duration_hours THEN
       RAISE EXCEPTION 'Maximum duration for this service is % hours', v_max_duration_hours;
     END IF;
+
+    v_base_duration_raw := p_duration_hours_raw - v_extra_hours;
+    v_rounded_base :=
+      round(v_base_duration_raw / v_duration_increment_hours) * v_duration_increment_hours;
+
+    v_duration_hours := v_rounded_base + v_extra_hours;
+
+    -- Rounding must never move the authoritative billable total outside the
+    -- service limits (stored on bookings.duration_hours and used for labor).
+    v_duration_hours := greatest(
+      v_min_duration_hours,
+      least(v_max_duration_hours, v_duration_hours)
+    );
+
+    -- Keep base labor consistent with the authoritative total.
+    v_rounded_base := greatest(0, v_duration_hours - v_extra_hours);
   END IF;
 
   SELECT wr.work_rate, wr.work_rate_before_discount, wr.catalog_discount_pct
@@ -13702,6 +13724,7 @@ CREATE OR REPLACE FUNCTION "public"."handle_new_user_multi_role"() RETURNS "trig
     AS $$
 DECLARE
   v_phone text;
+  v_email text;
 BEGIN
   v_phone := public.normalize_phone_for_users(
     COALESCE(
@@ -13711,10 +13734,16 @@ BEGIN
     )
   );
 
+  v_email := lower(NULLIF(btrim(NEW.email), ''));
+  IF v_email IS NOT NULL
+     AND v_email LIKE '%@phone.tryinstaclean.local' THEN
+    v_email := NULL;
+  END IF;
+
   INSERT INTO public.users (id, email, phone)
   VALUES (
     NEW.id,
-    lower(NULLIF(btrim(NEW.email), '')),
+    v_email,
     CASE
       WHEN v_phone IS NOT NULL
        AND NOT EXISTS (
@@ -13729,7 +13758,13 @@ BEGIN
   )
   ON CONFLICT (id) DO UPDATE
   SET
-    email = COALESCE(EXCLUDED.email, public.users.email),
+    email = CASE
+      WHEN EXCLUDED.email IS NOT NULL THEN EXCLUDED.email
+      WHEN public.users.email IS NOT NULL
+           AND lower(public.users.email) LIKE '%@phone.tryinstaclean.local'
+        THEN NULL
+      ELSE public.users.email
+    END,
     phone = CASE
       WHEN v_phone IS NOT NULL
        AND NOT EXISTS (
@@ -20238,11 +20273,12 @@ CREATE OR REPLACE FUNCTION "public"."sync_auth_user_to_public_user"() RETURNS "t
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
-declare
+DECLARE
   meta_first text;
   meta_last text;
   meta_full text;
-begin
+  synced_email text;
+BEGIN
   meta_first := nullif(trim(coalesce(new.raw_user_meta_data->>'first_name', '')), '');
   meta_last := nullif(trim(coalesce(new.raw_user_meta_data->>'last_name', '')), '');
   meta_full := nullif(
@@ -20256,42 +20292,54 @@ begin
     ''
   );
 
-  insert into public.users (id, email, phone, updated_at, last_updated)
-  values (new.id, new.email, new.phone, now(), now())
-  on conflict (id) do update
-  set
-    email = excluded.email,
+  synced_email := nullif(trim(coalesce(new.email, '')), '');
+  IF synced_email IS NOT NULL
+     AND lower(synced_email) LIKE '%@phone.tryinstaclean.local' THEN
+    synced_email := NULL;
+  END IF;
+
+  INSERT INTO public.users (id, email, phone, updated_at, last_updated)
+  VALUES (new.id, synced_email, new.phone, now(), now())
+  ON CONFLICT (id) DO UPDATE
+  SET
+    email = CASE
+      WHEN excluded.email IS NOT NULL THEN excluded.email
+      WHEN public.users.email IS NOT NULL
+           AND lower(public.users.email) LIKE '%@phone.tryinstaclean.local'
+        THEN NULL
+      ELSE public.users.email
+    END,
     phone = coalesce(excluded.phone, public.users.phone),
     updated_at = now(),
     last_updated = now();
 
-  insert into public.profiles (id, user_id, firstname, lastname, fullname, updated_at)
-  values (new.id, new.id, meta_first, meta_last, meta_full, now())
-  on conflict (id) do update
-  set
-    firstname = case
-      when nullif(trim(coalesce(public.profiles.firstname, '')), '') is null
-        then coalesce(excluded.firstname, public.profiles.firstname)
-      else public.profiles.firstname
-    end,
-    lastname = case
-      when nullif(trim(coalesce(public.profiles.lastname, '')), '') is null
-        then coalesce(excluded.lastname, public.profiles.lastname)
-      else public.profiles.lastname
-    end,
-    fullname = case
-      when nullif(trim(coalesce(public.profiles.fullname, '')), '') is null
-        then coalesce(excluded.fullname, public.profiles.fullname)
-      else public.profiles.fullname
-    end,
+  INSERT INTO public.profiles (id, user_id, firstname, lastname, fullname, updated_at)
+  VALUES (new.id, new.id, meta_first, meta_last, meta_full, now())
+  ON CONFLICT (id) DO UPDATE
+  SET
+    firstname = CASE
+      WHEN nullif(trim(coalesce(public.profiles.firstname, '')), '') IS NULL
+        THEN coalesce(excluded.firstname, public.profiles.firstname)
+      ELSE public.profiles.firstname
+    END,
+    lastname = CASE
+      WHEN nullif(trim(coalesce(public.profiles.lastname, '')), '') IS NULL
+        THEN coalesce(excluded.lastname, public.profiles.lastname)
+      ELSE public.profiles.lastname
+    END,
+    fullname = CASE
+      WHEN nullif(trim(coalesce(public.profiles.fullname, '')), '') IS NULL
+        THEN coalesce(excluded.fullname, public.profiles.fullname)
+      ELSE public.profiles.fullname
+    END,
     updated_at = now();
 
-  insert into public.user_roles (user_id, role_id)
-  values (new.id, coalesce(new.raw_app_meta_data->>'role', 'customer'))
-  on conflict (user_id, role_id) do nothing;
+  INSERT INTO public.user_roles (user_id, role_id)
+  VALUES (new.id, coalesce(new.raw_app_meta_data->>'role', 'customer'))
+  ON CONFLICT (user_id, role_id) DO NOTHING;
 
-  return new;
-end;
+  RETURN new;
+END;
 $$;
 
 
