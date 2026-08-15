@@ -719,15 +719,40 @@ CREATE OR REPLACE FUNCTION "public"."_promotion_code_redemption_count"("p_promot
     SET "search_path" TO 'public', 'pg_temp'
     AS $$
   SELECT count(*)::integer
-  FROM public.bookings b
+  FROM public.promotion_redemptions r
+  INNER JOIN public.bookings b ON b.id = r.booking_id
   WHERE b.promotion_code_id = p_promotion_code_id
-    AND (p_exclude_booking_id IS NULL OR b.id <> p_exclude_booking_id)
-    AND lower(coalesce(b.payment_status, 'pending')) IN ('pending', 'paid')
-    AND b.status IS DISTINCT FROM 'cancelled';
+    AND (
+      r.status = 'redeemed'
+      OR (
+        r.status = 'reserved'
+        AND (
+          (r.expires_at IS NOT NULL AND r.expires_at > now())
+          OR EXISTS (
+            SELECT 1
+            FROM public.admin_booking_schedule_groups g
+            WHERE g.id = b.schedule_group_id
+              AND g.status = 'open'
+              AND g.promotion_id = r.promotion_id
+              AND nullif(trim(COALESCE(g.paystack_reference, '')), '') IS NOT NULL
+              AND g.paystack_checkout_expires_at IS NOT NULL
+              AND g.paystack_checkout_expires_at > now()
+          )
+        )
+      )
+    )
+    AND (
+      p_exclude_booking_id IS NULL
+      OR r.booking_id IS DISTINCT FROM p_exclude_booking_id
+    );
 $$;
 
 
 ALTER FUNCTION "public"."_promotion_code_redemption_count"("p_promotion_code_id" "uuid", "p_exclude_booking_id" "uuid") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."_promotion_code_redemption_count"("p_promotion_code_id" "uuid", "p_exclude_booking_id" "uuid") IS 'Counts redeemed and live reserved rows. Reserved rows are live when unexpired, or while an open schedule checkout hold (paystack_checkout_expires_at) is still active. expires_at NULL alone is not live.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."_promotion_eligibility_core"("p_customer_id" "uuid", "p_promotion_slug" "text", "p_channel" "text", "p_service_id" integer DEFAULT NULL::integer, "p_lat" double precision DEFAULT NULL::double precision, "p_lng" double precision DEFAULT NULL::double precision, "p_extra_task_ids" "text"[] DEFAULT NULL::"text"[], "p_is_recurring" boolean DEFAULT false, "p_booking_id" "uuid" DEFAULT NULL::"uuid", "p_promotion_code_id" "uuid" DEFAULT NULL::"uuid") RETURNS "jsonb"
@@ -1122,6 +1147,16 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'error', 'payment_not_paid');
   END IF;
 
+  -- Durable explicit decline: never allow reclaim after decline.
+  IF EXISTS (
+    SELECT 1
+    FROM public.booking_assignment_declines d
+    WHERE d.booking_id = p_booking_id
+      AND d.cleaner_id = v_uid
+  ) THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_eligible');
+  END IF;
+
   IF v_row.cleaner_accepted_at IS NOT NULL
      AND v_row.assignment_phase = 'accepted' THEN
     IF v_row.cleaner_id = v_uid THEN
@@ -1180,6 +1215,10 @@ $$;
 
 
 ALTER FUNCTION "public"."accept_booking_assignment"("p_booking_id" "uuid") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."accept_booking_assignment"("p_booking_id" "uuid") IS 'Accept exclusive/broadcast assignment. Allows paid and post_paid via booking_payment_allows_contact; rejects durable booking_assignment_declines.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."accept_co_cleaner_invite"("p_token" "uuid") RETURNS "jsonb"
@@ -1756,6 +1795,39 @@ COMMENT ON FUNCTION "public"."admin_reset_exclusive_accept_hold"("p_booking_id" 
 
 
 
+CREATE OR REPLACE FUNCTION "public"."admin_schedule_checkout_hold_interval"() RETURNS interval
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+DECLARE
+  c_default_minutes constant numeric := 60;
+  v_minutes numeric;
+BEGIN
+  SELECT bs.value_numeric
+  INTO v_minutes
+  FROM public.booking_settings bs
+  WHERE bs.key = 'admin_schedule_paystack_checkout_hold_minutes';
+
+  IF v_minutes IS NULL OR v_minutes < 1 THEN
+    v_minutes := c_default_minutes;
+  END IF;
+
+  IF v_minutes > 24 * 60 THEN
+    v_minutes := 24 * 60;
+  END IF;
+
+  RETURN make_interval(mins => trunc(v_minutes)::integer);
+END;
+$$;
+
+
+ALTER FUNCTION "public"."admin_schedule_checkout_hold_interval"() OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."admin_schedule_checkout_hold_interval"() IS 'Finite checkout voucher-hold duration from booking_settings (default 60m, max 24h).';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."admin_soft_delete_user"("p_user_id" "uuid", "p_reason" "text" DEFAULT 'Deleted by admin'::"text") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -2085,6 +2157,171 @@ $$;
 
 
 ALTER FUNCTION "public"."allocate_schedule_group_customer_invoice_seq"("p_group_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."apply_paystack_refund_webhook_event"("p_booking_refund_id" "uuid", "p_event" "text", "p_paystack_refund_reference" "text" DEFAULT NULL::"text", "p_failure_reason" "text" DEFAULT NULL::"text") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_refund public.booking_refunds%ROWTYPE;
+  v_event text := lower(trim(COALESCE(p_event, '')));
+  v_payment_status text;
+  v_ref text := NULLIF(trim(COALESCE(p_paystack_refund_reference, '')), '');
+  v_failure text := NULLIF(trim(COALESCE(p_failure_reason, '')), '');
+BEGIN
+  IF p_booking_refund_id IS NULL OR v_event = '' THEN
+    RETURN jsonb_build_object('success', false, 'error', 'invalid_args');
+  END IF;
+
+  SELECT * INTO v_refund
+  FROM public.booking_refunds
+  WHERE id = p_booking_refund_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'not_found');
+  END IF;
+
+  v_payment_status := CASE
+    WHEN v_refund.refund_percent = 100 THEN 'refunded'
+    WHEN v_refund.refund_percent = 50 THEN 'partially_refunded'
+    ELSE NULL
+  END;
+
+  -- Terminal processed: ignore downgrades; heal payment_status on processed retries.
+  IF v_refund.status = 'processed' THEN
+    IF v_event = 'refund.processed' THEN
+      IF v_payment_status IS NOT NULL THEN
+        UPDATE public.bookings
+        SET
+          payment_status = v_payment_status,
+          updated_at = now(),
+          last_updated = now()
+        WHERE id = v_refund.booking_id
+          AND payment_status IS DISTINCT FROM v_payment_status;
+      END IF;
+
+      IF v_ref IS NOT NULL THEN
+        UPDATE public.booking_refunds
+        SET
+          paystack_refund_reference = COALESCE(paystack_refund_reference, v_ref),
+          updated_at = now()
+        WHERE id = v_refund.id;
+      END IF;
+
+      RETURN jsonb_build_object(
+        'success', true,
+        'already_processed', true,
+        'refund_status', 'processed',
+        'payment_status', v_payment_status
+      );
+    END IF;
+
+    RETURN jsonb_build_object(
+      'success', true,
+      'ignored', true,
+      'reason', 'already_processed',
+      'refund_status', 'processed'
+    );
+  END IF;
+
+  -- Do not move failed / manual_review backwards to pending.
+  IF v_refund.status IN ('failed', 'manual_review')
+     AND v_event IN ('refund.pending', 'refund.processing')
+  THEN
+    RETURN jsonb_build_object(
+      'success', true,
+      'ignored', true,
+      'reason', 'non_pending_terminal',
+      'refund_status', v_refund.status
+    );
+  END IF;
+
+  IF v_event IN ('refund.pending', 'refund.processing') THEN
+    UPDATE public.booking_refunds
+    SET
+      status = 'pending',
+      paystack_refund_reference = COALESCE(v_ref, paystack_refund_reference),
+      failure_reason = NULL,
+      updated_at = now()
+    WHERE id = v_refund.id;
+
+    RETURN jsonb_build_object('success', true, 'refund_status', 'pending');
+  END IF;
+
+  IF v_event = 'refund.needs-attention' THEN
+    UPDATE public.booking_refunds
+    SET
+      status = 'manual_review',
+      paystack_refund_reference = COALESCE(v_ref, paystack_refund_reference),
+      failure_reason = COALESCE(
+        v_failure,
+        'Paystack refund needs attention (customer bank details may be required).'
+      ),
+      updated_at = now()
+    WHERE id = v_refund.id;
+
+    RETURN jsonb_build_object('success', true, 'refund_status', 'manual_review');
+  END IF;
+
+  IF v_event = 'refund.failed' THEN
+    UPDATE public.booking_refunds
+    SET
+      status = 'failed',
+      paystack_refund_reference = COALESCE(v_ref, paystack_refund_reference),
+      failure_reason = COALESCE(v_failure, 'Paystack reported refund.failed.'),
+      updated_at = now()
+    WHERE id = v_refund.id;
+
+    RETURN jsonb_build_object('success', true, 'refund_status', 'failed');
+  END IF;
+
+  IF v_event = 'refund.processed' THEN
+    UPDATE public.booking_refunds
+    SET
+      status = 'processed',
+      paystack_refund_reference = COALESCE(v_ref, paystack_refund_reference),
+      failure_reason = CASE
+        WHEN v_payment_status IS NULL
+          THEN COALESCE(v_failure, format('Unhandled refund_percent=%s on refund.processed', v_refund.refund_percent))
+        ELSE NULL
+      END,
+      updated_at = now()
+    WHERE id = v_refund.id;
+
+    IF v_payment_status IS NOT NULL THEN
+      UPDATE public.bookings
+      SET
+        payment_status = v_payment_status,
+        updated_at = now(),
+        last_updated = now()
+      WHERE id = v_refund.booking_id;
+    END IF;
+
+    RETURN jsonb_build_object(
+      'success', true,
+      'refund_status', 'processed',
+      'payment_status', v_payment_status,
+      'settled', v_payment_status IS NOT NULL
+    );
+  END IF;
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'ignored', true,
+    'reason', 'unknown_event',
+    'event', v_event
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."apply_paystack_refund_webhook_event"("p_booking_refund_id" "uuid", "p_event" "text", "p_paystack_refund_reference" "text", "p_failure_reason" "text") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."apply_paystack_refund_webhook_event"("p_booking_refund_id" "uuid", "p_event" "text", "p_paystack_refund_reference" "text", "p_failure_reason" "text") IS 'Apply a Paystack refund.* webhook atomically. processed is terminal; retries heal bookings.payment_status.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."apply_referral_code"("p_code" "text") RETURNS "jsonb"
@@ -4422,7 +4659,10 @@ BEGIN
       v_location,
       v_tz,
       'confirmed'::public.booking_status,
-      'post_paid',
+      CASE
+        WHEN coalesce(v_group.billing_mode, 'postpaid') = 'postpaid' THEN 'post_paid'
+        ELSE 'pending'
+      END,
       v_total_minor,
       v_total_minor,
       v_total_minor,
@@ -4452,6 +4692,12 @@ BEGIN
     updated_at = now()
   WHERE g.id = v_group.id;
 
+  -- Keep promotion metadata on the earliest active visit after reshuffle.
+  IF v_group.promotion_id IS NOT NULL
+     AND COALESCE(v_group.promotion_discount_minor, 0) > 0 THEN
+    PERFORM public.reattach_admin_schedule_promotion_anchor(v_group.id);
+  END IF;
+
   RETURN jsonb_build_object(
     'ok', true,
     'idempotent', false,
@@ -4473,6 +4719,274 @@ ALTER FUNCTION "public"."change_admin_monthly_schedule_weekdays"("p_group_id" "u
 
 
 COMMENT ON FUNCTION "public"."change_admin_monthly_schedule_weekdays"("p_group_id" "uuid", "p_weekdays" integer[], "p_as_of_date" "date") IS 'Atomically move remaining open-group visits onto new ISO weekdays. Locks the group (and child bookings) with FOR UPDATE; service_role only. p_as_of_date overrides “today” for tests.';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."claim_admin_monthly_schedule_checkout"("p_group_id" "uuid", "p_candidate_reference" "text") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_group public.admin_booking_schedule_groups%ROWTYPE;
+  v_candidate text := trim(COALESCE(p_candidate_reference, ''));
+  v_existing text;
+  v_lease_active boolean := false;
+  v_anchor uuid;
+  v_has_live_hold boolean := false;
+  v_pinned boolean := false;
+  v_checkout_hold_live boolean := false;
+BEGIN
+  IF p_group_id IS NULL THEN
+    RAISE EXCEPTION 'group id required' USING ERRCODE = 'check_violation';
+  END IF;
+  IF length(v_candidate) = 0 THEN
+    RAISE EXCEPTION 'candidate reference required' USING ERRCODE = 'check_violation';
+  END IF;
+
+  SELECT *
+  INTO v_group
+  FROM public.admin_booking_schedule_groups g
+  WHERE g.id = p_group_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'schedule group not found' USING ERRCODE = 'no_data_found';
+  END IF;
+
+  IF v_group.status = 'paid' THEN
+    RETURN jsonb_build_object(
+      'ok', false,
+      'code', 'already_paid',
+      'reference', v_group.paystack_reference,
+      'created', false,
+      'lease_active', false
+    );
+  END IF;
+
+  IF v_group.status IS DISTINCT FROM 'open' THEN
+    RETURN jsonb_build_object(
+      'ok', false,
+      'code', 'not_open',
+      'reference', v_group.paystack_reference,
+      'created', false,
+      'lease_active', false
+    );
+  END IF;
+
+  v_existing := nullif(trim(COALESCE(v_group.paystack_reference, '')), '');
+  v_checkout_hold_live :=
+    v_existing IS NOT NULL
+    AND v_group.paystack_checkout_expires_at IS NOT NULL
+    AND v_group.paystack_checkout_expires_at > now();
+
+  IF v_existing IS NOT NULL AND NOT v_checkout_hold_live THEN
+    IF v_group.paystack_checkout_expires_at IS NULL THEN
+      -- Legacy open checkout from before paystack_checkout_expires_at existed:
+      -- grant a fresh finite hold and keep the existing Paystack reference.
+      v_pinned := public.pin_admin_schedule_promotion_for_checkout(p_group_id);
+      IF v_group.promotion_id IS NOT NULL
+         AND COALESCE(v_group.promotion_discount_minor, 0) > 0
+         AND NOT v_pinned THEN
+        RETURN jsonb_build_object(
+          'ok', false,
+          'code', 'promotion_unavailable',
+          'reference', v_existing,
+          'created', false,
+          'lease_active', false,
+          'message', 'could not pin legacy schedule promotion for checkout'
+        );
+      END IF;
+
+      SELECT *
+      INTO v_group
+      FROM public.admin_booking_schedule_groups g
+      WHERE g.id = p_group_id;
+
+      v_checkout_hold_live :=
+        v_group.paystack_checkout_expires_at IS NOT NULL
+        AND v_group.paystack_checkout_expires_at > now();
+    ELSE
+      -- Hold expired: drop abandoned reference so voucher can be revalidated.
+      UPDATE public.admin_booking_schedule_groups g
+      SET
+        paystack_reference = NULL,
+        paystack_checkout_claimed_at = NULL,
+        paystack_checkout_expires_at = NULL,
+        updated_at = now()
+      WHERE g.id = p_group_id
+        AND g.status = 'open';
+
+      v_existing := NULL;
+      v_group.paystack_reference := NULL;
+      v_group.paystack_checkout_claimed_at := NULL;
+      v_group.paystack_checkout_expires_at := NULL;
+    END IF;
+  END IF;
+
+  IF v_group.promotion_id IS NOT NULL
+     AND COALESCE(v_group.promotion_discount_minor, 0) > 0 THEN
+    BEGIN
+      v_anchor := public.reattach_admin_schedule_promotion_anchor(v_group.id);
+    EXCEPTION
+      WHEN others THEN
+        RETURN jsonb_build_object(
+          'ok', false,
+          'code', 'promotion_unavailable',
+          'reference', v_group.paystack_reference,
+          'created', false,
+          'lease_active', false,
+          'message', SQLERRM
+        );
+    END;
+
+    IF v_anchor IS NULL THEN
+      RETURN jsonb_build_object(
+        'ok', false,
+        'code', 'promotion_unavailable',
+        'reference', v_group.paystack_reference,
+        'created', false,
+        'lease_active', false,
+        'message', 'schedule promotion has no active visit'
+      );
+    END IF;
+
+    SELECT EXISTS (
+      SELECT 1
+      FROM public.promotion_redemptions r
+      INNER JOIN public.bookings b ON b.id = r.booking_id
+      WHERE r.user_id = v_group.customer_id
+        AND r.promotion_id = v_group.promotion_id
+        AND r.status = 'reserved'
+        AND r.expires_at IS NOT NULL
+        AND r.expires_at > now()
+        AND b.schedule_group_id = v_group.id
+    )
+    INTO v_has_live_hold;
+
+    IF NOT v_has_live_hold THEN
+      RETURN jsonb_build_object(
+        'ok', false,
+        'code', 'promotion_unavailable',
+        'reference', v_group.paystack_reference,
+        'created', false,
+        'lease_active', false,
+        'message', 'schedule promotion reservation is not active'
+      );
+    END IF;
+  END IF;
+
+  IF v_existing IS NULL THEN
+    UPDATE public.admin_booking_schedule_groups g
+    SET
+      paystack_reference = v_candidate,
+      paystack_checkout_claimed_at = now(),
+      updated_at = now()
+    WHERE g.id = v_group.id
+      AND g.status = 'open'
+      AND nullif(trim(COALESCE(g.paystack_reference, '')), '') IS NULL;
+
+    IF NOT FOUND THEN
+      SELECT *
+      INTO v_group
+      FROM public.admin_booking_schedule_groups g
+      WHERE g.id = p_group_id;
+
+      v_pinned := public.pin_admin_schedule_promotion_for_checkout(p_group_id);
+      IF v_group.promotion_id IS NOT NULL
+         AND COALESCE(v_group.promotion_discount_minor, 0) > 0
+         AND NOT v_pinned THEN
+        RETURN jsonb_build_object(
+          'ok', false,
+          'code', 'promotion_unavailable',
+          'reference', v_group.paystack_reference,
+          'created', false,
+          'lease_active', false,
+          'message', 'could not pin schedule promotion for checkout'
+        );
+      END IF;
+
+      v_lease_active :=
+        v_group.paystack_checkout_claimed_at IS NOT NULL
+        AND v_group.paystack_checkout_claimed_at > now() - interval '3 minutes';
+
+      RETURN jsonb_build_object(
+        'ok', true,
+        'code', 'reused',
+        'reference', nullif(trim(COALESCE(v_group.paystack_reference, '')), ''),
+        'created', false,
+        'lease_active', v_lease_active,
+        'claimed_at', v_group.paystack_checkout_claimed_at,
+        'checkout_expires_at', (
+          SELECT g.paystack_checkout_expires_at
+          FROM public.admin_booking_schedule_groups g
+          WHERE g.id = p_group_id
+        )
+      );
+    END IF;
+
+    v_pinned := public.pin_admin_schedule_promotion_for_checkout(p_group_id);
+    IF v_group.promotion_id IS NOT NULL
+       AND COALESCE(v_group.promotion_discount_minor, 0) > 0
+       AND NOT v_pinned THEN
+      RAISE EXCEPTION
+        'could not pin schedule promotion for checkout'
+        USING ERRCODE = 'check_violation';
+    END IF;
+
+    RETURN jsonb_build_object(
+      'ok', true,
+      'code', 'created',
+      'reference', v_candidate,
+      'created', true,
+      'lease_active', true,
+      'claimed_at', now(),
+      'checkout_expires_at', (
+        SELECT g.paystack_checkout_expires_at
+        FROM public.admin_booking_schedule_groups g
+        WHERE g.id = p_group_id
+      )
+    );
+  END IF;
+
+  v_pinned := public.pin_admin_schedule_promotion_for_checkout(p_group_id);
+  IF v_group.promotion_id IS NOT NULL
+     AND COALESCE(v_group.promotion_discount_minor, 0) > 0
+     AND NOT v_pinned THEN
+    RETURN jsonb_build_object(
+      'ok', false,
+      'code', 'promotion_unavailable',
+      'reference', v_existing,
+      'created', false,
+      'lease_active', false,
+      'message', 'could not pin schedule promotion for checkout'
+    );
+  END IF;
+
+  v_lease_active :=
+    v_group.paystack_checkout_claimed_at IS NOT NULL
+    AND v_group.paystack_checkout_claimed_at > now() - interval '3 minutes';
+
+  RETURN jsonb_build_object(
+    'ok', true,
+    'code', 'reused',
+    'reference', v_existing,
+    'created', false,
+    'lease_active', v_lease_active,
+    'claimed_at', v_group.paystack_checkout_claimed_at,
+    'checkout_expires_at', (
+      SELECT g.paystack_checkout_expires_at
+      FROM public.admin_booking_schedule_groups g
+      WHERE g.id = p_group_id
+    )
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."claim_admin_monthly_schedule_checkout"("p_group_id" "uuid", "p_candidate_reference" "text") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."claim_admin_monthly_schedule_checkout"("p_group_id" "uuid", "p_candidate_reference" "text") IS 'Claims/reuses a Paystack reference after voucher preflight. Legacy NULL paystack_checkout_expires_at gets a fresh finite hold and keeps the existing reference; expired holds are cleared so vouchers can be revalidated.';
 
 
 
@@ -5190,6 +5704,15 @@ BEGIN
   WHERE b.id = p_booking_id;
 
   IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM public.booking_assignment_declines d
+    WHERE d.booking_id = p_booking_id
+      AND d.cleaner_id = p_cleaner_id
+  ) THEN
     RETURN false;
   END IF;
 
@@ -9008,6 +9531,8 @@ CREATE OR REPLACE FUNCTION "public"."decline_booking_by_cleaner"("p_booking_id" 
 DECLARE
   v_uid uuid := auth.uid();
   v_row public.bookings%ROWTYPE;
+  v_release jsonb;
+  v_force boolean := false;
 BEGIN
   IF v_uid IS NULL THEN
     RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
@@ -9020,7 +9545,14 @@ BEGIN
   SELECT * INTO v_row
   FROM public.bookings
   WHERE id = p_booking_id
-    AND cleaner_id = v_uid
+    AND (
+      cleaner_id = v_uid
+      OR (
+        direct_assigned_cleaner_id = v_uid
+        AND cleaner_accepted_at IS NULL
+        AND COALESCE(assignment_phase::text, '') <> 'accepted'
+      )
+    )
     AND status IN ('confirmed', 'scheduled')
   FOR UPDATE;
 
@@ -9028,10 +9560,44 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'error', 'not_declinable');
   END IF;
 
+  INSERT INTO public.booking_assignment_declines (booking_id, cleaner_id, reason)
+  VALUES (p_booking_id, v_uid, NULLIF(trim(p_reason), ''))
+  ON CONFLICT (booking_id, cleaner_id) DO UPDATE
+  SET
+    declined_at = now(),
+    reason = COALESCE(EXCLUDED.reason, public.booking_assignment_declines.reason);
+
+  IF lower(COALESCE(v_row.payment_status, '')) = 'paid' THEN
+    v_force := v_row.cleaner_accepted_at IS NOT NULL
+      OR v_row.assignment_phase = 'accepted';
+    v_release := public.release_booking_to_broadcast(p_booking_id, v_force, v_uid);
+    IF COALESCE(v_release->>'success', 'false') <> 'true' THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'release_failed',
+        'detail', v_release
+      );
+    END IF;
+    IF COALESCE((v_release->>'already_accepted')::boolean, false) THEN
+      RETURN jsonb_build_object(
+        'success', false,
+        'error', 'release_blocked_already_accepted',
+        'detail', v_release
+      );
+    END IF;
+    RETURN jsonb_build_object(
+      'success', true,
+      'booking_id', p_booking_id,
+      'released_to_broadcast', true,
+      'forced_after_accept', v_force
+    );
+  END IF;
+
   UPDATE public.bookings
   SET
     status = 'cancelled',
-    updated_at = now()
+    updated_at = now(),
+    last_updated = now()
   WHERE id = p_booking_id;
 
   IF v_row.customer_id IS NOT NULL THEN
@@ -9055,6 +9621,10 @@ $$;
 
 
 ALTER FUNCTION "public"."decline_booking_by_cleaner"("p_booking_id" "uuid", "p_reason" "text") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."decline_booking_by_cleaner"("p_booking_id" "uuid", "p_reason" "text") IS 'Cleaner declines an assignment. Paid bookings release to broadcast and pass the declining cleaner id so explicit declines are durable (including pre-accept). Once accepted, only the current cleaner_id may decline.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."default_service_timezone"() RETURNS "text"
@@ -10415,6 +10985,87 @@ $$;
 ALTER FUNCTION "public"."get_active_pricing_rule"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."get_admin_cleaner_dispatch_map"() RETURNS TABLE("user_id" "uuid", "display_name" "text", "latitude" double precision, "longitude" double precision, "max_travel_distance_meters" integer, "specialties" "text"[], "service_areas" "text"[], "rating" double precision, "completed_jobs" integer, "verified" boolean, "status" "text")
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+  SELECT
+    cd.user_id,
+    COALESCE(
+      NULLIF(BTRIM(p.fullname), ''),
+      NULLIF(BTRIM(CONCAT_WS(' ', p.firstname, p.lastname)), ''),
+      'Cleaner'
+    ) AS display_name,
+    CASE
+      WHEN COALESCE(cd.base_location::geography, p.location_wkt) IS NULL THEN NULL
+      ELSE ST_Y(COALESCE(cd.base_location::geography, p.location_wkt)::geometry)
+    END AS latitude,
+    CASE
+      WHEN COALESCE(cd.base_location::geography, p.location_wkt) IS NULL THEN NULL
+      ELSE ST_X(COALESCE(cd.base_location::geography, p.location_wkt)::geometry)
+    END AS longitude,
+    COALESCE(cd.max_travel_distance_meters, 30000) AS max_travel_distance_meters,
+    COALESCE(cd.specialties, ARRAY[]::text[]) AS specialties,
+    COALESCE(cd.service_areas, ARRAY[]::text[]) AS service_areas,
+    public.cleaner_display_rating(cd.rating, cd.review_count) AS rating,
+    public.cleaner_completed_paid_jobs_count(cd.user_id) AS completed_jobs,
+    cd.verified,
+    cd.status::text
+  FROM public.cleaner_data cd
+  JOIN public.profiles p ON p.user_id = cd.user_id
+  WHERE cd.status = 'active'
+    AND cd.verified = true
+    AND public.is_profile_discoverable_by_others(p)
+  ORDER BY display_name ASC, cd.user_id ASC;
+$$;
+
+
+ALTER FUNCTION "public"."get_admin_cleaner_dispatch_map"() OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."get_admin_cleaner_dispatch_map"() IS 'Service-role-only admin dispatch feed containing active verified cleaner coordinates when available, specialties, travel radius, display rating and authoritative completed jobs.';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."get_admin_customer_dispatch_locations"("p_days_ahead" integer DEFAULT 30) RETURNS TABLE("booking_id" "uuid", "customer_id" "uuid", "customer_name" "text", "address" "text", "latitude" double precision, "longitude" double precision, "scheduled_at_utc" timestamp with time zone, "timezone_name" "text", "status" "text", "service_name" "text")
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+  SELECT
+    b.id AS booking_id,
+    b.customer_id,
+    COALESCE(
+      NULLIF(BTRIM(p.fullname), ''),
+      NULLIF(BTRIM(CONCAT_WS(' ', p.firstname, p.lastname)), ''),
+      'Customer'
+    ) AS customer_name,
+    b.address,
+    ST_Y(b.location_coordinates::geometry) AS latitude,
+    ST_X(b.location_coordinates::geometry) AS longitude,
+    b.scheduled_at_utc,
+    COALESCE(NULLIF(BTRIM(b.timezone_name), ''), 'Africa/Accra') AS timezone_name,
+    b.status::text,
+    COALESCE(st.name, b.title, 'Service') AS service_name
+  FROM public.bookings b
+  LEFT JOIN public.profiles p ON p.user_id = b.customer_id
+  LEFT JOIN public.service_types st ON st.id = b.service_id
+  WHERE b.location_coordinates IS NOT NULL
+    AND b.customer_id IS NOT NULL
+    AND public.booking_payment_allows_contact(b.payment_status::text)
+    AND b.status IN ('pending', 'confirmed', 'scheduled', 'en_route', 'arrived', 'in_progress')
+    AND b.scheduled_at_utc >= now() - interval '1 day'
+    AND b.scheduled_at_utc <= now() + make_interval(days => GREATEST(1, LEAST(COALESCE(p_days_ahead, 30), 90)))
+  ORDER BY b.scheduled_at_utc ASC, b.created_at DESC;
+$$;
+
+
+ALTER FUNCTION "public"."get_admin_customer_dispatch_locations"("p_days_ahead" integer) OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."get_admin_customer_dispatch_locations"("p_days_ahead" integer) IS 'Service-role-only paid/post-paid upcoming customer booking locations for the admin cleaner dispatch map.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."get_ai_match_settings"() RETURNS "jsonb"
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public', 'pg_temp'
@@ -11210,6 +11861,15 @@ BEGIN
         FROM public.cleaner_availability_exceptions cae
         WHERE cae.cleaner_id = cd.user_id
           AND cae.exception_date = p_date
+      )
+      AND (
+        p_exclude_booking_id IS NULL
+        OR NOT EXISTS (
+          SELECT 1
+          FROM public.booking_assignment_declines d
+          WHERE d.booking_id = p_exclude_booking_id
+            AND d.cleaner_id = cd.user_id
+        )
       )
   ),
   scored_cleaners AS (
@@ -14390,6 +15050,12 @@ BEGIN
     AND public.booking_broadcast_grace_ends_at(
       b.scheduled_at_utc, b.duration_hours, b.duration_final
     ) > now()
+    AND NOT EXISTS (
+      SELECT 1
+      FROM public.booking_assignment_declines d
+      WHERE d.booking_id = b.id
+        AND d.cleaner_id = p_cleaner_id
+    )
     AND EXISTS (
       SELECT 1
       FROM public.get_best_available_cleaners(
@@ -14414,6 +15080,10 @@ $$;
 
 
 ALTER FUNCTION "public"."list_broadcast_assignments_for_cleaner"("p_cleaner_id" "uuid") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."list_broadcast_assignments_for_cleaner"("p_cleaner_id" "uuid") IS 'List broadcast bookings for the authenticated cleaner. Sets system discovery context before get_best_available_cleaners and excludes durable declines.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."list_cleaner_assignment_offers"("p_cleaner_id" "uuid" DEFAULT NULL::"uuid") RETURNS "jsonb"
@@ -15784,6 +16454,67 @@ COMMENT ON FUNCTION "public"."phone_lookup_variants"("p_raw" "text") IS 'E.164 a
 
 
 
+CREATE OR REPLACE FUNCTION "public"."pin_admin_schedule_promotion_for_checkout"("p_group_id" "uuid") RETURNS boolean
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+DECLARE
+  v_group public.admin_booking_schedule_groups%ROWTYPE;
+  v_hold_until timestamptz;
+  v_updated integer := 0;
+BEGIN
+  IF p_group_id IS NULL THEN
+    RETURN false;
+  END IF;
+
+  SELECT *
+  INTO v_group
+  FROM public.admin_booking_schedule_groups g
+  WHERE g.id = p_group_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN false;
+  END IF;
+
+  v_hold_until := now() + public.admin_schedule_checkout_hold_interval();
+
+  UPDATE public.admin_booking_schedule_groups g
+  SET
+    paystack_checkout_expires_at = v_hold_until,
+    updated_at = now()
+  WHERE g.id = p_group_id;
+
+  IF v_group.promotion_id IS NULL
+     OR COALESCE(v_group.promotion_discount_minor, 0) <= 0 THEN
+    RETURN true;
+  END IF;
+
+  UPDATE public.promotion_redemptions r
+  SET expires_at = v_hold_until
+  WHERE r.user_id = v_group.customer_id
+    AND r.promotion_id = v_group.promotion_id
+    AND r.status = 'reserved'
+    AND EXISTS (
+      SELECT 1
+      FROM public.bookings b
+      WHERE b.id = r.booking_id
+        AND b.schedule_group_id = p_group_id
+    );
+
+  GET DIAGNOSTICS v_updated = ROW_COUNT;
+  RETURN v_updated > 0;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."pin_admin_schedule_promotion_for_checkout"("p_group_id" "uuid") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."pin_admin_schedule_promotion_for_checkout"("p_group_id" "uuid") IS 'Sets a finite checkout hold on the group and package reservation (now + hold interval). Never pins with expires_at NULL.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."platform_fee_major_from_booking"("p_platform_fee" numeric, "p_core_amount_minor" integer) RETURNS numeric
     LANGUAGE "plpgsql" IMMUTABLE
     AS $$
@@ -16279,6 +17010,169 @@ $_$;
 
 
 ALTER FUNCTION "public"."queue_inbox_notification_push"("p_user_id" "uuid", "p_title" "text", "p_body" "text", "p_type" "text", "p_data" "jsonb") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."reattach_admin_schedule_promotion_anchor"("p_group_id" "uuid") RETURNS "uuid"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+DECLARE
+  v_group public.admin_booking_schedule_groups%ROWTYPE;
+  v_anchor uuid;
+  v_expires timestamptz;
+  v_red record;
+  v_reserve jsonb;
+  v_hold_in_group boolean := false;
+  v_live_reserved boolean := false;
+  v_checkout_held boolean := false;
+BEGIN
+  IF p_group_id IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  SELECT *
+  INTO v_group
+  FROM public.admin_booking_schedule_groups g
+  WHERE g.id = p_group_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN NULL;
+  END IF;
+
+  IF v_group.promotion_id IS NULL
+     OR COALESCE(v_group.promotion_discount_minor, 0) <= 0 THEN
+    RETURN NULL;
+  END IF;
+
+  SELECT b.id
+  INTO v_anchor
+  FROM public.bookings b
+  WHERE b.schedule_group_id = p_group_id
+    AND b.status IS DISTINCT FROM 'cancelled'::public.booking_status
+  ORDER BY b.scheduled_date, b.id
+  LIMIT 1;
+
+  IF v_anchor IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  UPDATE public.bookings b
+  SET
+    promotion_id = NULL,
+    promotion_slug = NULL,
+    promotion_code_id = NULL,
+    promotion_discount_minor = 0,
+    updated_at = now()
+  WHERE b.schedule_group_id = p_group_id
+    AND b.id IS DISTINCT FROM v_anchor
+    AND (
+      b.promotion_id IS NOT NULL
+      OR COALESCE(b.promotion_discount_minor, 0) <> 0
+      OR b.promotion_slug IS NOT NULL
+      OR b.promotion_code_id IS NOT NULL
+    );
+
+  UPDATE public.bookings b
+  SET
+    promotion_id = v_group.promotion_id,
+    promotion_slug = v_group.promotion_slug,
+    promotion_code_id = v_group.promotion_code_id,
+    promotion_discount_minor = v_group.promotion_discount_minor,
+    updated_at = now()
+  WHERE b.id = v_anchor;
+
+  v_expires :=
+    ((v_group.period_end + 1)::timestamp AT TIME ZONE 'Africa/Accra')
+    + interval '14 days';
+
+  v_checkout_held :=
+    nullif(trim(COALESCE(v_group.paystack_reference, '')), '') IS NOT NULL
+    AND v_group.paystack_checkout_expires_at IS NOT NULL
+    AND v_group.paystack_checkout_expires_at > now();
+
+  SELECT r.status, r.booking_id, r.expires_at
+  INTO v_red
+  FROM public.promotion_redemptions r
+  WHERE r.user_id = v_group.customer_id
+    AND r.promotion_id = v_group.promotion_id
+  FOR UPDATE;
+
+  IF FOUND THEN
+    IF v_red.status = 'redeemed' THEN
+      IF EXISTS (
+        SELECT 1
+        FROM public.bookings b
+        WHERE b.id = v_red.booking_id
+          AND b.schedule_group_id = p_group_id
+      ) THEN
+        RETURN v_anchor;
+      END IF;
+      RAISE EXCEPTION
+        'schedule promotion already redeemed on another booking'
+        USING ERRCODE = 'check_violation';
+    END IF;
+
+    SELECT EXISTS (
+      SELECT 1
+      FROM public.bookings b
+      WHERE b.id = v_red.booking_id
+        AND b.schedule_group_id = p_group_id
+    )
+    INTO v_hold_in_group;
+
+    v_live_reserved :=
+      v_red.status = 'reserved'
+      AND (
+        (v_red.expires_at IS NOT NULL AND v_red.expires_at > now())
+        OR (v_checkout_held AND v_hold_in_group)
+      );
+
+    IF v_live_reserved THEN
+      IF NOT v_hold_in_group THEN
+        RAISE EXCEPTION
+          'schedule promotion reservation is held by another booking'
+          USING ERRCODE = 'check_violation';
+      END IF;
+
+      UPDATE public.promotion_redemptions r
+      SET
+        booking_id = v_anchor,
+        discount_minor = v_group.promotion_discount_minor,
+        expires_at = CASE
+          WHEN v_checkout_held THEN v_group.paystack_checkout_expires_at
+          ELSE GREATEST(COALESCE(r.expires_at, v_expires), v_expires)
+        END
+      WHERE r.user_id = v_group.customer_id
+        AND r.promotion_id = v_group.promotion_id
+        AND r.status = 'reserved';
+
+      RETURN v_anchor;
+    END IF;
+  END IF;
+
+  v_reserve := public.reserve_promotion_for_booking(v_anchor);
+  IF COALESCE((v_reserve ->> 'success')::boolean, false) IS NOT TRUE THEN
+    RAISE EXCEPTION
+      'schedule promotion reservation failed: %',
+      coalesce(v_reserve ->> 'error', 'unknown')
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  IF v_checkout_held THEN
+    PERFORM public.pin_admin_schedule_promotion_for_checkout(p_group_id);
+  END IF;
+
+  RETURN v_anchor;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."reattach_admin_schedule_promotion_anchor"("p_group_id" "uuid") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."reattach_admin_schedule_promotion_anchor"("p_group_id" "uuid") IS 'Stamps group promo onto earliest active visit. Live = unexpired reserved, or reserved under an unexpired checkout hold. Expired holds re-reserve via caps.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."recalculate_customer_trust_profile"("p_customer_id" "uuid") RETURNS "public"."customer_trust_profiles"
@@ -17776,7 +18670,59 @@ $_$;
 ALTER FUNCTION "public"."register_quick_task_upload"("p_storage_path" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."release_booking_to_broadcast"("p_booking_id" "uuid") RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."release_admin_monthly_schedule_checkout"("p_group_id" "uuid", "p_expected_reference" "text") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_expected text := trim(COALESCE(p_expected_reference, ''));
+  v_updated integer := 0;
+BEGIN
+  IF p_group_id IS NULL THEN
+    RAISE EXCEPTION 'group id required' USING ERRCODE = 'check_violation';
+  END IF;
+  IF length(v_expected) = 0 THEN
+    RAISE EXCEPTION 'expected reference required' USING ERRCODE = 'check_violation';
+  END IF;
+
+  UPDATE public.admin_booking_schedule_groups g
+  SET
+    paystack_reference = NULL,
+    paystack_checkout_claimed_at = NULL,
+    updated_at = now()
+  WHERE g.id = p_group_id
+    AND g.status = 'open'
+    AND nullif(trim(COALESCE(g.paystack_reference, '')), '') = v_expected;
+
+  GET DIAGNOSTICS v_updated = ROW_COUNT;
+
+  IF v_updated = 0 THEN
+    RETURN jsonb_build_object(
+      'ok', false,
+      'code', 'cas_mismatch',
+      'released', false
+    );
+  END IF;
+
+  PERFORM public.unpin_admin_schedule_promotion_after_checkout_release(p_group_id);
+
+  RETURN jsonb_build_object(
+    'ok', true,
+    'code', 'released',
+    'released', true
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."release_admin_monthly_schedule_checkout"("p_group_id" "uuid", "p_expected_reference" "text") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."release_admin_monthly_schedule_checkout"("p_group_id" "uuid", "p_expected_reference" "text") IS 'CAS-clear open-group Paystack reference after initialize fails, and restore the package voucher TTL so another schedule may claim the slot.';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."release_booking_to_broadcast"("p_booking_id" "uuid", "p_force_after_accept" boolean DEFAULT false, "p_declining_cleaner_id" "uuid" DEFAULT NULL::"uuid") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
@@ -17789,8 +18735,12 @@ DECLARE
   v_requested_category public.service_category;
   v_candidate uuid;
   v_notified integer := 0;
+  v_exclude_cleaner_id uuid;
+  v_clear_direct_assigned boolean := false;
+  v_explicit_decline boolean := p_declining_cleaner_id IS NOT NULL;
 BEGIN
   PERFORM set_config('app.system_cleaner_discovery', '1', true);
+  PERFORM set_config('app.booking_assignment_write', '1', true);
 
   SELECT * INTO v_row
   FROM public.bookings
@@ -17801,13 +18751,40 @@ BEGIN
     RETURN jsonb_build_object('success', false, 'error', 'not_found');
   END IF;
 
-  IF v_row.assignment_phase = 'accepted' OR v_row.cleaner_accepted_at IS NOT NULL THEN
+  IF NOT p_force_after_accept
+     AND (v_row.assignment_phase = 'accepted' OR v_row.cleaner_accepted_at IS NOT NULL)
+  THEN
     RETURN jsonb_build_object('success', true, 'already_accepted', true);
   END IF;
+
+  -- Explicit decline excludes that cleaner. Force-after-accept excludes current cleaner_id.
+  v_exclude_cleaner_id := COALESCE(
+    p_declining_cleaner_id,
+    CASE WHEN p_force_after_accept THEN v_row.cleaner_id ELSE NULL END
+  );
+
+  -- Clear direct pointer only when it belongs to the cleaner being released/declining.
+  -- Hold expiry (no declining cleaner) preserves the original direct-selected cleaner.
+  v_clear_direct_assigned := (
+    p_declining_cleaner_id IS NOT NULL
+    AND v_row.direct_assigned_cleaner_id IS NOT DISTINCT FROM p_declining_cleaner_id
+  ) OR (
+    p_force_after_accept
+    AND v_row.direct_assigned_cleaner_id IS NOT NULL
+    AND v_row.direct_assigned_cleaner_id IS NOT DISTINCT FROM v_row.cleaner_id
+  );
 
   UPDATE public.bookings
   SET
     cleaner_id = NULL,
+    cleaner_accepted_at = CASE
+      WHEN p_force_after_accept THEN NULL
+      ELSE cleaner_accepted_at
+    END,
+    direct_assigned_cleaner_id = CASE
+      WHEN v_clear_direct_assigned THEN NULL
+      ELSE direct_assigned_cleaner_id
+    END,
     assignment_phase = 'broadcast',
     assignment_hold_until = NULL,
     updated_at = now(),
@@ -17820,8 +18797,18 @@ BEGIN
       v_row.customer_id,
       'cleaner_assignment_broadcast',
       'Finding another cleaner',
-      'Your selected cleaner did not accept in time. We''re offering your job to other trusted cleaners so your booking is not delayed.',
-      jsonb_build_object('booking_id', p_booking_id, 'bookingId', p_booking_id)
+      CASE
+        WHEN p_force_after_accept OR v_explicit_decline THEN
+          'Your cleaner can no longer take this job. We''re finding another trusted cleaner for your booking.'
+        ELSE
+          'Your selected cleaner did not accept in time. We''re offering your job to other trusted cleaners so your booking is not delayed.'
+      END,
+      jsonb_build_object(
+        'booking_id', p_booking_id,
+        'bookingId', p_booking_id,
+        'force_after_accept', p_force_after_accept,
+        'explicit_decline', v_explicit_decline
+      )
     );
   END IF;
 
@@ -17829,7 +18816,13 @@ BEGIN
      OR v_row.scheduled_date IS NULL
      OR v_row.scheduled_time IS NULL
   THEN
-    RETURN jsonb_build_object('success', true, 'notified_cleaners', 0);
+    RETURN jsonb_build_object(
+      'success', true,
+      'notified_cleaners', 0,
+      'forced_after_accept', p_force_after_accept,
+      'cleared_direct_assigned', v_clear_direct_assigned,
+      'explicit_decline', v_explicit_decline
+    );
   END IF;
 
   v_lat := ST_Y(v_row.location_coordinates::geometry);
@@ -17858,7 +18851,13 @@ BEGIN
     ORDER BY g.final_score DESC NULLS LAST, g.distance_meters ASC
     LIMIT 12
   LOOP
-    IF v_candidate IS NULL OR v_candidate = v_row.direct_assigned_cleaner_id THEN
+    IF v_candidate IS NULL
+       OR (
+         NOT v_clear_direct_assigned
+         AND v_candidate = v_row.direct_assigned_cleaner_id
+       )
+       OR (v_exclude_cleaner_id IS NOT NULL AND v_candidate = v_exclude_cleaner_id)
+    THEN
       CONTINUE;
     END IF;
     INSERT INTO public.notifications (user_id, type, title, message, data)
@@ -17872,7 +18871,13 @@ BEGIN
     v_notified := v_notified + 1;
   END LOOP;
 
-  IF v_row.direct_assigned_cleaner_id IS NOT NULL THEN
+  IF v_row.direct_assigned_cleaner_id IS NOT NULL
+     AND NOT v_clear_direct_assigned
+     AND (
+       v_exclude_cleaner_id IS NULL
+       OR v_row.direct_assigned_cleaner_id IS DISTINCT FROM v_exclude_cleaner_id
+     )
+  THEN
     INSERT INTO public.notifications (user_id, type, title, message, data)
     VALUES (
       v_row.direct_assigned_cleaner_id,
@@ -17883,12 +18888,22 @@ BEGIN
     );
   END IF;
 
-  RETURN jsonb_build_object('success', true, 'notified_cleaners', v_notified);
+  RETURN jsonb_build_object(
+    'success', true,
+    'notified_cleaners', v_notified,
+    'forced_after_accept', p_force_after_accept,
+    'cleared_direct_assigned', v_clear_direct_assigned,
+    'explicit_decline', v_explicit_decline
+  );
 END;
 $$;
 
 
-ALTER FUNCTION "public"."release_booking_to_broadcast"("p_booking_id" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."release_booking_to_broadcast"("p_booking_id" "uuid", "p_force_after_accept" boolean, "p_declining_cleaner_id" "uuid") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."release_booking_to_broadcast"("p_booking_id" "uuid", "p_force_after_accept" boolean, "p_declining_cleaner_id" "uuid") IS 'Open a paid booking to broadcast. Hold expiry preserves direct_assigned_cleaner_id. Explicit decline passes p_declining_cleaner_id to exclude/clear that cleaner. p_force_after_accept clears cleaner_accepted_at after an accepted cleaner backs out.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."release_cleaner_after_15min_hold"() RETURNS "jsonb"
@@ -17910,6 +18925,7 @@ BEGIN
     updated_at = now(),
     last_updated = now()
   WHERE cleaner_id IS NOT NULL
+    AND schedule_group_id IS NULL
     AND lower(COALESCE(payment_status, 'pending')) NOT IN ('paid', 'post_paid')
     AND status IN ('confirmed', 'pending')
     AND (
@@ -17941,6 +18957,7 @@ DECLARE
   released_count integer := 0;
 BEGIN
   -- Keep cleaner_assigned_at so clients detect hold expiry (cleaner_id null + assigned_at set).
+  -- schedule_group_id visits are sticky prepaid/postpaid packages — never auto-release.
   UPDATE public.bookings
   SET
     cleaner_id = NULL,
@@ -17954,6 +18971,7 @@ BEGIN
     updated_at = now(),
     last_updated = now()
   WHERE cleaner_id IS NOT NULL
+    AND schedule_group_id IS NULL
     AND lower(COALESCE(payment_status, 'pending')) NOT IN ('paid', 'post_paid')
     AND (
       payment_status = 'failed'
@@ -18071,7 +19089,30 @@ CREATE OR REPLACE FUNCTION "public"."release_welcome_promotion_reservation"("p_b
     AS $$
 DECLARE
   v_updated integer;
+  v_schedule_owned boolean := false;
 BEGIN
+  -- Read-only ownership check: no FOR UPDATE on the schedule group.
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.bookings b
+    INNER JOIN public.admin_booking_schedule_groups g
+      ON g.id = b.schedule_group_id
+    WHERE b.id = p_booking_id
+      AND g.status = 'open'
+      AND g.promotion_id IS NOT NULL
+      AND COALESCE(g.promotion_discount_minor, 0) > 0
+  )
+  INTO v_schedule_owned;
+
+  IF v_schedule_owned THEN
+    RETURN jsonb_build_object(
+      'success', true,
+      'released', false,
+      'schedule_owned', true,
+      'kept', true
+    );
+  END IF;
+
   UPDATE public.promotion_redemptions
   SET status = 'released'
   WHERE booking_id = p_booking_id
@@ -18088,6 +19129,10 @@ $$;
 
 
 ALTER FUNCTION "public"."release_welcome_promotion_reservation"("p_booking_id" "uuid") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."release_welcome_promotion_reservation"("p_booking_id" "uuid") IS 'Releases a reserved promotion for a booking. For open admin schedule groups with a package voucher, keeps the hold in place (no synchronous reattach) so cancel cannot fail on voucher caps.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."remove_co_cleaner_from_team"("p_co_cleaner_id" "uuid") RETURNS "jsonb"
@@ -18136,14 +19181,17 @@ CREATE OR REPLACE FUNCTION "public"."reserve_promotion_for_booking"("p_booking_i
     AS $$
 DECLARE
   v_caller uuid := auth.uid();
+  v_is_service boolean := coalesce(auth.role(), '') = 'service_role';
   v_booking record;
   v_promo public.promotions%ROWTYPE;
   v_code public.promotion_codes%ROWTYPE;
   v_global_count integer;
   v_code_count integer;
   v_existing record;
+  v_expires_at timestamptz;
+  v_period_end date;
 BEGIN
-  IF v_caller IS NULL THEN
+  IF NOT v_is_service AND v_caller IS NULL THEN
     RETURN jsonb_build_object('success', false, 'error', 'not_authenticated');
   END IF;
 
@@ -18153,12 +19201,17 @@ BEGIN
     b.promotion_id,
     b.promotion_discount_minor,
     b.promotion_code_id,
-    b.cleaner_hold_expires_at
+    b.cleaner_hold_expires_at,
+    b.schedule_group_id
   INTO v_booking
   FROM public.bookings b
   WHERE b.id = p_booking_id;
 
-  IF NOT FOUND OR v_booking.customer_id <> v_caller THEN
+  IF NOT FOUND THEN
+    RETURN jsonb_build_object('success', false, 'error', 'forbidden');
+  END IF;
+
+  IF NOT v_is_service AND v_booking.customer_id <> v_caller THEN
     RETURN jsonb_build_object('success', false, 'error', 'forbidden');
   END IF;
 
@@ -18195,6 +19248,26 @@ BEGIN
   END IF;
 
   PERFORM public.cleanup_expired_welcome_promotion_reservations();
+
+  IF v_booking.schedule_group_id IS NOT NULL THEN
+    SELECT g.period_end
+    INTO v_period_end
+    FROM public.admin_booking_schedule_groups g
+    WHERE g.id = v_booking.schedule_group_id;
+
+    IF v_period_end IS NOT NULL THEN
+      v_expires_at :=
+        ((v_period_end + 1)::timestamp AT TIME ZONE 'Africa/Accra')
+        + interval '14 days';
+    END IF;
+  END IF;
+
+  IF v_expires_at IS NULL THEN
+    v_expires_at := COALESCE(
+      v_booking.cleaner_hold_expires_at,
+      now() + interval '48 hours'
+    );
+  END IF;
 
   SELECT r.status, r.booking_id, r.expires_at
   INTO v_existing
@@ -18245,7 +19318,7 @@ BEGIN
         booking_id = p_booking_id,
         discount_minor = v_booking.promotion_discount_minor,
         reserved_at = now(),
-        expires_at = COALESCE(v_booking.cleaner_hold_expires_at, now() + interval '48 hours')
+        expires_at = v_expires_at
       WHERE user_id = v_booking.customer_id
         AND promotion_id = v_booking.promotion_id
         AND (
@@ -18282,7 +19355,7 @@ BEGIN
       v_booking.promotion_discount_minor,
       'reserved',
       now(),
-      COALESCE(v_booking.cleaner_hold_expires_at, now() + interval '48 hours')
+      v_expires_at
     );
 
     RETURN jsonb_build_object('success', true);
@@ -18861,6 +19934,91 @@ $$;
 ALTER FUNCTION "public"."rls_auto_enable"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."rotate_admin_monthly_schedule_checkout"("p_group_id" "uuid", "p_expected_reference" "text", "p_new_reference" "text") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_expected text := trim(COALESCE(p_expected_reference, ''));
+  v_new text := trim(COALESCE(p_new_reference, ''));
+  v_updated integer := 0;
+  v_group public.admin_booking_schedule_groups%ROWTYPE;
+BEGIN
+  IF p_group_id IS NULL THEN
+    RAISE EXCEPTION 'group id required' USING ERRCODE = 'check_violation';
+  END IF;
+  IF length(v_expected) = 0 OR length(v_new) = 0 THEN
+    RAISE EXCEPTION 'expected and new references required' USING ERRCODE = 'check_violation';
+  END IF;
+  IF v_expected = v_new THEN
+    RETURN jsonb_build_object(
+      'ok', true,
+      'code', 'unchanged',
+      'reference', v_new,
+      'rotated', false
+    );
+  END IF;
+
+  UPDATE public.admin_booking_schedule_groups g
+  SET
+    paystack_reference = v_new,
+    paystack_checkout_claimed_at = now(),
+    updated_at = now()
+  WHERE g.id = p_group_id
+    AND g.status = 'open'
+    AND nullif(trim(COALESCE(g.paystack_reference, '')), '') = v_expected
+    AND (
+      g.paystack_checkout_claimed_at IS NULL
+      OR g.paystack_checkout_claimed_at <= now() - interval '3 minutes'
+    )
+    AND g.paystack_checkout_expires_at IS NOT NULL
+    AND g.paystack_checkout_expires_at > now();
+
+  GET DIAGNOSTICS v_updated = ROW_COUNT;
+
+  IF v_updated = 0 THEN
+    RETURN jsonb_build_object(
+      'ok', false,
+      'code', 'cas_mismatch_or_lease_active',
+      'rotated', false
+    );
+  END IF;
+
+  SELECT *
+  INTO v_group
+  FROM public.admin_booking_schedule_groups g
+  WHERE g.id = p_group_id;
+
+  IF NOT public.pin_admin_schedule_promotion_for_checkout(p_group_id)
+     AND v_group.promotion_id IS NOT NULL
+     AND COALESCE(v_group.promotion_discount_minor, 0) > 0 THEN
+    RAISE EXCEPTION
+      'could not pin schedule promotion after checkout rotate'
+      USING ERRCODE = 'check_violation';
+  END IF;
+
+  RETURN jsonb_build_object(
+    'ok', true,
+    'code', 'rotated',
+    'reference', v_new,
+    'rotated', true,
+    'checkout_expires_at', (
+      SELECT g.paystack_checkout_expires_at
+      FROM public.admin_booking_schedule_groups g
+      WHERE g.id = p_group_id
+    )
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."rotate_admin_monthly_schedule_checkout"("p_group_id" "uuid", "p_expected_reference" "text", "p_new_reference" "text") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."rotate_admin_monthly_schedule_checkout"("p_group_id" "uuid", "p_expected_reference" "text", "p_new_reference" "text") IS 'CAS-replace open-group Paystack reference only while the checkout hold is still live; refreshes the finite voucher hold.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."round_coord_for_geocode"("p_value" double precision, "p_precision" integer DEFAULT 4) RETURNS double precision
     LANGUAGE "sql" IMMUTABLE
     AS $$
@@ -19316,6 +20474,12 @@ CREATE OR REPLACE FUNCTION "public"."set_cleaner_assigned_at_for_hold"() RETURNS
     LANGUAGE "plpgsql"
     AS $$
 BEGIN
+  -- Admin monthly schedule visits: sticky cleaner assignment, not a temp hold.
+  IF NEW.schedule_group_id IS NOT NULL THEN
+    NEW.cleaner_hold_expires_at := NULL;
+    RETURN NEW;
+  END IF;
+
   -- Paid / post-paid: sticky assignment, not a temporary unpaid hold.
   IF lower(COALESCE(NEW.payment_status, 'pending')) IN ('paid', 'post_paid') THEN
     NEW.cleaner_hold_expires_at := NULL;
@@ -19669,6 +20833,8 @@ DECLARE
   v_price_minor integer;
   v_fee_minor integer;
   v_ref text;
+  v_anchor uuid;
+  v_finalize jsonb;
 BEGIN
   IF p_group_id IS NULL THEN
     RAISE EXCEPTION 'group id required' USING ERRCODE = 'check_violation';
@@ -19689,12 +20855,12 @@ BEGIN
     RAISE EXCEPTION 'schedule group not found' USING ERRCODE = 'no_data_found';
   END IF;
 
-  -- Always validate amount before any success path (including idempotent replay).
   IF p_amount_minor IS NULL OR p_amount_minor <> v_group.monthly_amount_minor THEN
     RAISE EXCEPTION 'paid amount does not match monthly_amount_minor'
       USING ERRCODE = 'check_violation';
   END IF;
 
+  -- Fully idempotent replay: first settle already finalized promotion atomically.
   IF v_group.status = 'paid' THEN
     IF v_group.paystack_reference IS NOT NULL
        AND v_group.paystack_reference = v_ref THEN
@@ -19717,10 +20883,8 @@ BEGIN
       USING ERRCODE = 'check_violation';
   END IF;
 
-  -- Local-only bypass for payment_status guard (needed when JWT role is absent, e.g. psql).
   PERFORM set_config('app.settle_admin_monthly_schedule', '1', true);
 
-  -- Fail closed if any non-cancelled visit already has terminal payment state.
   IF EXISTS (
     SELECT 1
     FROM public.bookings b
@@ -19733,7 +20897,6 @@ BEGIN
       USING ERRCODE = 'check_violation';
   END IF;
 
-  -- Lock child rows in scheduled order so concurrent cancel/update cannot race allocation.
   SELECT array_agg(q.id ORDER BY q.scheduled_date, q.id)
   INTO v_booking_ids
   FROM (
@@ -19761,8 +20924,6 @@ BEGIN
     v_idx := v_idx + 1;
     v_earning := v_share + CASE WHEN v_idx = v_count THEN v_remainder ELSE 0 END;
     v_fee_minor := v_fee_share + CASE WHEN v_idx = v_count THEN v_fee_remainder ELSE 0 END;
-    -- total_price / final_amount_minor / core_amount_minor: minor (pesewas)
-    -- platform_fee: major GHS (existing bookings convention)
     v_price_minor := v_price_share
       + CASE WHEN v_idx = v_count THEN v_price_remainder ELSE 0 END;
 
@@ -19786,6 +20947,21 @@ BEGIN
     updated_at = now()
   WHERE g.id = v_group.id;
 
+  IF v_group.promotion_id IS NOT NULL
+     AND COALESCE(v_group.promotion_discount_minor, 0) > 0 THEN
+    v_anchor := public.reattach_admin_schedule_promotion_anchor(v_group.id);
+    IF v_anchor IS NULL THEN
+      RAISE EXCEPTION 'schedule promotion has no active visit to redeem'
+        USING ERRCODE = 'check_violation';
+    END IF;
+    v_finalize := public.finalize_promotion_redemption(v_anchor);
+    IF COALESCE((v_finalize ->> 'success')::boolean, false) IS NOT TRUE THEN
+      RAISE EXCEPTION 'schedule promotion finalization failed: %',
+        coalesce(v_finalize ->> 'error', 'unknown')
+        USING ERRCODE = 'check_violation';
+    END IF;
+  END IF;
+
   RETURN jsonb_build_object(
     'ok', true,
     'idempotent', false,
@@ -19795,7 +20971,8 @@ BEGIN
     'monthly_amount_minor', v_group.monthly_amount_minor,
     'platform_fee_minor', v_group.platform_fee_minor,
     'cleaner_earnings_minor', v_group.cleaner_earnings_minor,
-    'paystack_reference', v_ref
+    'paystack_reference', v_ref,
+    'promotion_finalize', v_finalize
   );
 END;
 $$;
@@ -19804,7 +20981,7 @@ $$;
 ALTER FUNCTION "public"."settle_admin_monthly_schedule_payment"("p_group_id" "uuid", "p_paystack_reference" "text", "p_amount_minor" integer) OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."settle_admin_monthly_schedule_payment"("p_group_id" "uuid", "p_paystack_reference" "text", "p_amount_minor" integer) IS 'Idempotent settle for admin monthly schedule groups. Allocates monthly_amount_minor across non-cancelled visits; writes total_price/final/core in pesewas and platform_fee in major GHS. service_role only.';
+COMMENT ON FUNCTION "public"."settle_admin_monthly_schedule_payment"("p_group_id" "uuid", "p_paystack_reference" "text", "p_amount_minor" integer) IS 'Idempotent settle for admin monthly schedule groups. Same-reference replay returns immediately. Finalizes group voucher on first settle only. service_role only.';
 
 
 
@@ -21585,6 +22762,65 @@ $$;
 ALTER FUNCTION "public"."trigger_paystack_on_approval"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."unpin_admin_schedule_promotion_after_checkout_release"("p_group_id" "uuid") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+DECLARE
+  v_group public.admin_booking_schedule_groups%ROWTYPE;
+  v_expires timestamptz;
+BEGIN
+  IF p_group_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  SELECT *
+  INTO v_group
+  FROM public.admin_booking_schedule_groups g
+  WHERE g.id = p_group_id
+  FOR UPDATE;
+
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  UPDATE public.admin_booking_schedule_groups g
+  SET
+    paystack_checkout_expires_at = NULL,
+    updated_at = now()
+  WHERE g.id = p_group_id;
+
+  IF v_group.promotion_id IS NULL
+     OR COALESCE(v_group.promotion_discount_minor, 0) <= 0 THEN
+    RETURN;
+  END IF;
+
+  v_expires :=
+    ((v_group.period_end + 1)::timestamp AT TIME ZONE 'Africa/Accra')
+    + interval '14 days';
+
+  UPDATE public.promotion_redemptions r
+  SET expires_at = v_expires
+  WHERE r.user_id = v_group.customer_id
+    AND r.promotion_id = v_group.promotion_id
+    AND r.status = 'reserved'
+    AND EXISTS (
+      SELECT 1
+      FROM public.bookings b
+      WHERE b.id = r.booking_id
+        AND b.schedule_group_id = p_group_id
+    );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."unpin_admin_schedule_promotion_after_checkout_release"("p_group_id" "uuid") OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."unpin_admin_schedule_promotion_after_checkout_release"("p_group_id" "uuid") IS 'Clears paystack_checkout_expires_at and restores schedule package voucher TTL after checkout reference release.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."update_ai_match_settings"("p_settings" "jsonb") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public', 'pg_temp'
@@ -22755,7 +23991,17 @@ DECLARE
   v_promo public.promotions;
   v_eligibility jsonb;
 BEGIN
-  IF v_caller IS NULL OR v_caller <> p_customer_id THEN
+  -- service_role (admin trusted clients) may validate for an explicit customer.
+  IF coalesce(auth.role(), '') IS DISTINCT FROM 'service_role' THEN
+    IF v_caller IS NULL OR v_caller <> p_customer_id THEN
+      RETURN jsonb_build_object(
+        'eligible', false,
+        'reason', 'not_authenticated'
+      );
+    END IF;
+  END IF;
+
+  IF p_customer_id IS NULL THEN
     RETURN jsonb_build_object('eligible', false, 'reason', 'not_authenticated');
   END IF;
 
@@ -23003,6 +24249,14 @@ CREATE TABLE IF NOT EXISTS "public"."admin_booking_schedule_groups" (
     "create_notify_customer_claimed_at" timestamp with time zone,
     "create_notify_worker_claimed_at" timestamp with time zone,
     "customer_invoice_seq" integer,
+    "billing_mode" "text" DEFAULT 'postpaid'::"text" NOT NULL,
+    "paystack_checkout_claimed_at" timestamp with time zone,
+    "promotion_id" "uuid",
+    "promotion_code_id" "uuid",
+    "promotion_slug" "text",
+    "promotion_discount_minor" integer DEFAULT 0 NOT NULL,
+    "paystack_checkout_expires_at" timestamp with time zone,
+    CONSTRAINT "admin_booking_schedule_groups_billing_mode_check" CHECK (("billing_mode" = ANY (ARRAY['postpaid'::"text", 'prepaid_monthly'::"text", 'prepaid_per_visit'::"text"]))),
     CONSTRAINT "admin_booking_schedule_groups_check" CHECK (("period_start" <= "period_end")),
     CONSTRAINT "admin_booking_schedule_groups_check1" CHECK ((("platform_fee_minor" + "cleaner_earnings_minor") = "monthly_amount_minor")),
     CONSTRAINT "admin_booking_schedule_groups_cleaner_earnings_minor_check" CHECK (("cleaner_earnings_minor" >= 0)),
@@ -23015,6 +24269,7 @@ CREATE TABLE IF NOT EXISTS "public"."admin_booking_schedule_groups" (
     CONSTRAINT "admin_booking_schedule_groups_paid_audit" CHECK (((("status" = 'paid'::"text") AND ("paystack_reference" IS NOT NULL) AND ("settled_at" IS NOT NULL)) OR ("status" <> 'paid'::"text"))),
     CONSTRAINT "admin_booking_schedule_groups_period_visit_count_positive" CHECK ((("period_visit_count" IS NULL) OR ("period_visit_count" > 0))),
     CONSTRAINT "admin_booking_schedule_groups_platform_fee_minor_check" CHECK (("platform_fee_minor" >= 0)),
+    CONSTRAINT "admin_booking_schedule_groups_promotion_discount_nonneg" CHECK (("promotion_discount_minor" >= 0)),
     CONSTRAINT "admin_booking_schedule_groups_status_check" CHECK (("status" = ANY (ARRAY['open'::"text", 'paid'::"text", 'cancelled'::"text"]))),
     CONSTRAINT "admin_booking_schedule_groups_visit_counts_ordered" CHECK ((("period_visit_count" IS NULL) OR ("full_month_visit_count" IS NULL) OR ("period_visit_count" <= "full_month_visit_count"))),
     CONSTRAINT "admin_booking_schedule_groups_weekdays_iso" CHECK (("weekdays" <@ ARRAY[1, 2, 3, 4, 5, 6, 7])),
@@ -23067,6 +24322,34 @@ COMMENT ON COLUMN "public"."admin_booking_schedule_groups"."create_notify_worker
 
 
 COMMENT ON COLUMN "public"."admin_booking_schedule_groups"."customer_invoice_seq" IS 'Sticky incremental invoice sequence for monthly schedule receipts (display: PSK_INSTACLN_#### with min-width 4 zero-pad). Global uniqueness depends on allocation RPCs only — do not write this column directly.';
+
+
+
+COMMENT ON COLUMN "public"."admin_booking_schedule_groups"."billing_mode" IS 'postpaid | prepaid_monthly | prepaid_per_visit — controls visit payment_status and invoice/checkout CTAs.';
+
+
+
+COMMENT ON COLUMN "public"."admin_booking_schedule_groups"."paystack_checkout_claimed_at" IS 'When paystack_reference was claimed/rotated. Fresh claims (< 3 minutes) must not be rotated just because Paystack has not seen the reference yet.';
+
+
+
+COMMENT ON COLUMN "public"."admin_booking_schedule_groups"."promotion_id" IS 'Optional voucher campaign applied to this monthly package (platform-funded).';
+
+
+
+COMMENT ON COLUMN "public"."admin_booking_schedule_groups"."promotion_code_id" IS 'Optional promotion_codes row used when creating this schedule.';
+
+
+
+COMMENT ON COLUMN "public"."admin_booking_schedule_groups"."promotion_slug" IS 'Snapshot of promotions.slug for the applied voucher.';
+
+
+
+COMMENT ON COLUMN "public"."admin_booking_schedule_groups"."promotion_discount_minor" IS 'Package discount in pesewas; monthly_amount_minor is already net of this.';
+
+
+
+COMMENT ON COLUMN "public"."admin_booking_schedule_groups"."paystack_checkout_expires_at" IS 'When the current unpaid Paystack checkout stops protecting the package voucher. Must be finite; abandoned checkouts must not pin vouchers forever.';
 
 
 
@@ -23267,6 +24550,21 @@ CREATE TABLE IF NOT EXISTS "public"."base_durations" (
 
 
 ALTER TABLE "public"."base_durations" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."booking_assignment_declines" (
+    "booking_id" "uuid" NOT NULL,
+    "cleaner_id" "uuid" NOT NULL,
+    "declined_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "reason" "text"
+);
+
+
+ALTER TABLE "public"."booking_assignment_declines" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."booking_assignment_declines" IS 'Durable record of cleaners who explicitly declined a booking assignment. Used to exclude them from get_best_available_cleaners / broadcast / accept.';
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."booking_job_photos" (
@@ -26057,6 +27355,11 @@ ALTER TABLE ONLY "public"."base_durations"
 
 
 
+ALTER TABLE ONLY "public"."booking_assignment_declines"
+    ADD CONSTRAINT "booking_assignment_declines_pkey" PRIMARY KEY ("booking_id", "cleaner_id");
+
+
+
 ALTER TABLE ONLY "public"."booking_job_photos"
     ADD CONSTRAINT "booking_job_photos_pkey" PRIMARY KEY ("id");
 
@@ -26823,6 +28126,10 @@ CREATE INDEX "auth_lookup_rate_limit_window_idx" ON "public"."auth_lookup_rate_l
 
 
 CREATE INDEX "avatar_storage_deletions_delete_after_idx" ON "public"."avatar_storage_deletions" USING "btree" ("delete_after");
+
+
+
+CREATE INDEX "booking_assignment_declines_cleaner_id_idx" ON "public"."booking_assignment_declines" USING "btree" ("cleaner_id");
 
 
 
@@ -28042,6 +29349,16 @@ ALTER TABLE ONLY "public"."admin_booking_schedule_groups"
 
 
 ALTER TABLE ONLY "public"."admin_booking_schedule_groups"
+    ADD CONSTRAINT "admin_booking_schedule_groups_promotion_code_id_fkey" FOREIGN KEY ("promotion_code_id") REFERENCES "public"."promotion_codes"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."admin_booking_schedule_groups"
+    ADD CONSTRAINT "admin_booking_schedule_groups_promotion_id_fkey" FOREIGN KEY ("promotion_id") REFERENCES "public"."promotions"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."admin_booking_schedule_groups"
     ADD CONSTRAINT "admin_booking_schedule_groups_service_id_fkey" FOREIGN KEY ("service_id") REFERENCES "public"."service_types"("id");
 
 
@@ -28083,6 +29400,16 @@ ALTER TABLE ONLY "public"."availability"
 
 ALTER TABLE ONLY "public"."avatar_storage_deletions"
     ADD CONSTRAINT "avatar_storage_deletions_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."booking_assignment_declines"
+    ADD CONSTRAINT "booking_assignment_declines_booking_id_fkey" FOREIGN KEY ("booking_id") REFERENCES "public"."bookings"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."booking_assignment_declines"
+    ADD CONSTRAINT "booking_assignment_declines_cleaner_id_fkey" FOREIGN KEY ("cleaner_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
 
@@ -29265,6 +30592,9 @@ ALTER TABLE "public"."avatar_storage_deletions" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."base_durations" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."booking_assignment_declines" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."booking_job_photos" ENABLE ROW LEVEL SECURITY;
 
 
@@ -29997,6 +31327,10 @@ ALTER PUBLICATION "supabase_realtime" OWNER TO "postgres";
 
 
 
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."booking_refunds";
 
 
 
@@ -31211,6 +32545,11 @@ GRANT ALL ON FUNCTION "public"."admin_reset_exclusive_accept_hold"("p_booking_id
 
 
 
+REVOKE ALL ON FUNCTION "public"."admin_schedule_checkout_hold_interval"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."admin_schedule_checkout_hold_interval"() TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."admin_soft_delete_user"("p_user_id" "uuid", "p_reason" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."admin_soft_delete_user"("p_user_id" "uuid", "p_reason" "text") TO "service_role";
 
@@ -31246,6 +32585,13 @@ GRANT ALL ON FUNCTION "public"."allocate_booking_customer_invoice_seq"("p_bookin
 
 REVOKE ALL ON FUNCTION "public"."allocate_schedule_group_customer_invoice_seq"("p_group_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."allocate_schedule_group_customer_invoice_seq"("p_group_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."apply_paystack_refund_webhook_event"("p_booking_refund_id" "uuid", "p_event" "text", "p_paystack_refund_reference" "text", "p_failure_reason" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."apply_paystack_refund_webhook_event"("p_booking_refund_id" "uuid", "p_event" "text", "p_paystack_refund_reference" "text", "p_failure_reason" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."apply_paystack_refund_webhook_event"("p_booking_refund_id" "uuid", "p_event" "text", "p_paystack_refund_reference" "text", "p_failure_reason" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."apply_paystack_refund_webhook_event"("p_booking_refund_id" "uuid", "p_event" "text", "p_paystack_refund_reference" "text", "p_failure_reason" "text") TO "service_role";
 
 
 
@@ -31636,6 +32982,11 @@ GRANT ALL ON FUNCTION "public"."citext_smaller"("public"."citext", "public"."cit
 GRANT ALL ON FUNCTION "public"."citext_smaller"("public"."citext", "public"."citext") TO "anon";
 GRANT ALL ON FUNCTION "public"."citext_smaller"("public"."citext", "public"."citext") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."citext_smaller"("public"."citext", "public"."citext") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."claim_admin_monthly_schedule_checkout"("p_group_id" "uuid", "p_candidate_reference" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."claim_admin_monthly_schedule_checkout"("p_group_id" "uuid", "p_candidate_reference" "text") TO "service_role";
 
 
 
@@ -34190,6 +35541,16 @@ GRANT ALL ON FUNCTION "public"."get_active_pricing_rule"() TO "service_role";
 
 
 
+REVOKE ALL ON FUNCTION "public"."get_admin_cleaner_dispatch_map"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."get_admin_cleaner_dispatch_map"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."get_admin_customer_dispatch_locations"("p_days_ahead" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."get_admin_customer_dispatch_locations"("p_days_ahead" integer) TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."get_ai_match_settings"() TO "anon";
 GRANT ALL ON FUNCTION "public"."get_ai_match_settings"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."get_ai_match_settings"() TO "service_role";
@@ -35233,6 +36594,11 @@ GRANT ALL ON FUNCTION "public"."phone_lookup_variants"("p_raw" "text") TO "servi
 
 
 
+REVOKE ALL ON FUNCTION "public"."pin_admin_schedule_promotion_for_checkout"("p_group_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."pin_admin_schedule_promotion_for_checkout"("p_group_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."platform_fee_major_from_booking"("p_platform_fee" numeric, "p_core_amount_minor" integer) TO "anon";
 GRANT ALL ON FUNCTION "public"."platform_fee_major_from_booking"("p_platform_fee" numeric, "p_core_amount_minor" integer) TO "authenticated";
 GRANT ALL ON FUNCTION "public"."platform_fee_major_from_booking"("p_platform_fee" numeric, "p_core_amount_minor" integer) TO "service_role";
@@ -35550,6 +36916,11 @@ GRANT ALL ON FUNCTION "public"."queue_inbox_notification_push"("p_user_id" "uuid
 
 
 
+REVOKE ALL ON FUNCTION "public"."reattach_admin_schedule_promotion_anchor"("p_group_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."reattach_admin_schedule_promotion_anchor"("p_group_id" "uuid") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."recalculate_customer_trust_profile"("p_customer_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."recalculate_customer_trust_profile"("p_customer_id" "uuid") TO "service_role";
 
@@ -35707,10 +37078,15 @@ GRANT ALL ON FUNCTION "public"."register_quick_task_upload"("p_storage_path" "te
 
 
 
-REVOKE ALL ON FUNCTION "public"."release_booking_to_broadcast"("p_booking_id" "uuid") FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."release_booking_to_broadcast"("p_booking_id" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."release_booking_to_broadcast"("p_booking_id" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."release_booking_to_broadcast"("p_booking_id" "uuid") TO "service_role";
+REVOKE ALL ON FUNCTION "public"."release_admin_monthly_schedule_checkout"("p_group_id" "uuid", "p_expected_reference" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."release_admin_monthly_schedule_checkout"("p_group_id" "uuid", "p_expected_reference" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."release_booking_to_broadcast"("p_booking_id" "uuid", "p_force_after_accept" boolean, "p_declining_cleaner_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."release_booking_to_broadcast"("p_booking_id" "uuid", "p_force_after_accept" boolean, "p_declining_cleaner_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."release_booking_to_broadcast"("p_booking_id" "uuid", "p_force_after_accept" boolean, "p_declining_cleaner_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."release_booking_to_broadcast"("p_booking_id" "uuid", "p_force_after_accept" boolean, "p_declining_cleaner_id" "uuid") TO "service_role";
 
 
 
@@ -35844,6 +37220,11 @@ GRANT ALL ON FUNCTION "public"."revoke_preferred_cleaner_invite"("p_invite_id" "
 GRANT ALL ON FUNCTION "public"."rls_auto_enable"() TO "anon";
 GRANT ALL ON FUNCTION "public"."rls_auto_enable"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."rls_auto_enable"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."rotate_admin_monthly_schedule_checkout"("p_group_id" "uuid", "p_expected_reference" "text", "p_new_reference" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."rotate_admin_monthly_schedule_checkout"("p_group_id" "uuid", "p_expected_reference" "text", "p_new_reference" "text") TO "service_role";
 
 
 
@@ -39135,6 +40516,11 @@ GRANT ALL ON FUNCTION "public"."unlockrows"("text") TO "service_role";
 
 
 
+REVOKE ALL ON FUNCTION "public"."unpin_admin_schedule_promotion_after_checkout_release"("p_group_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."unpin_admin_schedule_promotion_after_checkout_release"("p_group_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."update_ai_match_settings"("p_settings" "jsonb") TO "anon";
 GRANT ALL ON FUNCTION "public"."update_ai_match_settings"("p_settings" "jsonb") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."update_ai_match_settings"("p_settings" "jsonb") TO "service_role";
@@ -39506,6 +40892,12 @@ GRANT ALL ON TABLE "public"."avatar_storage_deletions" TO "service_role";
 GRANT ALL ON TABLE "public"."base_durations" TO "anon";
 GRANT ALL ON TABLE "public"."base_durations" TO "authenticated";
 GRANT ALL ON TABLE "public"."base_durations" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."booking_assignment_declines" TO "anon";
+GRANT ALL ON TABLE "public"."booking_assignment_declines" TO "authenticated";
+GRANT ALL ON TABLE "public"."booking_assignment_declines" TO "service_role";
 
 
 
