@@ -13664,11 +13664,50 @@ $function$
 
 
 CREATE OR REPLACE FUNCTION public.get_admin_customer_dispatch_locations(p_days_ahead integer DEFAULT 30)
- RETURNS TABLE(booking_id uuid, customer_id uuid, customer_name text, address text, latitude double precision, longitude double precision, scheduled_at_utc timestamp with time zone, timezone_name text, status text, service_name text)
+ RETURNS TABLE(booking_id uuid, customer_id uuid, customer_name text, address text, latitude double precision, longitude double precision, scheduled_at_utc timestamp with time zone, timezone_name text, status text, service_name text, cleaner_id uuid)
  LANGUAGE sql
  STABLE SECURITY DEFINER
  SET search_path TO 'public', 'pg_temp'
 AS $function$
+  SELECT *
+  FROM public.get_admin_customer_dispatch_locations(p_days_ahead, NULL::text[]);
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.get_admin_customer_dispatch_locations(p_days_ahead integer, p_statuses text[])
+ RETURNS TABLE(booking_id uuid, customer_id uuid, customer_name text, address text, latitude double precision, longitude double precision, scheduled_at_utc timestamp with time zone, timezone_name text, status text, service_name text, cleaner_id uuid)
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public', 'pg_temp'
+AS $function$
+  WITH requested AS (
+    SELECT DISTINCT lower(btrim(s)) AS status
+    FROM unnest(
+      CASE
+        WHEN p_statuses IS NULL OR cardinality(p_statuses) = 0 THEN
+          ARRAY[
+            'pending',
+            'confirmed',
+            'scheduled',
+            'en_route',
+            'arrived',
+            'in_progress'
+          ]::text[]
+        ELSE p_statuses
+      END
+    ) AS s
+    WHERE btrim(s) <> ''
+      AND lower(btrim(s)) = ANY (
+        ARRAY[
+          'pending',
+          'confirmed',
+          'scheduled',
+          'en_route',
+          'arrived',
+          'in_progress'
+        ]::text[]
+      )
+  )
   SELECT
     b.id AS booking_id,
     b.customer_id,
@@ -13683,14 +13722,16 @@ AS $function$
     b.scheduled_at_utc,
     COALESCE(NULLIF(BTRIM(b.timezone_name), ''), 'Africa/Accra') AS timezone_name,
     b.status::text,
-    COALESCE(st.name, b.title, 'Service') AS service_name
+    COALESCE(st.name, b.title, 'Service') AS service_name,
+    b.cleaner_id
   FROM public.bookings b
   LEFT JOIN public.profiles p ON p.user_id = b.customer_id
   LEFT JOIN public.service_types st ON st.id = b.service_id
   WHERE b.location_coordinates IS NOT NULL
     AND b.customer_id IS NOT NULL
-    AND public.booking_payment_allows_contact(b.payment_status::text)
-    AND b.status IN ('pending', 'confirmed', 'scheduled', 'en_route', 'arrived', 'in_progress')
+    AND EXISTS (
+      SELECT 1 FROM requested r WHERE r.status = b.status::text
+    )
     AND b.scheduled_at_utc >= now() - interval '1 day'
     AND b.scheduled_at_utc <= now() + make_interval(days => GREATEST(1, LEAST(COALESCE(p_days_ahead, 30), 90)))
   ORDER BY b.scheduled_at_utc ASC, b.created_at DESC;
@@ -16871,6 +16912,11 @@ BEGIN
         'cleaner assignment acceptance columns are server-only (use accept_booking_assignment)'
         USING ERRCODE = '42501';
     END IF;
+    IF NEW.pricing_version IS NOT DISTINCT FROM 'admin_single_v1' THEN
+      RAISE EXCEPTION
+        'admin_single_v1 is server-only'
+        USING ERRCODE = '42501';
+    END IF;
     RETURN NEW;
   END IF;
 
@@ -16878,6 +16924,13 @@ BEGIN
      OR NEW.assignment_phase IS DISTINCT FROM OLD.assignment_phase THEN
     RAISE EXCEPTION
       'cleaner assignment acceptance columns are server-only (use accept_booking_assignment)'
+      USING ERRCODE = '42501';
+  END IF;
+
+  IF NEW.pricing_version IS DISTINCT FROM OLD.pricing_version
+     AND NEW.pricing_version IS NOT DISTINCT FROM 'admin_single_v1' THEN
+    RAISE EXCEPTION
+      'admin_single_v1 is server-only'
       USING ERRCODE = '42501';
   END IF;
 
@@ -22613,10 +22666,27 @@ BEGIN
     last_updated = now()
   WHERE cleaner_id IS NOT NULL
     AND schedule_group_id IS NULL
+    AND NOT (
+      pricing_version IS NOT DISTINCT FROM 'admin_single_v1'
+      AND status::text = ANY (
+        ARRAY[
+          'pending',
+          'confirmed',
+          'scheduled',
+          'en_route',
+          'arrived',
+          'in_progress'
+        ]
+      )
+    )
     AND lower(COALESCE(payment_status, 'pending')) NOT IN ('paid', 'post_paid')
-    AND status IN ('confirmed', 'pending')
+    AND status IN ('confirmed', 'pending', 'cancelled', 'completed')
     AND (
       payment_status = 'failed'
+      OR (
+        pricing_version IS NOT DISTINCT FROM 'admin_single_v1'
+        AND status::text IN ('cancelled', 'completed')
+      )
       OR (
         cleaner_assigned_at IS NOT NULL
         AND cleaner_assigned_at::timestamptz <= (now() - interval '15 minutes')::timestamptz
@@ -22643,7 +22713,8 @@ DECLARE
   released_count integer := 0;
 BEGIN
   -- Keep cleaner_assigned_at so clients detect hold expiry (cleaner_id null + assigned_at set).
-  -- schedule_group_id visits are sticky prepaid/postpaid packages — never auto-release.
+  -- Active admin_single_v1 + schedule_group visits stay sticky; cancelled/completed unpaid
+  -- admin singles are released so cleaners are not held indefinitely.
   UPDATE public.bookings
   SET
     cleaner_id = NULL,
@@ -22658,9 +22729,26 @@ BEGIN
     last_updated = now()
   WHERE cleaner_id IS NOT NULL
     AND schedule_group_id IS NULL
+    AND NOT (
+      pricing_version IS NOT DISTINCT FROM 'admin_single_v1'
+      AND status::text = ANY (
+        ARRAY[
+          'pending',
+          'confirmed',
+          'scheduled',
+          'en_route',
+          'arrived',
+          'in_progress'
+        ]
+      )
+    )
     AND lower(COALESCE(payment_status, 'pending')) NOT IN ('paid', 'post_paid')
     AND (
       payment_status = 'failed'
+      OR (
+        pricing_version IS NOT DISTINCT FROM 'admin_single_v1'
+        AND status::text IN ('cancelled', 'completed')
+      )
       OR (
         cleaner_assigned_at IS NOT NULL
         AND cleaner_assigned_at <= now() - interval '15 minutes'
@@ -23985,6 +24073,33 @@ AS $function$
 BEGIN
   -- Admin monthly schedule visits: sticky cleaner assignment, not a temp hold.
   IF NEW.schedule_group_id IS NOT NULL THEN
+    NEW.cleaner_hold_expires_at := NULL;
+    RETURN NEW;
+  END IF;
+
+  -- Terminal unpaid admin singles must not keep a sticky cleaner forever.
+  IF NEW.pricing_version IS NOT DISTINCT FROM 'admin_single_v1'
+     AND NEW.status::text IN ('cancelled', 'completed')
+     AND lower(COALESCE(NEW.payment_status, 'pending')) NOT IN ('paid', 'post_paid')
+  THEN
+    NEW.cleaner_id := NULL;
+    NEW.cleaner_hold_expires_at := NULL;
+    RETURN NEW;
+  END IF;
+
+  -- Active admin prepaid single visit: sticky until paid or terminal (not a checkout hold).
+  IF NEW.pricing_version IS NOT DISTINCT FROM 'admin_single_v1'
+     AND NEW.status::text = ANY (
+       ARRAY[
+         'pending',
+         'confirmed',
+         'scheduled',
+         'en_route',
+         'arrived',
+         'in_progress'
+       ]
+     )
+  THEN
     NEW.cleaner_hold_expires_at := NULL;
     RETURN NEW;
   END IF;
@@ -31178,7 +31293,7 @@ CREATE TRIGGER trg_enforce_care_pet_booking_gate BEFORE INSERT OR UPDATE OF serv
 
 CREATE TRIGGER trg_init_direct_assignment_on_paid BEFORE INSERT OR UPDATE OF payment_status, cleaner_id ON bookings FOR EACH ROW EXECUTE FUNCTION trg_init_direct_assignment_on_paid();
 
-CREATE TRIGGER trg_set_cleaner_assigned_at_for_hold BEFORE INSERT OR UPDATE OF cleaner_id, payment_status ON bookings FOR EACH ROW EXECUTE FUNCTION set_cleaner_assigned_at_for_hold();
+CREATE TRIGGER trg_set_cleaner_assigned_at_for_hold BEFORE INSERT OR UPDATE OF cleaner_id, payment_status, status, pricing_version ON bookings FOR EACH ROW EXECUTE FUNCTION set_cleaner_assigned_at_for_hold();
 
 CREATE TRIGGER trg_zz_guard_booking_assignment_column_writes BEFORE INSERT OR UPDATE ON bookings FOR EACH ROW EXECUTE FUNCTION guard_booking_assignment_column_writes();
 

@@ -11027,10 +11027,54 @@ COMMENT ON FUNCTION "public"."get_admin_cleaner_dispatch_map"() IS 'Service-role
 
 
 
-CREATE OR REPLACE FUNCTION "public"."get_admin_customer_dispatch_locations"("p_days_ahead" integer DEFAULT 30) RETURNS TABLE("booking_id" "uuid", "customer_id" "uuid", "customer_name" "text", "address" "text", "latitude" double precision, "longitude" double precision, "scheduled_at_utc" timestamp with time zone, "timezone_name" "text", "status" "text", "service_name" "text")
+CREATE OR REPLACE FUNCTION "public"."get_admin_customer_dispatch_locations"("p_days_ahead" integer DEFAULT 30) RETURNS TABLE("booking_id" "uuid", "customer_id" "uuid", "customer_name" "text", "address" "text", "latitude" double precision, "longitude" double precision, "scheduled_at_utc" timestamp with time zone, "timezone_name" "text", "status" "text", "service_name" "text", "cleaner_id" "uuid")
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public', 'pg_temp'
     AS $$
+  SELECT *
+  FROM public.get_admin_customer_dispatch_locations(p_days_ahead, NULL::text[]);
+$$;
+
+
+ALTER FUNCTION "public"."get_admin_customer_dispatch_locations"("p_days_ahead" integer) OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."get_admin_customer_dispatch_locations"("p_days_ahead" integer) IS 'Compatibility wrapper for get_admin_customer_dispatch_locations(integer, text[]) with default statuses.';
+
+
+
+CREATE OR REPLACE FUNCTION "public"."get_admin_customer_dispatch_locations"("p_days_ahead" integer, "p_statuses" "text"[]) RETURNS TABLE("booking_id" "uuid", "customer_id" "uuid", "customer_name" "text", "address" "text", "latitude" double precision, "longitude" double precision, "scheduled_at_utc" timestamp with time zone, "timezone_name" "text", "status" "text", "service_name" "text", "cleaner_id" "uuid")
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public', 'pg_temp'
+    AS $$
+  WITH requested AS (
+    SELECT DISTINCT lower(btrim(s)) AS status
+    FROM unnest(
+      CASE
+        WHEN p_statuses IS NULL OR cardinality(p_statuses) = 0 THEN
+          ARRAY[
+            'pending',
+            'confirmed',
+            'scheduled',
+            'en_route',
+            'arrived',
+            'in_progress'
+          ]::text[]
+        ELSE p_statuses
+      END
+    ) AS s
+    WHERE btrim(s) <> ''
+      AND lower(btrim(s)) = ANY (
+        ARRAY[
+          'pending',
+          'confirmed',
+          'scheduled',
+          'en_route',
+          'arrived',
+          'in_progress'
+        ]::text[]
+      )
+  )
   SELECT
     b.id AS booking_id,
     b.customer_id,
@@ -11045,24 +11089,26 @@ CREATE OR REPLACE FUNCTION "public"."get_admin_customer_dispatch_locations"("p_d
     b.scheduled_at_utc,
     COALESCE(NULLIF(BTRIM(b.timezone_name), ''), 'Africa/Accra') AS timezone_name,
     b.status::text,
-    COALESCE(st.name, b.title, 'Service') AS service_name
+    COALESCE(st.name, b.title, 'Service') AS service_name,
+    b.cleaner_id
   FROM public.bookings b
   LEFT JOIN public.profiles p ON p.user_id = b.customer_id
   LEFT JOIN public.service_types st ON st.id = b.service_id
   WHERE b.location_coordinates IS NOT NULL
     AND b.customer_id IS NOT NULL
-    AND public.booking_payment_allows_contact(b.payment_status::text)
-    AND b.status IN ('pending', 'confirmed', 'scheduled', 'en_route', 'arrived', 'in_progress')
+    AND EXISTS (
+      SELECT 1 FROM requested r WHERE r.status = b.status::text
+    )
     AND b.scheduled_at_utc >= now() - interval '1 day'
     AND b.scheduled_at_utc <= now() + make_interval(days => GREATEST(1, LEAST(COALESCE(p_days_ahead, 30), 90)))
   ORDER BY b.scheduled_at_utc ASC, b.created_at DESC;
 $$;
 
 
-ALTER FUNCTION "public"."get_admin_customer_dispatch_locations"("p_days_ahead" integer) OWNER TO "postgres";
+ALTER FUNCTION "public"."get_admin_customer_dispatch_locations"("p_days_ahead" integer, "p_statuses" "text"[]) OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."get_admin_customer_dispatch_locations"("p_days_ahead" integer) IS 'Service-role-only paid/post-paid upcoming customer booking locations for the admin cleaner dispatch map.';
+COMMENT ON FUNCTION "public"."get_admin_customer_dispatch_locations"("p_days_ahead" integer, "p_statuses" "text"[]) IS 'Service-role-only customer booking locations for admin dispatch. Includes cleaner_id for assigned-route linking. Filters by coords, optional p_statuses, and schedule window. Payment status is not gated.';
 
 
 
@@ -14272,6 +14318,11 @@ BEGIN
         'cleaner assignment acceptance columns are server-only (use accept_booking_assignment)'
         USING ERRCODE = '42501';
     END IF;
+    IF NEW.pricing_version IS NOT DISTINCT FROM 'admin_single_v1' THEN
+      RAISE EXCEPTION
+        'admin_single_v1 is server-only'
+        USING ERRCODE = '42501';
+    END IF;
     RETURN NEW;
   END IF;
 
@@ -14279,6 +14330,13 @@ BEGIN
      OR NEW.assignment_phase IS DISTINCT FROM OLD.assignment_phase THEN
     RAISE EXCEPTION
       'cleaner assignment acceptance columns are server-only (use accept_booking_assignment)'
+      USING ERRCODE = '42501';
+  END IF;
+
+  IF NEW.pricing_version IS DISTINCT FROM OLD.pricing_version
+     AND NEW.pricing_version IS NOT DISTINCT FROM 'admin_single_v1' THEN
+    RAISE EXCEPTION
+      'admin_single_v1 is server-only'
       USING ERRCODE = '42501';
   END IF;
 
@@ -14290,7 +14348,7 @@ $$;
 ALTER FUNCTION "public"."guard_booking_assignment_column_writes"() OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."guard_booking_assignment_column_writes"() IS 'Blocks authenticated/anon clients from writing cleaner_accepted_at or assignment_phase; service_role, app.booking_assignment_write=1, and non-client sessions may write.';
+COMMENT ON FUNCTION "public"."guard_booking_assignment_column_writes"() IS 'Blocks authenticated/anon clients from writing cleaner_accepted_at, assignment_phase, or pricing_version=admin_single_v1; service_role, app.booking_assignment_write=1, and non-client sessions may write.';
 
 
 
@@ -18926,10 +18984,27 @@ BEGIN
     last_updated = now()
   WHERE cleaner_id IS NOT NULL
     AND schedule_group_id IS NULL
+    AND NOT (
+      pricing_version IS NOT DISTINCT FROM 'admin_single_v1'
+      AND status::text = ANY (
+        ARRAY[
+          'pending',
+          'confirmed',
+          'scheduled',
+          'en_route',
+          'arrived',
+          'in_progress'
+        ]
+      )
+    )
     AND lower(COALESCE(payment_status, 'pending')) NOT IN ('paid', 'post_paid')
-    AND status IN ('confirmed', 'pending')
+    AND status IN ('confirmed', 'pending', 'cancelled', 'completed')
     AND (
       payment_status = 'failed'
+      OR (
+        pricing_version IS NOT DISTINCT FROM 'admin_single_v1'
+        AND status::text IN ('cancelled', 'completed')
+      )
       OR (
         cleaner_assigned_at IS NOT NULL
         AND cleaner_assigned_at::timestamptz <= (now() - interval '15 minutes')::timestamptz
@@ -18957,7 +19032,8 @@ DECLARE
   released_count integer := 0;
 BEGIN
   -- Keep cleaner_assigned_at so clients detect hold expiry (cleaner_id null + assigned_at set).
-  -- schedule_group_id visits are sticky prepaid/postpaid packages — never auto-release.
+  -- Active admin_single_v1 + schedule_group visits stay sticky; cancelled/completed unpaid
+  -- admin singles are released so cleaners are not held indefinitely.
   UPDATE public.bookings
   SET
     cleaner_id = NULL,
@@ -18972,9 +19048,26 @@ BEGIN
     last_updated = now()
   WHERE cleaner_id IS NOT NULL
     AND schedule_group_id IS NULL
+    AND NOT (
+      pricing_version IS NOT DISTINCT FROM 'admin_single_v1'
+      AND status::text = ANY (
+        ARRAY[
+          'pending',
+          'confirmed',
+          'scheduled',
+          'en_route',
+          'arrived',
+          'in_progress'
+        ]
+      )
+    )
     AND lower(COALESCE(payment_status, 'pending')) NOT IN ('paid', 'post_paid')
     AND (
       payment_status = 'failed'
+      OR (
+        pricing_version IS NOT DISTINCT FROM 'admin_single_v1'
+        AND status::text IN ('cancelled', 'completed')
+      )
       OR (
         cleaner_assigned_at IS NOT NULL
         AND cleaner_assigned_at <= now() - interval '15 minutes'
@@ -18992,6 +19085,10 @@ $$;
 
 
 ALTER FUNCTION "public"."release_cleaner_hold_15min"() OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."release_cleaner_hold_15min"() IS 'Releases unpaid temporary cleaner holds older than 15 minutes. Exempts schedule_group visits and active admin_single_v1 prepaid singles; clears cancelled/completed unpaid admin singles.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."release_orphaned_quick_task_upload_claim"("p_claim_id" "uuid") RETURNS "jsonb"
@@ -20476,6 +20573,33 @@ CREATE OR REPLACE FUNCTION "public"."set_cleaner_assigned_at_for_hold"() RETURNS
 BEGIN
   -- Admin monthly schedule visits: sticky cleaner assignment, not a temp hold.
   IF NEW.schedule_group_id IS NOT NULL THEN
+    NEW.cleaner_hold_expires_at := NULL;
+    RETURN NEW;
+  END IF;
+
+  -- Terminal unpaid admin singles must not keep a sticky cleaner forever.
+  IF NEW.pricing_version IS NOT DISTINCT FROM 'admin_single_v1'
+     AND NEW.status::text IN ('cancelled', 'completed')
+     AND lower(COALESCE(NEW.payment_status, 'pending')) NOT IN ('paid', 'post_paid')
+  THEN
+    NEW.cleaner_id := NULL;
+    NEW.cleaner_hold_expires_at := NULL;
+    RETURN NEW;
+  END IF;
+
+  -- Active admin prepaid single visit: sticky until paid or terminal (not a checkout hold).
+  IF NEW.pricing_version IS NOT DISTINCT FROM 'admin_single_v1'
+     AND NEW.status::text = ANY (
+       ARRAY[
+         'pending',
+         'confirmed',
+         'scheduled',
+         'en_route',
+         'arrived',
+         'in_progress'
+       ]
+     )
+  THEN
     NEW.cleaner_hold_expires_at := NULL;
     RETURN NEW;
   END IF;
@@ -29297,7 +29421,7 @@ CREATE OR REPLACE TRIGGER "trg_profiles_fullname" BEFORE INSERT OR UPDATE OF "fi
 
 
 
-CREATE OR REPLACE TRIGGER "trg_set_cleaner_assigned_at_for_hold" BEFORE INSERT OR UPDATE OF "cleaner_id", "payment_status" ON "public"."bookings" FOR EACH ROW EXECUTE FUNCTION "public"."set_cleaner_assigned_at_for_hold"();
+CREATE OR REPLACE TRIGGER "trg_set_cleaner_assigned_at_for_hold" BEFORE INSERT OR UPDATE OF "cleaner_id", "payment_status", "status", "pricing_version" ON "public"."bookings" FOR EACH ROW EXECUTE FUNCTION "public"."set_cleaner_assigned_at_for_hold"();
 
 
 
@@ -35548,6 +35672,11 @@ GRANT ALL ON FUNCTION "public"."get_admin_cleaner_dispatch_map"() TO "service_ro
 
 REVOKE ALL ON FUNCTION "public"."get_admin_customer_dispatch_locations"("p_days_ahead" integer) FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."get_admin_customer_dispatch_locations"("p_days_ahead" integer) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."get_admin_customer_dispatch_locations"("p_days_ahead" integer, "p_statuses" "text"[]) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."get_admin_customer_dispatch_locations"("p_days_ahead" integer, "p_statuses" "text"[]) TO "service_role";
 
 
 
