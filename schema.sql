@@ -2637,6 +2637,48 @@ COMMENT ON FUNCTION "public"."approve_cleaner_application"("p_application_id" "u
 
 
 
+CREATE OR REPLACE FUNCTION "public"."assert_airbnb_quick_tasks_service_bookable"("p_service_id" integer) RETURNS "void"
+    LANGUAGE "plpgsql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_category public.service_category;
+BEGIN
+  IF p_service_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  SELECT st.category
+  INTO v_category
+  FROM public.service_types st
+  WHERE st.id = p_service_id;
+
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  IF v_category = 'airbnb'::public.service_category
+     AND NOT public.is_airbnb_catalog_visible() THEN
+    RAISE EXCEPTION 'This service is not available yet'
+      USING ERRCODE = 'P0001';
+  END IF;
+
+  IF v_category = 'quick_tasks'::public.service_category
+     AND NOT public.is_quick_tasks_catalog_visible() THEN
+    RAISE EXCEPTION 'This service is not available yet'
+      USING ERRCODE = 'P0001';
+  END IF;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."assert_airbnb_quick_tasks_service_bookable"("p_service_id" integer) OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."assert_airbnb_quick_tasks_service_bookable"("p_service_id" integer) IS 'Rejects airbnb/quick_tasks service IDs while their BOOK_NOW flag is off.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."assert_care_pet_service_bookable"("p_service_id" integer) RETURNS "void"
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -6941,6 +6983,7 @@ BEGIN
   END IF;
 
   PERFORM public.assert_care_pet_service_bookable(p_service_id);
+  PERFORM public.assert_airbnb_quick_tasks_service_bookable(p_service_id);
 
   IF v_service_rate IS NULL OR v_service_rate < 0 THEN
     RAISE EXCEPTION 'Invalid service price';
@@ -7298,6 +7341,7 @@ BEGIN
   END IF;
 
   PERFORM public.assert_care_pet_service_bookable(p_service_id);
+  PERFORM public.assert_airbnb_quick_tasks_service_bookable(p_service_id);
 
   IF v_service_rate IS NULL OR v_service_rate < 0 THEN
     RAISE EXCEPTION 'Invalid service price';
@@ -8152,6 +8196,11 @@ DECLARE
   v_has_placeholder boolean := false;
   v_seen_task_ids uuid[] := ARRAY[]::uuid[];
 BEGIN
+  IF NOT public.is_quick_tasks_catalog_visible() THEN
+    RAISE EXCEPTION 'This service is not available yet'
+      USING ERRCODE = 'P0001';
+  END IF;
+
   IF p_selected_tasks IS NULL
      OR jsonb_typeof(p_selected_tasks) <> 'array'
      OR jsonb_array_length(p_selected_tasks) < 1 THEN
@@ -8552,7 +8601,7 @@ $$;
 ALTER FUNCTION "public"."compute_micro_task_booking_pricing"("p_selected_tasks" "jsonb", "p_scheduled_date" "date", "p_service_timezone" "text", "p_equipment_provider" "text", "p_include_booking_cover" boolean, "p_client_claimed_final_minor" integer, "p_for_checkout" boolean) OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."compute_micro_task_booking_pricing"("p_selected_tasks" "jsonb", "p_scheduled_date" "date", "p_service_timezone" "text", "p_equipment_provider" "text", "p_include_booking_cover" boolean, "p_client_claimed_final_minor" integer, "p_for_checkout" boolean) IS 'Authoritative Quick Tasks pricing. Estimates allowed for anon; checkout kill switch precedes auth.';
+COMMENT ON FUNCTION "public"."compute_micro_task_booking_pricing"("p_selected_tasks" "jsonb", "p_scheduled_date" "date", "p_service_timezone" "text", "p_equipment_provider" "text", "p_include_booking_cover" boolean, "p_client_claimed_final_minor" integer, "p_for_checkout" boolean) IS 'Quick Tasks pricing. Rejects estimates and checkout while QUICK_TASKS_BOOK_NOW is off.';
 
 
 
@@ -9858,6 +9907,7 @@ CREATE OR REPLACE FUNCTION "public"."enforce_care_pet_booking_gate"() RETURNS "t
     AS $$
 BEGIN
   PERFORM public.assert_care_pet_service_bookable(NEW.service_id);
+  PERFORM public.assert_airbnb_quick_tasks_service_bookable(NEW.service_id);
   RETURN NEW;
 END;
 $$;
@@ -9866,7 +9916,7 @@ $$;
 ALTER FUNCTION "public"."enforce_care_pet_booking_gate"() OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."enforce_care_pet_booking_gate"() IS 'Blocks caregiving/pet_care bookings while CARE_PET_BOOKING is off.';
+COMMENT ON FUNCTION "public"."enforce_care_pet_booking_gate"() IS 'Blocks caregiving/pet_care (CARE_PET_BOOKING) and airbnb/quick_tasks (BOOK_NOW) bookings when gated off.';
 
 
 
@@ -13966,10 +14016,16 @@ BEGIN
   LEFT JOIN public.service_types st ON st.category_id = sc.id
   WHERE (st.active = true OR st.id IS NULL)
     AND (
-      public.is_care_pet_catalog_visible()
-      OR COALESCE(sc.slug, '') NOT IN ('caregiving', 'pet_care')
+      CASE COALESCE(sc.slug, '')
+        WHEN 'caregiving' THEN public.is_care_pet_catalog_visible()
+        WHEN 'pet_care' THEN public.is_care_pet_catalog_visible()
+        WHEN 'airbnb' THEN public.is_airbnb_catalog_visible()
+        WHEN 'quick_tasks' THEN public.is_quick_tasks_catalog_visible()
+        ELSE true
+      END
     )
-  GROUP BY sc.id, sc.name, sc.icon;
+  GROUP BY sc.id, sc.name, sc.icon, sc.sort_order
+  ORDER BY sc.sort_order ASC, sc.name ASC;
 END;
 $$;
 
@@ -13977,7 +14033,7 @@ $$;
 ALTER FUNCTION "public"."get_service_categories"() OWNER TO "postgres";
 
 
-COMMENT ON FUNCTION "public"."get_service_categories"() IS 'Active service catalog; Caregiving/Pet Care omitted while CARE_PET_BOOK_NOW is off.';
+COMMENT ON FUNCTION "public"."get_service_categories"() IS 'Active service catalog ordered by sort_order; gated categories omitted while their Book Now flags are off.';
 
 
 
@@ -14698,6 +14754,21 @@ $$;
 ALTER FUNCTION "public"."is_admin"("user_uuid" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."is_airbnb_catalog_visible"() RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT public.is_app_feature_enabled('AIRBNB_BOOK_NOW', 'production');
+$$;
+
+
+ALTER FUNCTION "public"."is_airbnb_catalog_visible"() OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."is_airbnb_catalog_visible"() IS 'True when AIRBNB_BOOK_NOW is enabled on production.';
+
+
+
 CREATE OR REPLACE FUNCTION "public"."is_app_feature_enabled"("p_key" "text", "p_channel" "text" DEFAULT 'production'::"text") RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -14975,6 +15046,21 @@ $$;
 
 
 ALTER FUNCTION "public"."is_profile_visible_to_viewer"("p" "public"."profiles", "viewer_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."is_quick_tasks_catalog_visible"() RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT public.is_app_feature_enabled('QUICK_TASKS_BOOK_NOW', 'production');
+$$;
+
+
+ALTER FUNCTION "public"."is_quick_tasks_catalog_visible"() OWNER TO "postgres";
+
+
+COMMENT ON FUNCTION "public"."is_quick_tasks_catalog_visible"() IS 'True when QUICK_TASKS_BOOK_NOW is enabled on production.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."jitter_booking_location_coordinates"("p_booking_id" "uuid", "p_point" "public"."geometry", "p_radius_meters" double precision DEFAULT 600) RETURNS "public"."geometry"
@@ -26921,6 +27007,7 @@ CREATE TABLE IF NOT EXISTS "public"."service_categories" (
     "icon_scale" numeric,
     "description" "text",
     "image_url" "text",
+    "sort_order" integer DEFAULT 100 NOT NULL,
     CONSTRAINT "service_categories_icon_scale_range" CHECK ((("icon_scale" IS NULL) OR (("icon_scale" >= 0.75) AND ("icon_scale" <= 1.5))))
 );
 
@@ -26937,6 +27024,10 @@ COMMENT ON COLUMN "public"."service_categories"."description" IS 'Short marketin
 
 
 COMMENT ON COLUMN "public"."service_categories"."image_url" IS 'Remote icon URL for category rows (Book Now picker, services grid). Not inherited from service_types.';
+
+
+
+COMMENT ON COLUMN "public"."service_categories"."sort_order" IS 'Book Now / get_service_categories display order (ascending). Editable in Admin → Services.';
 
 
 
@@ -29225,6 +29316,10 @@ CREATE UNIQUE INDEX "reviews_booking_reviewer_key" ON "public"."reviews" USING "
 
 
 
+CREATE INDEX "service_categories_sort_order_idx" ON "public"."service_categories" USING "btree" ("sort_order", "name");
+
+
+
 CREATE UNIQUE INDEX "service_types_specialty_slug_key" ON "public"."service_types" USING "btree" ("specialty_slug") WHERE ("specialty_slug" IS NOT NULL);
 
 
@@ -30647,11 +30742,25 @@ CREATE POLICY "anon_read_invite_codes" ON "public"."invite_codes" FOR SELECT TO 
 
 
 
-CREATE POLICY "anon_read_service_categories" ON "public"."service_categories" FOR SELECT TO "anon" USING (("public"."is_care_pet_catalog_visible"() OR (COALESCE("slug", ''::"text") <> ALL (ARRAY['caregiving'::"text", 'pet_care'::"text"]))));
+CREATE POLICY "anon_read_service_categories" ON "public"."service_categories" FOR SELECT TO "anon" USING (
+CASE COALESCE("slug", ''::"text")
+    WHEN 'caregiving'::"text" THEN "public"."is_care_pet_catalog_visible"()
+    WHEN 'pet_care'::"text" THEN "public"."is_care_pet_catalog_visible"()
+    WHEN 'airbnb'::"text" THEN "public"."is_airbnb_catalog_visible"()
+    WHEN 'quick_tasks'::"text" THEN "public"."is_quick_tasks_catalog_visible"()
+    ELSE true
+END);
 
 
 
-CREATE POLICY "anon_read_service_types" ON "public"."service_types" FOR SELECT TO "anon" USING (("public"."is_care_pet_catalog_visible"() OR (("category" IS DISTINCT FROM 'caregiving'::"public"."service_category") AND ("category" IS DISTINCT FROM 'pet_care'::"public"."service_category"))));
+CREATE POLICY "anon_read_service_types" ON "public"."service_types" FOR SELECT TO "anon" USING (
+CASE "category"
+    WHEN 'caregiving'::"public"."service_category" THEN "public"."is_care_pet_catalog_visible"()
+    WHEN 'pet_care'::"public"."service_category" THEN "public"."is_care_pet_catalog_visible"()
+    WHEN 'airbnb'::"public"."service_category" THEN "public"."is_airbnb_catalog_visible"()
+    WHEN 'quick_tasks'::"public"."service_category" THEN "public"."is_quick_tasks_catalog_visible"()
+    ELSE true
+END);
 
 
 
@@ -30675,11 +30784,25 @@ CREATE POLICY "anyone_read_roles" ON "public"."roles" FOR SELECT TO "authenticat
 
 
 
-CREATE POLICY "anyone_read_service_categories" ON "public"."service_categories" FOR SELECT USING (("public"."is_care_pet_catalog_visible"() OR (COALESCE("slug", ''::"text") <> ALL (ARRAY['caregiving'::"text", 'pet_care'::"text"]))));
+CREATE POLICY "anyone_read_service_categories" ON "public"."service_categories" FOR SELECT USING (
+CASE COALESCE("slug", ''::"text")
+    WHEN 'caregiving'::"text" THEN "public"."is_care_pet_catalog_visible"()
+    WHEN 'pet_care'::"text" THEN "public"."is_care_pet_catalog_visible"()
+    WHEN 'airbnb'::"text" THEN "public"."is_airbnb_catalog_visible"()
+    WHEN 'quick_tasks'::"text" THEN "public"."is_quick_tasks_catalog_visible"()
+    ELSE true
+END);
 
 
 
-CREATE POLICY "anyone_read_service_types" ON "public"."service_types" FOR SELECT USING (("public"."is_care_pet_catalog_visible"() OR (("category" IS DISTINCT FROM 'caregiving'::"public"."service_category") AND ("category" IS DISTINCT FROM 'pet_care'::"public"."service_category"))));
+CREATE POLICY "anyone_read_service_types" ON "public"."service_types" FOR SELECT USING (
+CASE "category"
+    WHEN 'caregiving'::"public"."service_category" THEN "public"."is_care_pet_catalog_visible"()
+    WHEN 'pet_care'::"public"."service_category" THEN "public"."is_care_pet_catalog_visible"()
+    WHEN 'airbnb'::"public"."service_category" THEN "public"."is_airbnb_catalog_visible"()
+    WHEN 'quick_tasks'::"public"."service_category" THEN "public"."is_quick_tasks_catalog_visible"()
+    ELSE true
+END);
 
 
 
@@ -31057,9 +31180,9 @@ CREATE POLICY "micro_task_options_admin_write" ON "public"."micro_task_options" 
 
 
 
-CREATE POLICY "micro_task_options_select_active_or_admin" ON "public"."micro_task_options" FOR SELECT TO "authenticated", "anon" USING ((EXISTS ( SELECT 1
+CREATE POLICY "micro_task_options_select_active_or_admin" ON "public"."micro_task_options" FOR SELECT TO "authenticated", "anon" USING (("public"."is_quick_tasks_catalog_visible"() AND (EXISTS ( SELECT 1
    FROM "public"."micro_tasks" "mt"
-  WHERE (("mt"."id" = "micro_task_options"."micro_task_id") AND (("mt"."is_active" = true) OR "public"."is_admin"("auth"."uid"()))))));
+  WHERE (("mt"."id" = "micro_task_options"."micro_task_id") AND (("mt"."is_active" = true) OR "public"."is_admin"("auth"."uid"())))))));
 
 
 
@@ -31070,7 +31193,7 @@ CREATE POLICY "micro_tasks_admin_write" ON "public"."micro_tasks" TO "authentica
 
 
 
-CREATE POLICY "micro_tasks_select_active_or_admin" ON "public"."micro_tasks" FOR SELECT TO "authenticated", "anon" USING ((("is_active" = true) OR "public"."is_admin"("auth"."uid"())));
+CREATE POLICY "micro_tasks_select_active_or_admin" ON "public"."micro_tasks" FOR SELECT TO "authenticated", "anon" USING (("public"."is_quick_tasks_catalog_visible"() AND (("is_active" = true) OR "public"."is_admin"("auth"."uid"()))));
 
 
 
@@ -32741,6 +32864,13 @@ GRANT ALL ON FUNCTION "public"."approve_and_complete_booking"("p_booking_id" "uu
 
 REVOKE ALL ON FUNCTION "public"."approve_cleaner_application"("p_application_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."approve_cleaner_application"("p_application_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."assert_airbnb_quick_tasks_service_bookable"("p_service_id" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."assert_airbnb_quick_tasks_service_bookable"("p_service_id" integer) TO "anon";
+GRANT ALL ON FUNCTION "public"."assert_airbnb_quick_tasks_service_bookable"("p_service_id" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."assert_airbnb_quick_tasks_service_bookable"("p_service_id" integer) TO "service_role";
 
 
 
@@ -36122,6 +36252,13 @@ GRANT ALL ON FUNCTION "public"."is_admin"("user_uuid" "uuid") TO "service_role";
 
 
 
+REVOKE ALL ON FUNCTION "public"."is_airbnb_catalog_visible"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."is_airbnb_catalog_visible"() TO "anon";
+GRANT ALL ON FUNCTION "public"."is_airbnb_catalog_visible"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."is_airbnb_catalog_visible"() TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."is_app_feature_enabled"("p_key" "text", "p_channel" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."is_app_feature_enabled"("p_key" "text", "p_channel" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."is_app_feature_enabled"("p_key" "text", "p_channel" "text") TO "authenticated";
@@ -36225,6 +36362,13 @@ GRANT ALL ON FUNCTION "public"."is_profile_discoverable_by_others"("p" "public".
 GRANT ALL ON FUNCTION "public"."is_profile_visible_to_viewer"("p" "public"."profiles", "viewer_id" "uuid") TO "anon";
 GRANT ALL ON FUNCTION "public"."is_profile_visible_to_viewer"("p" "public"."profiles", "viewer_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."is_profile_visible_to_viewer"("p" "public"."profiles", "viewer_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."is_quick_tasks_catalog_visible"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."is_quick_tasks_catalog_visible"() TO "anon";
+GRANT ALL ON FUNCTION "public"."is_quick_tasks_catalog_visible"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."is_quick_tasks_catalog_visible"() TO "service_role";
 
 
 

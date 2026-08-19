@@ -2907,6 +2907,43 @@ END;
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.assert_airbnb_quick_tasks_service_bookable(p_service_id integer)
+ RETURNS void
+ LANGUAGE plpgsql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+DECLARE
+  v_category public.service_category;
+BEGIN
+  IF p_service_id IS NULL THEN
+    RETURN;
+  END IF;
+
+  SELECT st.category
+  INTO v_category
+  FROM public.service_types st
+  WHERE st.id = p_service_id;
+
+  IF NOT FOUND THEN
+    RETURN;
+  END IF;
+
+  IF v_category = 'airbnb'::public.service_category
+     AND NOT public.is_airbnb_catalog_visible() THEN
+    RAISE EXCEPTION 'This service is not available yet'
+      USING ERRCODE = 'P0001';
+  END IF;
+
+  IF v_category = 'quick_tasks'::public.service_category
+     AND NOT public.is_quick_tasks_catalog_visible() THEN
+    RAISE EXCEPTION 'This service is not available yet'
+      USING ERRCODE = 'P0001';
+  END IF;
+END;
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.assert_care_pet_service_bookable(p_service_id integer)
  RETURNS void
  LANGUAGE plpgsql
@@ -7353,6 +7390,7 @@ BEGIN
   END IF;
 
   PERFORM public.assert_care_pet_service_bookable(p_service_id);
+  PERFORM public.assert_airbnb_quick_tasks_service_bookable(p_service_id);
 
   IF v_service_rate IS NULL OR v_service_rate < 0 THEN
     RAISE EXCEPTION 'Invalid service price';
@@ -7709,6 +7747,7 @@ BEGIN
   END IF;
 
   PERFORM public.assert_care_pet_service_bookable(p_service_id);
+  PERFORM public.assert_airbnb_quick_tasks_service_bookable(p_service_id);
 
   IF v_service_rate IS NULL OR v_service_rate < 0 THEN
     RAISE EXCEPTION 'Invalid service price';
@@ -8544,6 +8583,11 @@ DECLARE
   v_has_placeholder boolean := false;
   v_seen_task_ids uuid[] := ARRAY[]::uuid[];
 BEGIN
+  IF NOT public.is_quick_tasks_catalog_visible() THEN
+    RAISE EXCEPTION 'This service is not available yet'
+      USING ERRCODE = 'P0001';
+  END IF;
+
   IF p_selected_tasks IS NULL
      OR jsonb_typeof(p_selected_tasks) <> 'array'
      OR jsonb_array_length(p_selected_tasks) < 1 THEN
@@ -10415,6 +10459,7 @@ CREATE OR REPLACE FUNCTION public.enforce_care_pet_booking_gate()
 AS $function$
 BEGIN
   PERFORM public.assert_care_pet_service_bookable(NEW.service_id);
+  PERFORM public.assert_airbnb_quick_tasks_service_bookable(NEW.service_id);
   RETURN NEW;
 END;
 $function$
@@ -16532,10 +16577,16 @@ BEGIN
   LEFT JOIN public.service_types st ON st.category_id = sc.id
   WHERE (st.active = true OR st.id IS NULL)
     AND (
-      public.is_care_pet_catalog_visible()
-      OR COALESCE(sc.slug, '') NOT IN ('caregiving', 'pet_care')
+      CASE COALESCE(sc.slug, '')
+        WHEN 'caregiving' THEN public.is_care_pet_catalog_visible()
+        WHEN 'pet_care' THEN public.is_care_pet_catalog_visible()
+        WHEN 'airbnb' THEN public.is_airbnb_catalog_visible()
+        WHEN 'quick_tasks' THEN public.is_quick_tasks_catalog_visible()
+        ELSE true
+      END
     )
-  GROUP BY sc.id, sc.name, sc.icon;
+  GROUP BY sc.id, sc.name, sc.icon, sc.sort_order
+  ORDER BY sc.sort_order ASC, sc.name ASC;
 END;
 $function$
 
@@ -17272,6 +17323,16 @@ AS $function$
 $function$
 
 
+CREATE OR REPLACE FUNCTION public.is_airbnb_catalog_visible()
+ RETURNS boolean
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+  SELECT public.is_app_feature_enabled('AIRBNB_BOOK_NOW', 'production');
+$function$
+
+
 CREATE OR REPLACE FUNCTION public.is_app_feature_enabled(p_key text, p_channel text DEFAULT 'production'::text)
  RETURNS boolean
  LANGUAGE sql
@@ -17472,6 +17533,16 @@ AS $function$
       OR viewer_id = p.user_id
       OR public.is_profile_discoverable_by_others(p)
     );
+$function$
+
+
+CREATE OR REPLACE FUNCTION public.is_quick_tasks_catalog_visible()
+ RETURNS boolean
+ LANGUAGE sql
+ STABLE SECURITY DEFINER
+ SET search_path TO 'public'
+AS $function$
+  SELECT public.is_app_feature_enabled('QUICK_TASKS_BOOK_NOW', 'production');
 $function$
 
 
