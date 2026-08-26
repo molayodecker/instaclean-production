@@ -18377,18 +18377,35 @@ AS $function$
 $function$
 
 
-CREATE OR REPLACE FUNCTION public.inbox_notification_android_channel(p_type text)
+CREATE OR REPLACE FUNCTION public.inbox_notification_android_channel(p_type text, p_android_notification_channel_version integer DEFAULT NULL::integer)
  RETURNS text
  LANGUAGE sql
  IMMUTABLE
 AS $function$
   SELECT CASE p_type
-    WHEN 'broadcast_assignment_offer' THEN 'job_offers_v2'
-    WHEN 'job_offer' THEN 'job_offers_v2'
-    WHEN 'direct_assignment_offer' THEN 'new_booking_v2'
-    WHEN 'direct_assignment_reminder' THEN 'new_booking_v2'
+    WHEN 'broadcast_assignment_offer' THEN
+      CASE
+        WHEN coalesce(p_android_notification_channel_version, 0) >= 3 THEN 'job_offers_v3'
+        ELSE 'job_offers_v2'
+      END
+    WHEN 'job_offer' THEN
+      CASE
+        WHEN coalesce(p_android_notification_channel_version, 0) >= 3 THEN 'job_offers_v3'
+        ELSE 'job_offers_v2'
+      END
+    WHEN 'direct_assignment_offer' THEN
+      CASE
+        WHEN coalesce(p_android_notification_channel_version, 0) >= 3 THEN 'new_booking_v3'
+        ELSE 'new_booking_v2'
+      END
+    WHEN 'direct_assignment_reminder' THEN
+      CASE
+        WHEN coalesce(p_android_notification_channel_version, 0) >= 3 THEN 'new_booking_v3'
+        ELSE 'new_booking_v2'
+      END
     WHEN 'booking_cancelled' THEN 'booking_cancellations'
     WHEN 'booking_rescheduled' THEN 'booking_updates'
+    WHEN 'review_request' THEN 'booking_updates'
     WHEN 'unassigned_booking_escalated' THEN 'booking_cancellations'
     WHEN 'new_message' THEN 'messages'
     WHEN 'cleaner_en_route' THEN 'cleaner_milestones'
@@ -21924,6 +21941,7 @@ DECLARE
   v_badge integer := 0;
   v_messages jsonb := '[]'::jsonb;
   v_token text;
+  v_channel_version integer;
   v_request_id bigint;
   v_push_data jsonb;
   v_message jsonb;
@@ -21935,7 +21953,6 @@ BEGIN
   v_title := coalesce(nullif(trim(p_title), ''), 'Instaclean');
   v_body := coalesce(nullif(trim(p_body), ''), 'You have a new notification.');
   v_type := coalesce(nullif(trim(p_type), ''), 'unknown');
-  v_channel := public.inbox_notification_android_channel(v_type);
   v_sound := public.inbox_notification_android_sound(v_type);
 
   v_push_data := coalesce(p_data, '{}'::jsonb);
@@ -21956,21 +21973,23 @@ BEGIN
 
   v_badge := least(greatest(coalesce(v_badge, 0), 1), 999);
 
-  FOR v_token IN
-    SELECT DISTINCT t.token
+  FOR v_token, v_channel_version IN
+    SELECT t.token, max(t.android_notification_channel_version)::integer
     FROM (
-      SELECT dt.token
+      SELECT dt.token, dt.android_notification_channel_version
       FROM public.device_tokens dt
       WHERE dt.user_id = p_user_id
         AND dt.token ~ '^(Expo(nent)?PushToken)\[.+\]$'
-      UNION
-      SELECT cd.expo_push_token AS token
+      UNION ALL
+      SELECT cd.expo_push_token AS token, NULL::integer AS android_notification_channel_version
       FROM public.cleaner_devices cd
       WHERE cd.cleaner_id = p_user_id
         AND cd.expo_push_token ~ '^(Expo(nent)?PushToken)\[.+\]$'
     ) t
     WHERE t.token IS NOT NULL
+    GROUP BY t.token
   LOOP
+    v_channel := public.inbox_notification_android_channel(v_type, v_channel_version);
     v_message := jsonb_build_object(
       'to', v_token,
       'title', v_title,
@@ -23668,7 +23687,7 @@ END;
 $function$
 
 
-CREATE OR REPLACE FUNCTION public.register_device_push_token(p_token text, p_platform text)
+CREATE OR REPLACE FUNCTION public.register_device_push_token(p_token text, p_platform text, p_android_notification_channel_version integer DEFAULT NULL::integer, p_app_version text DEFAULT NULL::text)
  RETURNS void
  LANGUAGE plpgsql
  SECURITY DEFINER
@@ -23676,17 +23695,24 @@ CREATE OR REPLACE FUNCTION public.register_device_push_token(p_token text, p_pla
 AS $function$
 DECLARE
   v_user_id uuid := auth.uid();
+  v_token text := btrim(coalesce(p_token, ''));
+  v_app_version text := nullif(btrim(coalesce(p_app_version, '')), '');
 BEGIN
   IF v_user_id IS NULL THEN
     RAISE EXCEPTION 'Not authenticated' USING ERRCODE = '42501';
   END IF;
 
-  IF p_token IS NULL OR btrim(p_token) = '' THEN
+  IF v_token = '' THEN
     RAISE EXCEPTION 'token is required' USING ERRCODE = '22004';
   END IF;
 
   IF p_platform NOT IN ('ios', 'android') THEN
     RAISE EXCEPTION 'invalid platform' USING ERRCODE = '22023';
+  END IF;
+
+  IF p_android_notification_channel_version IS NOT NULL
+     AND p_android_notification_channel_version < 1 THEN
+    RAISE EXCEPTION 'invalid android_notification_channel_version' USING ERRCODE = '22023';
   END IF;
 
   -- Legacy accounts may exist in auth.users without a public.users shell row.
@@ -23696,11 +23722,29 @@ BEGIN
   WHERE au.id = v_user_id
   ON CONFLICT (id) DO NOTHING;
 
-  INSERT INTO public.device_tokens (user_id, token, platform, updated_at)
-  VALUES (v_user_id, btrim(p_token), p_platform, now())
+  INSERT INTO public.device_tokens (
+    user_id,
+    token,
+    platform,
+    android_notification_channel_version,
+    app_version,
+    updated_at
+  )
+  VALUES (
+    v_user_id,
+    v_token,
+    p_platform,
+    p_android_notification_channel_version,
+    v_app_version,
+    now()
+  )
   ON CONFLICT (token) DO UPDATE SET
     user_id = EXCLUDED.user_id,
     platform = EXCLUDED.platform,
+    -- Always store the reported capability (including NULL) so a failed channel
+    -- verification can clear a previously incorrect `_v3` claim.
+    android_notification_channel_version = EXCLUDED.android_notification_channel_version,
+    app_version = COALESCE(EXCLUDED.app_version, public.device_tokens.app_version),
     updated_at = EXCLUDED.updated_at;
 END;
 $function$
