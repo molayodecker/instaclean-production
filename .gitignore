@@ -4,6 +4,12 @@
 # Generated backup artifacts (stored in R2 / CI only)
 data.sql
 data.sql.gz
+full.dump
+manifest.json
+checksums.sha256
+latest.json
 schema.sql.gz
 roles.sql.gz
 exports/functions_triggers.sql.gz
+exports/full.dump.list
+restore/
