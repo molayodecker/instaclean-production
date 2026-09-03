@@ -78,17 +78,22 @@ jobs:
             SAME_REPO_PR="true"
           fi
 
-          if [ "$EVENT" = "schedule" ] || [ "$EVENT" = "workflow_dispatch" ] || [ "$SAME_REPO_PR" = "true" ]; then
+          if [ "$EVENT" = "schedule" ] || [ "$EVENT" = "workflow_dispatch" ]; then
             echo "mode=full" >> "$GITHUB_OUTPUT"
             echo "upload_to_r2=true" >> "$GITHUB_OUTPUT"
-            echo "Running FULL backup"
+            echo "upload_ddl_to_r2=true" >> "$GITHUB_OUTPUT"
+            echo "Running FULL backup and uploading to R2"
+          elif [ "$SAME_REPO_PR" = "true" ]; then
+            echo "mode=full" >> "$GITHUB_OUTPUT"
+            echo "upload_to_r2=false" >> "$GITHUB_OUTPUT"
+            echo "upload_ddl_to_r2=false" >> "$GITHUB_OUTPUT"
+            echo "Running FULL backup validation without R2 upload"
           else
             echo "mode=schema" >> "$GITHUB_OUTPUT"
             echo "upload_to_r2=false" >> "$GITHUB_OUTPUT"
+            echo "upload_ddl_to_r2=true" >> "$GITHUB_OUTPUT"
             echo "Running SCHEMA + SAFE CONFIG backup"
           fi
-
-          echo "upload_ddl_to_r2=true" >> "$GITHUB_OUTPUT"
 
       - name: Checkout main branch
         if: steps.gate.outputs.enabled == 'true' && github.event_name != 'pull_request'
@@ -132,6 +137,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
           /usr/lib/postgresql/17/bin/pg_dump --version
+          /usr/lib/postgresql/17/bin/pg_restore --version
           /usr/lib/postgresql/17/bin/psql --version
           "$HOME/.local/bin/aws" --version
 
@@ -218,19 +224,169 @@ jobs:
             --table=public.timezones \
             | gzip > exports/config_data.sql.gz
 
-      - name: Dump full data
+      - name: Dump portable application data
         if: steps.gate.outputs.enabled == 'true' && steps.mode.outputs.mode == 'full'
         shell: bash
         run: |
           set -euo pipefail
 
+          # Supabase CLI intentionally excludes managed schemas such as auth,
+          # storage, and extension-owned schemas. This remains our portable
+          # application-data restore artifact.
           supabase db dump \
             --db-url "$SUPABASE_DB_URL_IPV4" \
             --data-only \
             --use-copy \
             | gzip > data.sql.gz
 
-          rm -f data.sql
+          gzip -t data.sql.gz
+
+          COPY_COUNT=$(zgrep -c '^COPY ' data.sql.gz || true)
+          if [ "$COPY_COUNT" -lt 1 ]; then
+            echo "::error::data.sql.gz contains no COPY statements; refusing to publish an empty data backup."
+            exit 1
+          fi
+
+          echo "Portable data dump contains $COPY_COUNT COPY sections."
+
+      - name: Dump complete PostgreSQL archive
+        if: steps.gate.outputs.enabled == 'true' && steps.mode.outputs.mode == 'full'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Raw pg_dump captures all non-system schemas, including Supabase
+          # managed auth/storage data. This is a recovery/migration archive,
+          # not a dump to restore blindly into Fly Managed Postgres.
+          /usr/lib/postgresql/17/bin/pg_dump "$SUPABASE_DB_URL_IPV4" \
+            --format=custom \
+            --file=full.dump
+
+          /usr/lib/postgresql/17/bin/pg_restore \
+            --list full.dump \
+            > exports/full.dump.list
+
+          TABLE_DATA_COUNT=$(grep -c 'TABLE DATA' exports/full.dump.list || true)
+          if [ "$TABLE_DATA_COUNT" -lt 1 ]; then
+            echo "::error::full.dump contains no TABLE DATA entries."
+            exit 1
+          fi
+
+          for REQUIRED_ENTRY in \
+            'TABLE DATA auth users ' \
+            'TABLE DATA public bookings ' \
+            'TABLE DATA public users '
+          do
+            if ! grep -Fq "$REQUIRED_ENTRY" exports/full.dump.list; then
+              echo "::error::full.dump is missing required archive entry: $REQUIRED_ENTRY"
+              exit 1
+            fi
+          done
+
+          echo "Complete archive contains $TABLE_DATA_COUNT TABLE DATA entries."
+
+      - name: Package and validate backup set
+        if: steps.gate.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gzip -c schema.sql > schema.sql.gz
+          gzip -c roles.sql > roles.sql.gz
+          gzip -c exports/functions_triggers.sql > exports/functions_triggers.sql.gz
+
+          gzip -t schema.sql.gz
+          gzip -t roles.sql.gz
+          gzip -t exports/functions_triggers.sql.gz
+          gzip -t exports/config_data.sql.gz
+
+          if [ "${{ steps.mode.outputs.mode }}" != "full" ]; then
+            exit 0
+          fi
+
+          sha256sum \
+            schema.sql.gz \
+            roles.sql.gz \
+            exports/functions_triggers.sql.gz \
+            exports/config_data.sql.gz \
+            data.sql.gz \
+            full.dump \
+            > checksums.sha256
+
+          export BACKUP_DATE="$(date -u +%Y-%m-%d)"
+          export BACKUP_CREATED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          export BACKUP_RUN_ID="${{ github.run_id }}"
+          export BACKUP_GITHUB_SHA="${{ github.sha }}"
+          export BACKUP_EVENT="${{ github.event_name }}"
+          export SOURCE_POSTGRES_VERSION="$(
+            /usr/lib/postgresql/17/bin/psql "$SUPABASE_DB_URL_IPV4" \
+              -Atqc 'SHOW server_version'
+          )"
+          export PORTABLE_COPY_COUNT="$(zgrep -c '^COPY ' data.sql.gz || true)"
+          export FULL_TABLE_DATA_COUNT="$(grep -c 'TABLE DATA' exports/full.dump.list || true)"
+
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          manifest = {
+              "backup_version": 2,
+              "created_at": os.environ["BACKUP_CREATED_AT"],
+              "date": os.environ["BACKUP_DATE"],
+              "github": {
+                  "run_id": os.environ["BACKUP_RUN_ID"],
+                  "sha": os.environ["BACKUP_GITHUB_SHA"],
+                  "event": os.environ["BACKUP_EVENT"],
+              },
+              "source": {
+                  "provider": "supabase",
+                  "postgres_version": os.environ["SOURCE_POSTGRES_VERSION"],
+              },
+              "contains_row_data": True,
+              "artifacts": {
+                  "schema.sql.gz": {
+                      "kind": "supabase_filtered_schema",
+                      "contains_row_data": False,
+                  },
+                  "roles.sql.gz": {
+                      "kind": "supabase_filtered_roles",
+                      "contains_row_data": False,
+                  },
+                  "functions_triggers.sql.gz": {
+                      "kind": "supplemental_database_logic",
+                      "contains_row_data": False,
+                  },
+                  "config_data.sql.gz": {
+                      "kind": "safe_config_data",
+                      "contains_row_data": True,
+                  },
+                  "data.sql.gz": {
+                      "kind": "supabase_filtered_portable_data",
+                      "contains_row_data": True,
+                      "managed_schemas_excluded": True,
+                      "copy_sections": int(os.environ["PORTABLE_COPY_COUNT"]),
+                  },
+                  "full.dump": {
+                      "kind": "postgres_custom_archive",
+                      "contains_row_data": True,
+                      "includes_managed_schemas": True,
+                      "table_data_entries": int(os.environ["FULL_TABLE_DATA_COUNT"]),
+                      "restore_with": "pg_restore",
+                  },
+              },
+          }
+
+          Path("manifest.json").write_text(
+              json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+          echo "Backup manifest:"
+          cat manifest.json
+          echo "Checksums:"
+          cat checksums.sha256
 
       - name: Show generated files
         if: steps.gate.outputs.enabled == 'true'
@@ -239,8 +395,24 @@ jobs:
           set -euo pipefail
 
           echo "Generated backup files:"
-          ls -lh roles.sql schema.sql exports/functions_triggers.sql exports/config_data.sql.gz || true
-          ls -lh data.sql.gz || true
+          ls -lh \
+            roles.sql \
+            schema.sql \
+            schema.sql.gz \
+            roles.sql.gz \
+            exports/functions_triggers.sql \
+            exports/functions_triggers.sql.gz \
+            exports/config_data.sql.gz \
+            || true
+
+          if [ "${{ steps.mode.outputs.mode }}" = "full" ]; then
+            ls -lh \
+              data.sql.gz \
+              full.dump \
+              exports/full.dump.list \
+              manifest.json \
+              checksums.sha256
+          fi
 
       - name: Commit schema, roles, functions/triggers, and safe config data to GitHub
         if: steps.gate.outputs.enabled == 'true' && github.event_name != 'pull_request'
@@ -275,10 +447,6 @@ jobs:
           RUN_ID="${{ github.run_id }}"
           PREFIX="s3://$R2_BUCKET_NAME/$DATE/$RUN_ID"
 
-          gzip -c schema.sql > schema.sql.gz
-          gzip -c roles.sql > roles.sql.gz
-          gzip -c exports/functions_triggers.sql > exports/functions_triggers.sql.gz
-
           aws s3 cp schema.sql.gz \
             "$PREFIX/schema.sql.gz" \
             --endpoint-url "$ENDPOINT"
@@ -295,7 +463,7 @@ jobs:
             "$PREFIX/config_data.sql.gz" \
             --endpoint-url "$ENDPOINT"
 
-      - name: Upload full data backup to Cloudflare R2
+      - name: Upload full database backup to Cloudflare R2
         if: >
           steps.gate.outputs.enabled == 'true' &&
           steps.mode.outputs.upload_to_r2 == 'true' &&
@@ -310,14 +478,22 @@ jobs:
           set -euo pipefail
 
           if [ -z "${AWS_ACCESS_KEY_ID:-}" ] || [ -z "${AWS_SECRET_ACCESS_KEY:-}" ]; then
-            echo "::error::R2 credentials are missing. Full data backup cannot be uploaded."
+            echo "::error::R2 credentials are missing. Full database backup cannot be uploaded."
             exit 1
           fi
 
-          if [ ! -f data.sql.gz ]; then
-            echo "::error::data.sql.gz was not generated."
-            exit 1
-          fi
+          for FILE in \
+            data.sql.gz \
+            full.dump \
+            exports/full.dump.list \
+            manifest.json \
+            checksums.sha256
+          do
+            if [ ! -s "$FILE" ]; then
+              echo "::error::$FILE was not generated or is empty."
+              exit 1
+            fi
+          done
 
           ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
           DATE=$(date -u +%Y-%m-%d)
@@ -327,3 +503,45 @@ jobs:
           aws s3 cp data.sql.gz \
             "$PREFIX/data.sql.gz" \
             --endpoint-url "$ENDPOINT"
+
+          aws s3 cp full.dump \
+            "$PREFIX/full.dump" \
+            --endpoint-url "$ENDPOINT"
+
+          aws s3 cp exports/full.dump.list \
+            "$PREFIX/full.dump.list" \
+            --endpoint-url "$ENDPOINT"
+
+          aws s3 cp manifest.json \
+            "$PREFIX/manifest.json" \
+            --endpoint-url "$ENDPOINT"
+
+          aws s3 cp checksums.sha256 \
+            "$PREFIX/checksums.sha256" \
+            --endpoint-url "$ENDPOINT"
+
+          python3 - <<PY
+          import json
+          from pathlib import Path
+
+          pointer = {
+              "date": "$DATE",
+              "run_id": "$RUN_ID",
+              "prefix": "$DATE/$RUN_ID",
+              "manifest": "$DATE/$RUN_ID/manifest.json",
+              "portable_data": "$DATE/$RUN_ID/data.sql.gz",
+              "full_archive": "$DATE/$RUN_ID/full.dump",
+          }
+          Path("latest.json").write_text(
+              json.dumps(pointer, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+          # Update the pointer only after every full-backup artifact succeeds.
+          aws s3 cp latest.json \
+            "s3://$R2_BUCKET_NAME/latest.json" \
+            --endpoint-url "$ENDPOINT"
+
+          echo "Full backup uploaded to $PREFIX"
+          echo "Latest pointer updated at s3://$R2_BUCKET_NAME/latest.json"
