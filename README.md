@@ -9,6 +9,7 @@ Database checkpoint and backups for the Instaclean production Supabase project.
 | `schema.sql` | Supabase-filtered database schema dump |
 | `roles.sql` | Database roles and grants |
 | `scripts/dump_functions_triggers.sql` | Helper query for functions and triggers |
+| `scripts/pull_latest_r2_backup.sh` | Download and verify the latest successful full R2 backup |
 | `.github/workflows/backup.yml` | Scheduled, manual, and validation backup workflow |
 
 ## Backups
@@ -75,6 +76,30 @@ latest.json
 ```
 
 The pointer contains the latest full-backup prefix and paths to `manifest.json`, `data.sql.gz`, and `full.dump`. It is written only after all required full-backup artifacts upload successfully.
+
+## Pull the latest backup from Cloudflare R2
+
+Set the same bucket credentials locally or on the one-off Fly/Mithril restore environment, then run:
+
+```bash
+export R2_ACCOUNT_ID='<cloudflare-account-id>'
+export R2_BUCKET_NAME='insta-production'
+export R2_ACCESS_KEY_ID='<access-key-id>'
+export R2_SECRET_ACCESS_KEY='<secret-access-key>'
+
+bash scripts/pull_latest_r2_backup.sh ./restore/latest
+```
+
+The script:
+
+1. downloads `latest.json`
+2. resolves the exact successful backup prefix
+3. downloads schema, roles, portable row data, the complete custom archive, manifest, and checksum file
+4. verifies SHA-256 checksums
+5. validates the gzip artifacts
+6. validates `full.dump` with `pg_restore --list` when `pg_restore` is installed
+
+A failed checksum or invalid archive stops the pull instead of handing a corrupted snapshot to a restore process.
 
 ## Validation
 
