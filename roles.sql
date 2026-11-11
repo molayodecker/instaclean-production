@@ -10,4 +10,6 @@ ALTER ROLE "authenticated" SET "statement_timeout" TO '8s';
 
 ALTER ROLE "authenticator" SET "statement_timeout" TO '8s';
 
+ALTER ROLE "supabase_admin" SET "statement_timeout" TO '0';
+
 RESET ALL;
